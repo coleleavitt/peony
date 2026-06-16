@@ -1,0 +1,17 @@
+[package]
+name = "peony-cache"
+description = "Persistent incremental cache: symbol graph, layout decisions, debug index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peony-object      = { path = "../peony-object" }
+peony-symbols     = { path = "../peony-symbols" }
+peony-layout      = { path = "../peony-layout" }
+serde.workspace      = true
+bincode.workspace    = true
+ws-deque.workspace   = true
+rustc-hash.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true

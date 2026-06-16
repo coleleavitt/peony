@@ -1,0 +1,524 @@
+DIGEST 6cde88b5b0df9c1b5c7b7985e8e2ee20
+FPeony.RelocDisjoint
+R994:997 Stdlib.Lists.List <> <> lib
+R999:1003 Stdlib.Arith.Arith <> <> lib
+R1005:1008 Stdlib.Bool.Bool <> <> lib
+R1010:1012 Stdlib.micromega.Lia <> <> lib
+R1042:1052 Stdlib.Sorting.Permutation <> <> lib
+R1082:1105 Stdlib.Logic.FunctionalExtensionality <> <> lib
+R1115:1127 Stdlib.Lists.List ListNotations <> mod
+def 1495:1498 <> addr
+R1503:1505 Corelib.Init.Datatypes <> nat ind
+def 1519:1522 <> byte
+R1527:1529 Corelib.Init.Datatypes <> nat ind
+def 1543:1545 <> mem
+R1554:1557 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R1550:1553 Peony.RelocDisjoint <> addr def
+R1558:1561 Peony.RelocDisjoint <> byte def
+rec 1888:1892 <> reloc
+proj 1901:1905 <> r_off
+proj 1919:1925 <> r_bytes
+R1911:1914 Peony.RelocDisjoint <> addr def
+R1929:1932 Corelib.Init.Datatypes <> list ind
+R1934:1937 Peony.RelocDisjoint <> byte def
+def 1954:1962 <> footprint
+R1969:1973 Peony.RelocDisjoint <> reloc rec
+binder 1965:1965 <> r:4
+R1978:1981 Corelib.Init.Datatypes <> list ind
+R1983:1986 Peony.RelocDisjoint <> addr def
+R1993:1995 Corelib.Lists.ListDef <> map def
+R2021:2023 Corelib.Lists.ListDef <> seq def
+R2028:2033 Corelib.Init.Datatypes <> length def
+R2036:2042 Peony.RelocDisjoint <> r_bytes proj
+R2044:2044 Peony.RelocDisjoint <> r:4 var
+binder 2002:2002 <> i:5
+R2014:2016 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R2007:2011 Peony.RelocDisjoint <> r_off proj
+R2013:2013 Peony.RelocDisjoint <> r:4 var
+R2017:2017 Peony.RelocDisjoint <> i:5 var
+def 2207:2212 <> apply1
+R2219:2223 Peony.RelocDisjoint <> reloc rec
+binder 2215:2215 <> r:6
+R2231:2233 Peony.RelocDisjoint <> mem def
+binder 2227:2227 <> m:7
+R2238:2240 Peony.RelocDisjoint <> mem def
+binder 2251:2251 <> a:8
+R2263:2266 Corelib.Init.Datatypes <> andb def
+R2291:2297 Stdlib.Arith.PeanoNat Nat ltb def
+R2299:2299 Peony.RelocDisjoint <> a:8 var
+R2309:2311 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R2302:2306 Peony.RelocDisjoint <> r_off proj
+R2308:2308 Peony.RelocDisjoint <> r:6 var
+R2312:2317 Corelib.Init.Datatypes <> length def
+R2320:2326 Peony.RelocDisjoint <> r_bytes proj
+R2328:2328 Peony.RelocDisjoint <> r:6 var
+R2269:2275 Stdlib.Arith.PeanoNat Nat leb def
+R2278:2282 Peony.RelocDisjoint <> r_off proj
+R2284:2284 Peony.RelocDisjoint <> r:6 var
+R2287:2287 Peony.RelocDisjoint <> a:8 var
+R2387:2387 Peony.RelocDisjoint <> m:7 var
+R2389:2389 Peony.RelocDisjoint <> a:8 var
+R2342:2344 Corelib.Lists.ListDef <> nth def
+R2373:2373 Peony.RelocDisjoint <> m:7 var
+R2375:2375 Peony.RelocDisjoint <> a:8 var
+R2361:2367 Peony.RelocDisjoint <> r_bytes proj
+R2369:2369 Peony.RelocDisjoint <> r:6 var
+R2348:2350 Corelib.Init.Peano <> ::nat_scope:x_'-'_x not
+R2347:2347 Peony.RelocDisjoint <> a:8 var
+R2351:2355 Peony.RelocDisjoint <> r_off proj
+R2357:2357 Peony.RelocDisjoint <> r:6 var
+def 2460:2468 <> apply_all
+R2476:2479 Corelib.Init.Datatypes <> list ind
+R2481:2485 Peony.RelocDisjoint <> reloc rec
+binder 2471:2472 <> rs:9
+R2493:2495 Peony.RelocDisjoint <> mem def
+binder 2489:2489 <> m:10
+R2500:2502 Peony.RelocDisjoint <> mem def
+R2509:2517 Stdlib.Lists.List <> fold_left def
+R2546:2546 Peony.RelocDisjoint <> m:10 var
+R2543:2544 Peony.RelocDisjoint <> rs:9 var
+binder 2524:2524 <> m:11
+binder 2526:2526 <> r:12
+R2531:2536 Peony.RelocDisjoint <> apply1 def
+R2538:2538 Peony.RelocDisjoint <> r:12 var
+R2540:2540 Peony.RelocDisjoint <> m:11 var
+def 2937:2944 <> disjoint
+R2955:2959 Peony.RelocDisjoint <> reloc rec
+binder 2947:2948 <> r1:13
+binder 2950:2951 <> r2:14
+R3016:3021 Corelib.Init.Logic <> ::type_scope:x_'\/'_x not
+R3004:3007 Corelib.Init.Peano <> ::nat_scope:x_'<='_x not
+R2982:2984 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R2974:2978 Peony.RelocDisjoint <> r_off proj
+R2980:2981 Peony.RelocDisjoint <> r1:13 var
+R2985:2990 Corelib.Init.Datatypes <> length def
+R2993:2999 Peony.RelocDisjoint <> r_bytes proj
+R3001:3002 Peony.RelocDisjoint <> r1:13 var
+R3008:3012 Peony.RelocDisjoint <> r_off proj
+R3014:3015 Peony.RelocDisjoint <> r2:14 var
+R3052:3055 Corelib.Init.Peano <> ::nat_scope:x_'<='_x not
+R3030:3032 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R3022:3026 Peony.RelocDisjoint <> r_off proj
+R3028:3029 Peony.RelocDisjoint <> r2:14 var
+R3033:3038 Corelib.Init.Datatypes <> length def
+R3041:3047 Peony.RelocDisjoint <> r_bytes proj
+R3049:3050 Peony.RelocDisjoint <> r2:14 var
+R3056:3060 Peony.RelocDisjoint <> r_off proj
+R3062:3063 Peony.RelocDisjoint <> r1:13 var
+prf 3073:3084 <> disjoint_sym
+binder 3095:3096 <> r1:15
+binder 3098:3099 <> r2:16
+R3116:3119 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3102:3109 Peony.RelocDisjoint <> disjoint def
+R3111:3112 Peony.RelocDisjoint <> r1:15 var
+R3114:3115 Peony.RelocDisjoint <> r2:16 var
+R3120:3127 Peony.RelocDisjoint <> disjoint def
+R3129:3130 Peony.RelocDisjoint <> r2:16 var
+R3132:3133 Peony.RelocDisjoint <> r1:15 var
+R3150:3157 Peony.RelocDisjoint <> disjoint def
+prf 3350:3363 <> apply1_outside
+binder 3376:3376 <> r:17
+binder 3378:3378 <> m:18
+binder 3380:3380 <> a:19
+R3439:3446 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3387:3389 Corelib.Init.Logic <> ::type_scope:'~'_x not
+R3438:3438 Corelib.Init.Logic <> ::type_scope:'~'_x not
+R3402:3405 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+R3397:3400 Corelib.Init.Peano <> ::nat_scope:x_'<='_x not
+R3390:3394 Peony.RelocDisjoint <> r_off proj
+R3396:3396 Peony.RelocDisjoint <> r:17 var
+R3401:3401 Peony.RelocDisjoint <> a:19 var
+R3407:3409 Corelib.Init.Peano <> ::nat_scope:x_'<'_x not
+R3406:3406 Peony.RelocDisjoint <> a:19 var
+R3417:3419 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R3410:3414 Peony.RelocDisjoint <> r_off proj
+R3416:3416 Peony.RelocDisjoint <> r:17 var
+R3420:3425 Corelib.Init.Datatypes <> length def
+R3428:3434 Peony.RelocDisjoint <> r_bytes proj
+R3436:3436 Peony.RelocDisjoint <> r:17 var
+R3459:3461 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R3447:3452 Peony.RelocDisjoint <> apply1 def
+R3454:3454 Peony.RelocDisjoint <> r:17 var
+R3456:3456 Peony.RelocDisjoint <> m:18 var
+R3458:3458 Peony.RelocDisjoint <> a:19 var
+R3462:3462 Peony.RelocDisjoint <> m:18 var
+R3464:3464 Peony.RelocDisjoint <> a:19 var
+R3502:3507 Peony.RelocDisjoint <> apply1 def
+R3522:3528 Stdlib.Arith.PeanoNat Nat leb def
+R3531:3535 Peony.RelocDisjoint <> r_off proj
+R3564:3570 Stdlib.Arith.PeanoNat Nat ltb def
+R3582:3584 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R3575:3579 Peony.RelocDisjoint <> r_off proj
+R3585:3590 Corelib.Init.Datatypes <> length def
+R3593:3599 Peony.RelocDisjoint <> r_bytes proj
+R3522:3528 Stdlib.Arith.PeanoNat Nat leb def
+R3531:3535 Peony.RelocDisjoint <> r_off proj
+R3564:3570 Stdlib.Arith.PeanoNat Nat ltb def
+R3582:3584 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R3575:3579 Peony.RelocDisjoint <> r_off proj
+R3585:3590 Corelib.Init.Datatypes <> length def
+R3593:3599 Peony.RelocDisjoint <> r_bytes proj
+R3564:3570 Stdlib.Arith.PeanoNat Nat ltb def
+R3582:3584 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R3575:3579 Peony.RelocDisjoint <> r_off proj
+R3585:3590 Corelib.Init.Datatypes <> length def
+R3593:3599 Peony.RelocDisjoint <> r_bytes proj
+R3647:3656 Stdlib.Arith.PeanoNat Nat leb_le thm
+R3647:3656 Stdlib.Arith.PeanoNat Nat leb_le thm
+R3672:3681 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R3672:3681 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+prf 3743:3755 <> apply1_inside
+binder 3768:3768 <> r:20
+binder 3770:3770 <> m:21
+binder 3772:3772 <> a:22
+R3791:3794 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3786:3789 Corelib.Init.Peano <> ::nat_scope:x_'<='_x not
+R3779:3783 Peony.RelocDisjoint <> r_off proj
+R3785:3785 Peony.RelocDisjoint <> r:20 var
+R3790:3790 Peony.RelocDisjoint <> a:22 var
+R3827:3834 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3796:3798 Corelib.Init.Peano <> ::nat_scope:x_'<'_x not
+R3795:3795 Peony.RelocDisjoint <> a:22 var
+R3806:3808 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R3799:3803 Peony.RelocDisjoint <> r_off proj
+R3805:3805 Peony.RelocDisjoint <> r:20 var
+R3809:3814 Corelib.Init.Datatypes <> length def
+R3817:3823 Peony.RelocDisjoint <> r_bytes proj
+R3825:3825 Peony.RelocDisjoint <> r:20 var
+R3847:3849 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R3835:3840 Peony.RelocDisjoint <> apply1 def
+R3842:3842 Peony.RelocDisjoint <> r:20 var
+R3844:3844 Peony.RelocDisjoint <> m:21 var
+R3846:3846 Peony.RelocDisjoint <> a:22 var
+R3850:3852 Corelib.Lists.ListDef <> nth def
+R3881:3881 Peony.RelocDisjoint <> m:21 var
+R3883:3883 Peony.RelocDisjoint <> a:22 var
+R3869:3875 Peony.RelocDisjoint <> r_bytes proj
+R3877:3877 Peony.RelocDisjoint <> r:20 var
+R3856:3858 Corelib.Init.Peano <> ::nat_scope:x_'-'_x not
+R3855:3855 Peony.RelocDisjoint <> a:22 var
+R3859:3863 Peony.RelocDisjoint <> r_off proj
+R3865:3865 Peony.RelocDisjoint <> r:20 var
+R3925:3930 Peony.RelocDisjoint <> apply1 def
+R3941:3950 Stdlib.Arith.PeanoNat Nat leb_le thm
+R3941:3950 Stdlib.Arith.PeanoNat Nat leb_le thm
+R3966:3975 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R3966:3975 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+prf 4484:4493 <> apply_comm
+binder 4506:4507 <> r1:23
+binder 4509:4510 <> r2:24
+binder 4512:4512 <> m:25
+R4533:4540 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R4519:4526 Peony.RelocDisjoint <> disjoint def
+R4528:4529 Peony.RelocDisjoint <> r1:23 var
+R4531:4532 Peony.RelocDisjoint <> r2:24 var
+R4564:4566 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R4541:4546 Peony.RelocDisjoint <> apply1 def
+R4548:4549 Peony.RelocDisjoint <> r1:23 var
+R4552:4557 Peony.RelocDisjoint <> apply1 def
+R4559:4560 Peony.RelocDisjoint <> r2:24 var
+R4562:4562 Peony.RelocDisjoint <> m:25 var
+R4567:4572 Peony.RelocDisjoint <> apply1 def
+R4574:4575 Peony.RelocDisjoint <> r2:24 var
+R4578:4583 Peony.RelocDisjoint <> apply1 def
+R4585:4586 Peony.RelocDisjoint <> r1:23 var
+R4588:4588 Peony.RelocDisjoint <> m:25 var
+R4630:4654 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R4630:4654 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R4675:4682 Peony.RelocDisjoint <> disjoint def
+R4893:4898 Peony.RelocDisjoint <> apply1 def
+R4913:4919 Stdlib.Arith.PeanoNat Nat leb def
+R4922:4926 Peony.RelocDisjoint <> r_off proj
+R4956:4962 Stdlib.Arith.PeanoNat Nat ltb def
+R4975:4977 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R4967:4971 Peony.RelocDisjoint <> r_off proj
+R4978:4983 Corelib.Init.Datatypes <> length def
+R4986:4992 Peony.RelocDisjoint <> r_bytes proj
+R5021:5027 Stdlib.Arith.PeanoNat Nat leb def
+R5030:5034 Peony.RelocDisjoint <> r_off proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5163:5165 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5152:5158 Stdlib.Arith.PeanoNat Nat leb def
+R5166:5169 Corelib.Init.Datatypes <> true constr
+R5163:5165 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5152:5158 Stdlib.Arith.PeanoNat Nat leb def
+R5166:5169 Corelib.Init.Datatypes <> true constr
+R5225:5227 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5214:5220 Stdlib.Arith.PeanoNat Nat leb def
+R5228:5232 Corelib.Init.Datatypes <> false constr
+R5225:5227 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5214:5220 Stdlib.Arith.PeanoNat Nat leb def
+R5228:5232 Corelib.Init.Datatypes <> false constr
+R5288:5290 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5277:5283 Stdlib.Arith.PeanoNat Nat ltb def
+R5291:5294 Corelib.Init.Datatypes <> true constr
+R5288:5290 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5277:5283 Stdlib.Arith.PeanoNat Nat ltb def
+R5291:5294 Corelib.Init.Datatypes <> true constr
+R5350:5352 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5339:5345 Stdlib.Arith.PeanoNat Nat ltb def
+R5353:5357 Corelib.Init.Datatypes <> false constr
+R5350:5352 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5339:5345 Stdlib.Arith.PeanoNat Nat ltb def
+R5353:5357 Corelib.Init.Datatypes <> false constr
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R4913:4919 Stdlib.Arith.PeanoNat Nat leb def
+R4922:4926 Peony.RelocDisjoint <> r_off proj
+R4956:4962 Stdlib.Arith.PeanoNat Nat ltb def
+R4975:4977 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R4967:4971 Peony.RelocDisjoint <> r_off proj
+R4978:4983 Corelib.Init.Datatypes <> length def
+R4986:4992 Peony.RelocDisjoint <> r_bytes proj
+R4956:4962 Stdlib.Arith.PeanoNat Nat ltb def
+R4975:4977 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R4967:4971 Peony.RelocDisjoint <> r_off proj
+R4978:4983 Corelib.Init.Datatypes <> length def
+R4986:4992 Peony.RelocDisjoint <> r_bytes proj
+R5021:5027 Stdlib.Arith.PeanoNat Nat leb def
+R5030:5034 Peony.RelocDisjoint <> r_off proj
+R5021:5027 Stdlib.Arith.PeanoNat Nat leb def
+R5030:5034 Peony.RelocDisjoint <> r_off proj
+R5021:5027 Stdlib.Arith.PeanoNat Nat leb def
+R5030:5034 Peony.RelocDisjoint <> r_off proj
+R5021:5027 Stdlib.Arith.PeanoNat Nat leb def
+R5030:5034 Peony.RelocDisjoint <> r_off proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5064:5070 Stdlib.Arith.PeanoNat Nat ltb def
+R5083:5085 Corelib.Init.Peano <> ::nat_scope:x_'+'_x not
+R5075:5079 Peony.RelocDisjoint <> r_off proj
+R5086:5091 Corelib.Init.Datatypes <> length def
+R5094:5100 Peony.RelocDisjoint <> r_bytes proj
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5188:5197 Stdlib.Arith.PeanoNat Nat leb_le thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5313:5322 Stdlib.Arith.PeanoNat Nat ltb_lt thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5250:5260 Stdlib.Arith.PeanoNat Nat leb_nle thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+R5375:5384 Stdlib.Arith.PeanoNat Nat ltb_ge thm
+ind 5725:5741 <> pairwise_disjoint
+constr 5769:5774 <> pd_nil
+constr 5802:5808 <> pd_cons
+R5755:5758 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R5745:5748 Corelib.Init.Datatypes <> list ind
+R5750:5754 Peony.RelocDisjoint <> reloc rec
+R5779:5795 Peony.RelocDisjoint <> pairwise_disjoint:26 ind
+R5797:5798 Stdlib.Lists.List ListNotations ::list_scope:'['_']' not
+binder 5819:5819 <> r:28
+binder 5821:5822 <> rs:29
+R5851:5858 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R5829:5834 Corelib.Lists.ListDef <> Forall ind
+R5849:5850 Peony.RelocDisjoint <> rs:29 var
+R5837:5844 Peony.RelocDisjoint <> disjoint def
+R5846:5846 Peony.RelocDisjoint <> r:28 var
+R5879:5886 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R5859:5875 Peony.RelocDisjoint <> pairwise_disjoint:26 ind
+R5877:5878 Peony.RelocDisjoint <> rs:29 var
+R5887:5903 Peony.RelocDisjoint <> pairwise_disjoint:26 ind
+R5907:5910 Corelib.Init.Datatypes <> ::list_scope:x_'::'_x not
+R5906:5906 Peony.RelocDisjoint <> r:28 var
+R5911:5912 Peony.RelocDisjoint <> rs:29 var
+scheme 5725:5741 <> pairwise_disjoint_ind
+scheme 5725:5741 <> pairwise_disjoint_sind
+prf 6081:6094 <> apply_all_push
+binder 6107:6108 <> rs:30
+binder 6110:6110 <> r:31
+binder 6112:6112 <> m:32
+R6141:6148 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R6119:6124 Corelib.Lists.ListDef <> Forall ind
+R6139:6140 Peony.RelocDisjoint <> rs:30 var
+R6127:6134 Peony.RelocDisjoint <> disjoint def
+R6136:6136 Peony.RelocDisjoint <> r:31 var
+R6174:6176 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R6149:6157 Peony.RelocDisjoint <> apply_all def
+R6159:6160 Peony.RelocDisjoint <> rs:30 var
+R6163:6168 Peony.RelocDisjoint <> apply1 def
+R6170:6170 Peony.RelocDisjoint <> r:31 var
+R6172:6172 Peony.RelocDisjoint <> m:32 var
+R6177:6182 Peony.RelocDisjoint <> apply1 def
+R6184:6184 Peony.RelocDisjoint <> r:31 var
+R6187:6195 Peony.RelocDisjoint <> apply_all def
+R6197:6198 Peony.RelocDisjoint <> rs:30 var
+R6200:6200 Peony.RelocDisjoint <> m:32 var
+R6431:6442 Peony.RelocDisjoint <> disjoint_sym thm
+R6410:6419 Peony.RelocDisjoint <> apply_comm thm
+R6410:6419 Peony.RelocDisjoint <> apply_comm thm
+R6431:6442 Peony.RelocDisjoint <> disjoint_sym thm
+R6410:6419 Peony.RelocDisjoint <> apply_comm thm
+prf 6837:6847 <> Forall_perm
+R6868:6871 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R6863:6867 Peony.RelocDisjoint <> reloc rec
+binder 6859:6859 <> P:33
+binder 6878:6879 <> l1:34
+binder 6881:6882 <> l2:35
+R6904:6907 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R6887:6897 Stdlib.Sorting.Permutation <> Permutation ind
+R6902:6903 Peony.RelocDisjoint <> l2:35 var
+R6899:6900 Peony.RelocDisjoint <> l1:34 var
+R6919:6922 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R6908:6913 Corelib.Lists.ListDef <> Forall ind
+R6917:6918 Peony.RelocDisjoint <> l1:34 var
+R6915:6915 Peony.RelocDisjoint <> P:33 var
+R6923:6928 Corelib.Lists.ListDef <> Forall ind
+R6932:6933 Peony.RelocDisjoint <> l2:35 var
+R6930:6930 Peony.RelocDisjoint <> P:33 var
+prf 7168:7189 <> pairwise_disjoint_perm
+binder 7200:7201 <> l1:36
+binder 7203:7204 <> l2:37
+R7226:7229 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R7209:7219 Stdlib.Sorting.Permutation <> Permutation ind
+R7224:7225 Peony.RelocDisjoint <> l2:37 var
+R7221:7222 Peony.RelocDisjoint <> l1:36 var
+R7250:7253 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R7230:7246 Peony.RelocDisjoint <> pairwise_disjoint ind
+R7248:7249 Peony.RelocDisjoint <> l1:36 var
+R7254:7270 Peony.RelocDisjoint <> pairwise_disjoint ind
+R7272:7273 Peony.RelocDisjoint <> l2:37 var
+R7393:7403 Peony.RelocDisjoint <> Forall_perm thm
+R7406:7413 Peony.RelocDisjoint <> disjoint def
+R7393:7403 Peony.RelocDisjoint <> Forall_perm thm
+R7406:7413 Peony.RelocDisjoint <> disjoint def
+R7633:7644 Peony.RelocDisjoint <> disjoint_sym thm
+R7633:7644 Peony.RelocDisjoint <> disjoint_sym thm
+prf 8122:8145 <> apply_all_perm_invariant
+binder 8158:8159 <> l1:38
+binder 8161:8162 <> l2:39
+binder 8164:8164 <> m:40
+R8188:8195 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R8171:8181 Stdlib.Sorting.Permutation <> Permutation ind
+R8186:8187 Peony.RelocDisjoint <> l2:39 var
+R8183:8184 Peony.RelocDisjoint <> l1:38 var
+R8216:8223 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R8196:8212 Peony.RelocDisjoint <> pairwise_disjoint ind
+R8214:8215 Peony.RelocDisjoint <> l1:38 var
+R8238:8240 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R8224:8232 Peony.RelocDisjoint <> apply_all def
+R8234:8235 Peony.RelocDisjoint <> l1:38 var
+R8237:8237 Peony.RelocDisjoint <> m:40 var
+R8241:8249 Peony.RelocDisjoint <> apply_all def
+R8251:8252 Peony.RelocDisjoint <> l2:39 var
+R8254:8254 Peony.RelocDisjoint <> m:40 var
+R8701:8712 Peony.RelocDisjoint <> disjoint_sym thm
+R8680:8689 Peony.RelocDisjoint <> apply_comm thm
+R8680:8689 Peony.RelocDisjoint <> apply_comm thm
+R8701:8712 Peony.RelocDisjoint <> disjoint_sym thm
+R8680:8689 Peony.RelocDisjoint <> apply_comm thm
+R8820:8841 Peony.RelocDisjoint <> pairwise_disjoint_perm thm
+R8820:8841 Peony.RelocDisjoint <> pairwise_disjoint_perm thm
+prf 9065:9092 <> parallel_reloc_deterministic
+binder 9105:9110 <> sched1:41
+binder 9112:9117 <> sched2:42
+binder 9119:9119 <> m:43
+R9151:9158 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R9126:9136 Stdlib.Sorting.Permutation <> Permutation ind
+R9145:9150 Peony.RelocDisjoint <> sched2:42 var
+R9138:9143 Peony.RelocDisjoint <> sched1:41 var
+R9183:9190 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R9159:9175 Peony.RelocDisjoint <> pairwise_disjoint ind
+R9177:9182 Peony.RelocDisjoint <> sched1:41 var
+R9209:9211 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R9191:9199 Peony.RelocDisjoint <> apply_all def
+R9201:9206 Peony.RelocDisjoint <> sched1:41 var
+R9208:9208 Peony.RelocDisjoint <> m:43 var
+R9212:9220 Peony.RelocDisjoint <> apply_all def
+R9222:9227 Peony.RelocDisjoint <> sched2:42 var
+R9229:9229 Peony.RelocDisjoint <> m:43 var
+R9254:9277 Peony.RelocDisjoint <> apply_all_perm_invariant thm
+R9254:9277 Peony.RelocDisjoint <> apply_all_perm_invariant thm

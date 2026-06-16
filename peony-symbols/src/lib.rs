@@ -1,0 +1,496 @@
+//! `peony-symbols` — Global symbol table: resolution, weak/strong rules.
+//!
+//! This crate owns the **global symbol table** built from all input objects.
+//! It implements the standard Unix symbol resolution rules:
+//!
+//! 1. Strong global > weak global > undefined.
+//! 2. First strong definition wins; a second strong definition is a duplicate
+//!    symbol error.
+//! 3. Weak definitions are replaced by strong definitions silently.
+//!
+//! Each defined symbol records the *defining object*, its *input section index*,
+//! and its *value* (offset within that section). After layout assigns section
+//! addresses, [`SymbolResolution::virtual_address`] is filled by
+//! `peony_layout::finalize_symbols` as `section_address + value`.
+//!
+//! ## References
+//!
+//! * MaskRay, "Why isn't ld.lld faster?" — symbol resolution pass description
+//! * mold design.md — string interning + parallel symbol table init
+//! * Maier et al. arXiv:1601.04017 — lock-free linear-probing hash tables
+
+use std::hash::{Hash, Hasher};
+
+use peony_object::{Binding, InputObject, InputSymbol};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use thiserror::Error;
+
+// ── PreHashed — QUAD §2.3 (Wild PassThroughHashMap pattern) ─────────────────
+
+/// A key wrapper that pre-computes the hash once and never re-hashes.
+///
+/// This implements Lemma 2.3 from QUAD: symbol names hashed once during input
+/// scan, reused for all subsequent lookups, giving ~10× fewer hash computations
+/// for Rust mangled names (avg ~80 bytes).
+#[derive(Clone, Eq)]
+pub struct PreHashed<K> {
+    hash: u64,
+    pub key: K,
+}
+
+impl<K: Hash> PreHashed<K> {
+    pub fn new(key: K) -> Self {
+        let mut h = FxHasher::default();
+        key.hash(&mut h);
+        Self {
+            hash: h.finish(),
+            key,
+        }
+    }
+}
+
+impl<K: PartialEq> PartialEq for PreHashed<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.key == other.key
+    }
+}
+
+impl<K> Hash for PreHashed<K> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl<K: std::fmt::Debug> std::fmt::Debug for PreHashed<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.key.fmt(f)
+    }
+}
+
+/// Convenience: hash a byte slice with FxHasher and return the u64 hash.
+pub fn fx_hash(data: &[u8]) -> u64 {
+    let mut h = FxHasher::default();
+    data.hash(&mut h);
+    h.finish()
+}
+
+// ── Error type ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum SymbolError {
+    #[error("duplicate symbol `{name}`: defined in both `{first}` and `{second}`")]
+    DuplicateSymbol {
+        name: String,
+        first: String,
+        second: String,
+    },
+    #[error("undefined symbol `{name}` (referenced but never defined)")]
+    UndefinedSymbol { name: String },
+}
+
+pub type Result<T> = std::result::Result<T, SymbolError>;
+
+// ── Symbol IDs ────────────────────────────────────────────────────────────────
+
+/// Compact, dense identifier for a symbol in the global table.
+///
+/// IDs are assigned in insertion order and are stable within a single link.
+/// In incremental mode they are persisted to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId(pub u32);
+
+/// Which input object defines this symbol (or where it was first seen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectId(pub u32);
+
+// ── Resolution state ──────────────────────────────────────────────────────────
+
+/// The fully resolved state of one global symbol.
+#[derive(Debug, Clone)]
+pub struct SymbolResolution {
+    pub id: SymbolId,
+    pub binding: Binding,
+    /// Object that provides the definition (`None` if still undefined).
+    pub defined_in: Option<ObjectId>,
+    /// Input-section index (within `defined_in`) of the definition.
+    /// `None` for absolute symbols and undefined references.
+    pub section_index: Option<usize>,
+    /// Symbol value: offset within its input section (or absolute value).
+    pub value: u64,
+    /// Symbol size in bytes (for `.symtab`).
+    pub size: u64,
+    /// `Some((size, align))` if this is a tentative (common) definition awaiting
+    /// allocation in `.bss`. A real definition overrides it.
+    pub common: Option<(u64, u64)>,
+    /// Defined by a shared library (resolved at runtime via the GOT).
+    pub import: bool,
+    /// Index assigned in `.dynsym` (for imports); 0 = unassigned.
+    pub dynsym_index: u32,
+    /// Virtual address assigned during layout (zero until `finalize_symbols`).
+    pub virtual_address: u64,
+    /// GOT slot address (0 = not needed).
+    pub got_address: u64,
+    /// PLT stub address (0 = not needed; static links resolve PLT32 directly).
+    pub plt_address: u64,
+    /// Initial-Exec GOT slot address holding this symbol's TP offset (0 = none).
+    pub gottp_address: u64,
+}
+
+impl SymbolResolution {
+    /// A symbol is "defined" if it has a local definition or is satisfied by a
+    /// shared library import.
+    pub fn is_defined(&self) -> bool {
+        self.defined_in.is_some() || self.import
+    }
+}
+
+// ── Global symbol table ───────────────────────────────────────────────────────
+
+/// The global symbol table built from all input objects.
+pub struct SymbolTable {
+    /// Map from raw symbol name bytes → resolution.
+    resolutions: FxHashMap<Vec<u8>, SymbolResolution>,
+    /// Dense list of all symbol names in ID order (for reverse lookup).
+    names: Vec<Vec<u8>>,
+    /// Names of input objects (for error messages).
+    object_paths: Vec<String>,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            resolutions: FxHashMap::default(),
+            names: Vec::new(),
+            object_paths: Vec::new(),
+        }
+    }
+
+    /// Register an input object and return its [`ObjectId`].
+    pub fn add_object(&mut self, path: String) -> ObjectId {
+        let id = ObjectId(self.object_paths.len() as u32);
+        self.object_paths.push(path);
+        id
+    }
+
+    /// Process all global/weak symbols from one input object.
+    pub fn process_object(&mut self, obj_id: ObjectId, obj: &InputObject) -> Result<()> {
+        self.process_object_excluding(obj_id, obj, &FxHashSet::default())
+    }
+
+    /// Like [`process_object`], but skips symbols defined in `excluded` input
+    /// sections (used to drop deduplicated COMDAT group members).
+    pub fn process_object_excluding(
+        &mut self,
+        obj_id: ObjectId,
+        obj: &InputObject,
+        excluded: &FxHashSet<usize>,
+    ) -> Result<()> {
+        for sym in &obj.symbols {
+            if sym.binding == Binding::Local {
+                continue; // locals are never in the global table
+            }
+            if sym.name.is_empty() {
+                continue;
+            }
+            if let Some(si) = sym.section {
+                if excluded.contains(&si.0) {
+                    continue; // symbol lives in a discarded COMDAT section
+                }
+            }
+            self.merge_symbol(obj_id, sym)?;
+        }
+        Ok(())
+    }
+
+    fn merge_symbol(&mut self, obj_id: ObjectId, sym: &InputSymbol) -> Result<()> {
+        if sym.is_undefined {
+            // Track the strongest binding of any undefined reference: a STRONG
+            // (global) undefined reference must be satisfied, whereas a purely
+            // WEAK undefined reference is allowed and resolves to zero.
+            match self.resolutions.get_mut(&sym.name) {
+                Some(e) if e.defined_in.is_some() => {} // already defined
+                Some(e) => {
+                    if sym.binding == Binding::Global {
+                        e.binding = Binding::Global;
+                    }
+                }
+                None => {
+                    let mut u = Self::make_undefined_resolution();
+                    u.binding = sym.binding; // Weak or Global
+                    self.resolutions.insert(sym.name.clone(), u);
+                }
+            }
+            return Ok(());
+        }
+
+        if sym.is_common {
+            return self.merge_common(obj_id, sym);
+        }
+
+        let def_section = sym.section.map(|s| s.0);
+
+        // A real definition overrides any prior tentative (common) definition.
+        if let Some(e) = self.resolutions.get(&sym.name) {
+            if e.common.is_some() {
+                let e = self.resolutions.get_mut(&sym.name).unwrap();
+                e.binding = sym.binding;
+                e.defined_in = Some(obj_id);
+                e.section_index = def_section;
+                e.value = sym.value;
+                e.size = sym.size;
+                e.common = None;
+                return Ok(());
+            }
+        }
+
+        if let Some(existing) = self.resolutions.get(&sym.name) {
+            let action = conflict_action(existing, obj_id, sym, &self.object_paths)?;
+            match action {
+                ConflictAction::SatisfyUndef | ConflictAction::Upgrade => {
+                    // (Re)bind to this definition. SatisfyUndef assigns a fresh ID;
+                    // Upgrade keeps the existing ID (a weak def already had one).
+                    let assign_id = matches!(action, ConflictAction::SatisfyUndef);
+                    let new_id = if assign_id {
+                        let id = SymbolId(self.names.len() as u32);
+                        self.names.push(sym.name.clone());
+                        Some(id)
+                    } else {
+                        None
+                    };
+                    let e = self.resolutions.get_mut(&sym.name).unwrap();
+                    if let Some(id) = new_id {
+                        e.id = id;
+                    }
+                    e.binding = sym.binding;
+                    e.defined_in = Some(obj_id);
+                    e.section_index = def_section;
+                    e.value = sym.value;
+                    e.size = sym.size;
+                }
+                ConflictAction::KeepExisting => {}
+                ConflictAction::WarnLocal => {
+                    tracing::warn!(
+                        "local symbol `{}` unexpectedly reached global table",
+                        String::from_utf8_lossy(&sym.name)
+                    );
+                }
+            }
+        } else {
+            let id = SymbolId(self.names.len() as u32);
+            self.names.push(sym.name.clone());
+            self.resolutions.insert(
+                sym.name.clone(),
+                SymbolResolution {
+                    id,
+                    binding: sym.binding,
+                    defined_in: Some(obj_id),
+                    section_index: def_section,
+                    value: sym.value,
+                    size: sym.size,
+                    common: None,
+                    import: false,
+                    dynsym_index: 0,
+                    virtual_address: 0,
+                    got_address: 0,
+                    plt_address: 0,
+                    gottp_address: 0,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Merge a tentative (common) definition.
+    fn merge_common(&mut self, obj_id: ObjectId, sym: &InputSymbol) -> Result<()> {
+        let size = sym.size;
+        let align = sym.value.max(1);
+        // Snapshot the existing entry's relevant state to avoid borrow conflicts.
+        let existing = self
+            .resolutions
+            .get(&sym.name)
+            .map(|e| (e.defined_in.is_some(), e.common));
+        match existing {
+            // A real definition already wins; ignore the common.
+            Some((true, None)) => {}
+            // Merge two commons: take the maximum size and alignment.
+            Some((_, Some((es, ea)))) => {
+                let e = self.resolutions.get_mut(&sym.name).unwrap();
+                let s = size.max(es);
+                e.common = Some((s, align.max(ea)));
+                e.size = s;
+            }
+            // Existing undefined slot → turn it into a common definition.
+            Some((false, None)) => {
+                let id = SymbolId(self.names.len() as u32);
+                self.names.push(sym.name.clone());
+                let e = self.resolutions.get_mut(&sym.name).unwrap();
+                e.id = id;
+                e.binding = sym.binding;
+                e.defined_in = Some(obj_id);
+                e.section_index = None;
+                e.size = size;
+                e.common = Some((size, align));
+            }
+            None => {
+                let id = SymbolId(self.names.len() as u32);
+                self.names.push(sym.name.clone());
+                self.resolutions.insert(
+                    sym.name.clone(),
+                    SymbolResolution {
+                        id,
+                        binding: sym.binding,
+                        defined_in: Some(obj_id),
+                        section_index: None,
+                        value: 0,
+                        size,
+                        common: Some((size, align)),
+                        import: false,
+                        dynsym_index: 0,
+                        virtual_address: 0,
+                        got_address: 0,
+                        plt_address: 0,
+                        gottp_address: 0,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn make_undefined_resolution() -> SymbolResolution {
+        SymbolResolution {
+            id: SymbolId(u32::MAX),
+            binding: Binding::Global,
+            defined_in: None,
+            section_index: None,
+            value: 0,
+            size: 0,
+            common: None,
+            import: false,
+            dynsym_index: 0,
+            virtual_address: 0,
+            got_address: 0,
+            plt_address: 0,
+            gottp_address: 0,
+        }
+    }
+
+    /// Look up a symbol by name.
+    pub fn lookup(&self, name: &[u8]) -> Option<&SymbolResolution> {
+        self.resolutions.get(name)
+    }
+
+    /// Mutable lookup — used by layout to fill addresses.
+    pub fn lookup_mut(&mut self, name: &[u8]) -> Option<&mut SymbolResolution> {
+        self.resolutions.get_mut(name)
+    }
+
+    /// Mark currently-undefined symbols that a shared library exports as dynamic
+    /// imports (resolved at runtime). Returns how many references were satisfied.
+    pub fn register_shared_exports(&mut self, exports: &[Vec<u8>]) -> usize {
+        let mut n = 0;
+        for name in exports {
+            // An undefined reference satisfied by the shared library.
+            let satisfy = matches!(
+                self.resolutions.get(name),
+                Some(r) if r.defined_in.is_none() && !r.import
+            );
+            if !satisfy {
+                continue;
+            }
+            // Imports need a real SymbolId so they participate in GOT/.dynsym.
+            let id = SymbolId(self.names.len() as u32);
+            self.names.push(name.clone());
+            let r = self.resolutions.get_mut(name).unwrap();
+            r.import = true;
+            r.id = id;
+            n += 1;
+        }
+        n
+    }
+
+    /// Whether any symbol is a dynamic import (→ a dynamic executable is needed).
+    pub fn has_imports(&self) -> bool {
+        self.resolutions.values().any(|r| r.import)
+    }
+
+    /// Define (or overwrite) `name` as an absolute symbol with `value`
+    /// (used for `--defsym` and linker-provided symbols).
+    pub fn define_absolute(&mut self, name: &[u8], value: u64) {
+        let e = self
+            .resolutions
+            .entry(name.to_vec())
+            .or_insert_with(Self::make_undefined_resolution);
+        e.defined_in = Some(ObjectId(0));
+        e.section_index = None;
+        e.value = value;
+        e.virtual_address = value;
+    }
+
+    /// The name bytes for a [`SymbolId`] (only valid for *defined* symbols).
+    pub fn name_by_id(&self, id: SymbolId) -> Option<&[u8]> {
+        self.names.get(id.0 as usize).map(|v| v.as_slice())
+    }
+
+    /// Iterate over all resolutions.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &SymbolResolution)> {
+        self.resolutions.iter().map(|(k, v)| (k.as_slice(), v))
+    }
+
+    /// Mutable iteration over all resolutions (for address write-back).
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut SymbolResolution> {
+        self.resolutions.values_mut()
+    }
+
+    /// Number of distinct objects registered.
+    pub fn object_count(&self) -> usize {
+        self.object_paths.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.resolutions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.resolutions.is_empty()
+    }
+}
+
+// ── Conflict resolution helper (free function to avoid borrow issues) ─────────
+
+enum ConflictAction {
+    /// The existing entry was undefined; this definition satisfies it.
+    SatisfyUndef,
+    /// The existing entry was a weak definition; upgrade to this strong one.
+    Upgrade,
+    /// Keep the existing (stronger or equal) definition.
+    KeepExisting,
+    WarnLocal,
+}
+
+fn conflict_action(
+    existing: &SymbolResolution,
+    obj_id: ObjectId,
+    sym: &InputSymbol,
+    object_paths: &[String],
+) -> std::result::Result<ConflictAction, SymbolError> {
+    match (existing.defined_in, existing.binding, sym.binding) {
+        (None, _, _) => Ok(ConflictAction::SatisfyUndef),
+        (Some(_), Binding::Weak, Binding::Global) => Ok(ConflictAction::Upgrade),
+        (Some(_), Binding::Global, Binding::Global) => Err(SymbolError::DuplicateSymbol {
+            name: String::from_utf8_lossy(&sym.name).into_owned(),
+            first: object_paths[existing.defined_in.unwrap().0 as usize].clone(),
+            second: object_paths[obj_id.0 as usize].clone(),
+        }),
+        (Some(_), _, Binding::Weak) => Ok(ConflictAction::KeepExisting),
+        (Some(_), _, Binding::Local) | (Some(_), Binding::Local, _) => {
+            Ok(ConflictAction::WarnLocal)
+        }
+    }
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

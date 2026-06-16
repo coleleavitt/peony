@@ -1,0 +1,4 @@
+{"id":"t1","subject":"Verify workspace builds clean","status":"completed","created_at_ms":1780633020067,"archived_at_ms":1781447100126}
+{"id":"t2","subject":"Write Cargo.toml for each member crate","status":"completed","created_at_ms":1780633020067,"archived_at_ms":1781447100126}
+{"id":"t3","subject":"Write source files for all crates","status":"completed","created_at_ms":1780633020068,"archived_at_ms":1781447100126}
+{"id":"t4","subject":"Download research papers to research/","status":"completed","created_at_ms":1780845643383,"archived_at_ms":1781455142355}

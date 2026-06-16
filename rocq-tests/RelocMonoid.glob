@@ -1,0 +1,317 @@
+DIGEST 3cbeb0ccb0bd7390ef29d3ba339a6fb6
+FPeony.RelocMonoid
+R1203:1206 Stdlib.Lists.List <> <> lib
+R1208:1212 Stdlib.Arith.Arith <> <> lib
+R1214:1217 Stdlib.Bool.Bool <> <> lib
+R1219:1221 Stdlib.micromega.Lia <> <> lib
+R1251:1274 Stdlib.Logic.FunctionalExtensionality <> <> lib
+R1284:1296 Stdlib.Lists.List ListNotations <> mod
+def 1311:1314 <> addr
+R1319:1321 Corelib.Init.Datatypes <> nat ind
+def 1335:1338 <> byte
+R1343:1345 Corelib.Init.Datatypes <> nat ind
+def 1774:1778 <> patch
+R1787:1790 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R1783:1786 Peony.RelocMonoid <> addr def
+R1791:1796 Corelib.Init.Datatypes <> option ind
+R1798:1801 Peony.RelocMonoid <> byte def
+def 1816:1820 <> empty
+R1824:1828 Peony.RelocMonoid <> patch def
+R1842:1845 Corelib.Init.Datatypes <> None constr
+def 1860:1862 <> dom
+R1869:1873 Peony.RelocMonoid <> patch def
+binder 1865:1865 <> p:1
+R1881:1884 Peony.RelocMonoid <> addr def
+binder 1877:1877 <> a:2
+R1900:1903 Corelib.Init.Logic <> ::type_scope:x_'<>'_x not
+R1897:1897 Peony.RelocMonoid <> p:1 var
+R1899:1899 Peony.RelocMonoid <> a:2 var
+R1904:1907 Corelib.Init.Datatypes <> None constr
+def 2080:2089 <> compatible
+R2098:2102 Peony.RelocMonoid <> patch def
+binder 2092:2092 <> p:3
+binder 2094:2094 <> q:4
+binder 2124:2124 <> a:5
+R2137:2140 Corelib.Init.Logic <> ::type_scope:x_'\/'_x not
+R2130:2132 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R2127:2127 Peony.RelocMonoid <> p:3 var
+R2129:2129 Peony.RelocMonoid <> a:5 var
+R2133:2136 Corelib.Init.Datatypes <> None constr
+R2144:2146 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R2141:2141 Peony.RelocMonoid <> q:4 var
+R2143:2143 Peony.RelocMonoid <> a:5 var
+R2147:2150 Corelib.Init.Datatypes <> None constr
+prf 2160:2173 <> compatible_sym
+binder 2184:2184 <> p:6
+binder 2186:2186 <> q:7
+R2203:2206 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R2189:2198 Peony.RelocMonoid <> compatible def
+R2200:2200 Peony.RelocMonoid <> p:6 var
+R2202:2202 Peony.RelocMonoid <> q:7 var
+R2207:2216 Peony.RelocMonoid <> compatible def
+R2218:2218 Peony.RelocMonoid <> q:7 var
+R2220:2220 Peony.RelocMonoid <> p:6 var
+def 2453:2457 <> oplus
+R2466:2470 Peony.RelocMonoid <> patch def
+binder 2460:2460 <> p:8
+binder 2462:2462 <> q:9
+R2475:2479 Peony.RelocMonoid <> patch def
+binder 2490:2490 <> a:10
+R2501:2501 Peony.RelocMonoid <> p:8 var
+R2503:2503 Peony.RelocMonoid <> a:10 var
+R2523:2526 Corelib.Init.Datatypes <> Some constr
+R2533:2536 Corelib.Init.Datatypes <> Some constr
+R2553:2556 Corelib.Init.Datatypes <> None constr
+R2563:2563 Peony.RelocMonoid <> q:9 var
+R2565:2565 Peony.RelocMonoid <> a:10 var
+R2607:2611 Peony.RelocMonoid <> oplus def
+not 2593:2593 <> :::x_'⊕'_x
+prf 2926:2938 <> oplus_empty_l
+binder 2949:2949 <> p:11
+R2963:2965 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R2957:2961 Peony.RelocMonoid <> :::x_'⊕'_x not
+R2952:2956 Peony.RelocMonoid <> empty def
+R2962:2962 Peony.RelocMonoid <> p:11 var
+R2966:2966 Peony.RelocMonoid <> p:11 var
+R2991:3015 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R2991:3015 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+prf 3054:3066 <> oplus_empty_r
+binder 3077:3077 <> p:12
+R3091:3093 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R3081:3085 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3080:3080 Peony.RelocMonoid <> p:12 var
+R3086:3090 Peony.RelocMonoid <> empty def
+R3094:3094 Peony.RelocMonoid <> p:12 var
+R3121:3145 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R3121:3145 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R3166:3170 Peony.RelocMonoid <> oplus def
+R3173:3177 Peony.RelocMonoid <> empty def
+prf 3300:3310 <> oplus_assoc
+binder 3321:3321 <> p:13
+binder 3323:3323 <> q:14
+binder 3325:3325 <> r:15
+R3343:3345 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R3328:3328 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3336:3341 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3330:3334 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3329:3329 Peony.RelocMonoid <> p:13 var
+R3335:3335 Peony.RelocMonoid <> q:14 var
+R3342:3342 Peony.RelocMonoid <> r:15 var
+R3347:3352 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3360:3360 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3346:3346 Peony.RelocMonoid <> p:13 var
+R3354:3358 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3353:3353 Peony.RelocMonoid <> q:14 var
+R3359:3359 Peony.RelocMonoid <> r:15 var
+R3392:3416 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R3392:3416 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R3437:3441 Peony.RelocMonoid <> oplus def
+prf 3568:3577 <> oplus_comm
+binder 3588:3588 <> p:16
+binder 3590:3590 <> q:17
+R3607:3610 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3593:3602 Peony.RelocMonoid <> compatible def
+R3604:3604 Peony.RelocMonoid <> p:16 var
+R3606:3606 Peony.RelocMonoid <> q:17 var
+R3618:3620 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R3612:3616 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3611:3611 Peony.RelocMonoid <> p:16 var
+R3617:3617 Peony.RelocMonoid <> q:17 var
+R3622:3626 Peony.RelocMonoid <> :::x_'⊕'_x not
+R3621:3621 Peony.RelocMonoid <> q:17 var
+R3627:3627 Peony.RelocMonoid <> p:16 var
+R3660:3684 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R3660:3684 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R3705:3709 Peony.RelocMonoid <> oplus def
+prf 3923:3938 <> compatible_oplus
+binder 3951:3951 <> p:18
+binder 3953:3953 <> q:19
+binder 3955:3955 <> r:20
+R3976:3979 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3962:3971 Peony.RelocMonoid <> compatible def
+R3973:3973 Peony.RelocMonoid <> p:18 var
+R3975:3975 Peony.RelocMonoid <> r:20 var
+R3994:3997 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R3980:3989 Peony.RelocMonoid <> compatible def
+R3991:3991 Peony.RelocMonoid <> q:19 var
+R3993:3993 Peony.RelocMonoid <> r:20 var
+R3998:4007 Peony.RelocMonoid <> compatible def
+R4011:4015 Peony.RelocMonoid <> :::x_'⊕'_x not
+R4010:4010 Peony.RelocMonoid <> p:18 var
+R4016:4016 Peony.RelocMonoid <> q:19 var
+R4019:4019 Peony.RelocMonoid <> r:20 var
+R4062:4066 Peony.RelocMonoid <> oplus def
+def 4478:4480 <> mem
+R4489:4492 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R4485:4488 Peony.RelocMonoid <> addr def
+R4493:4496 Peony.RelocMonoid <> byte def
+def 4620:4622 <> act
+R4629:4633 Peony.RelocMonoid <> patch def
+binder 4625:4625 <> p:21
+R4641:4643 Peony.RelocMonoid <> mem def
+binder 4637:4637 <> m:22
+R4648:4650 Peony.RelocMonoid <> mem def
+binder 4661:4661 <> a:23
+R4672:4672 Peony.RelocMonoid <> p:21 var
+R4674:4674 Peony.RelocMonoid <> a:23 var
+R4681:4684 Corelib.Init.Datatypes <> Some constr
+R4695:4698 Corelib.Init.Datatypes <> None constr
+R4703:4703 Peony.RelocMonoid <> m:22 var
+R4705:4705 Peony.RelocMonoid <> a:23 var
+prf 4778:4786 <> act_empty
+binder 4797:4797 <> m:24
+R4811:4813 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R4800:4802 Peony.RelocMonoid <> act def
+R4804:4808 Peony.RelocMonoid <> empty def
+R4810:4810 Peony.RelocMonoid <> m:24 var
+R4814:4814 Peony.RelocMonoid <> m:24 var
+R4839:4863 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R4839:4863 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+prf 5041:5049 <> act_oplus
+binder 5060:5060 <> p:25
+binder 5062:5062 <> q:26
+binder 5064:5064 <> m:27
+R5082:5084 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5067:5069 Peony.RelocMonoid <> act def
+R5073:5077 Peony.RelocMonoid <> :::x_'⊕'_x not
+R5072:5072 Peony.RelocMonoid <> p:25 var
+R5078:5078 Peony.RelocMonoid <> q:26 var
+R5081:5081 Peony.RelocMonoid <> m:27 var
+R5085:5087 Peony.RelocMonoid <> act def
+R5089:5089 Peony.RelocMonoid <> p:25 var
+R5092:5094 Peony.RelocMonoid <> act def
+R5096:5096 Peony.RelocMonoid <> q:26 var
+R5098:5098 Peony.RelocMonoid <> m:27 var
+R5131:5155 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R5131:5155 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R5176:5178 Peony.RelocMonoid <> act def
+R5181:5185 Peony.RelocMonoid <> oplus def
+prf 5558:5565 <> act_comm
+binder 5578:5578 <> p:28
+binder 5580:5580 <> q:29
+binder 5582:5582 <> m:30
+R5599:5606 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R5585:5594 Peony.RelocMonoid <> compatible def
+R5596:5596 Peony.RelocMonoid <> p:28 var
+R5598:5598 Peony.RelocMonoid <> q:29 var
+R5622:5624 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R5607:5609 Peony.RelocMonoid <> act def
+R5611:5611 Peony.RelocMonoid <> p:28 var
+R5614:5616 Peony.RelocMonoid <> act def
+R5618:5618 Peony.RelocMonoid <> q:29 var
+R5620:5620 Peony.RelocMonoid <> m:30 var
+R5625:5627 Peony.RelocMonoid <> act def
+R5629:5629 Peony.RelocMonoid <> q:29 var
+R5632:5634 Peony.RelocMonoid <> act def
+R5636:5636 Peony.RelocMonoid <> p:28 var
+R5638:5638 Peony.RelocMonoid <> m:30 var
+R5681:5689 Peony.RelocMonoid <> act_oplus thm
+R5695:5703 Peony.RelocMonoid <> act_oplus thm
+R5681:5689 Peony.RelocMonoid <> act_oplus thm
+R5681:5689 Peony.RelocMonoid <> act_oplus thm
+R5695:5703 Peony.RelocMonoid <> act_oplus thm
+R5695:5703 Peony.RelocMonoid <> act_oplus thm
+R5717:5726 Peony.RelocMonoid <> oplus_comm thm
+R5717:5726 Peony.RelocMonoid <> oplus_comm thm
+R5717:5726 Peony.RelocMonoid <> oplus_comm thm
+def 6029:6035 <> combine
+R6043:6046 Corelib.Init.Datatypes <> list ind
+R6048:6052 Peony.RelocMonoid <> patch def
+binder 6038:6039 <> ps:31
+R6057:6061 Peony.RelocMonoid <> patch def
+R6066:6075 Stdlib.Lists.List <> fold_right def
+R6089:6090 Peony.RelocMonoid <> ps:31 var
+R6083:6087 Peony.RelocMonoid <> empty def
+R6077:6081 Peony.RelocMonoid <> oplus def
+prf 6338:6348 <> act_combine
+binder 6361:6362 <> ps:32
+binder 6364:6364 <> m:33
+R6385:6387 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R6367:6369 Peony.RelocMonoid <> act def
+R6372:6378 Peony.RelocMonoid <> combine def
+R6380:6381 Peony.RelocMonoid <> ps:32 var
+R6384:6384 Peony.RelocMonoid <> m:33 var
+R6388:6397 Stdlib.Lists.List <> fold_right def
+R6405:6406 Peony.RelocMonoid <> ps:32 var
+R6403:6403 Peony.RelocMonoid <> m:33 var
+R6399:6401 Peony.RelocMonoid <> act def
+R6472:6480 Peony.RelocMonoid <> act_empty thm
+R6472:6480 Peony.RelocMonoid <> act_empty thm
+R6495:6503 Peony.RelocMonoid <> act_oplus thm
+R6495:6503 Peony.RelocMonoid <> act_oplus thm
+R6495:6503 Peony.RelocMonoid <> act_oplus thm
+prf 6842:6858 <> reloc_pcm_summary
+R6864:6864 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+R6890:6896 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+binder 6872:6872 <> p:34
+R6886:6888 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R6880:6884 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6875:6879 Peony.RelocMonoid <> empty def
+R6885:6885 Peony.RelocMonoid <> p:34 var
+R6889:6889 Peony.RelocMonoid <> p:34 var
+R6897:6897 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+R6923:6929 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+binder 6905:6905 <> p:35
+R6919:6921 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R6909:6913 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6908:6908 Peony.RelocMonoid <> p:35 var
+R6914:6918 Peony.RelocMonoid <> empty def
+R6922:6922 Peony.RelocMonoid <> p:35 var
+R6930:6930 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+R6978:6984 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+binder 6938:6938 <> p:36
+binder 6940:6940 <> q:37
+binder 6942:6942 <> r:38
+R6960:6962 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R6945:6945 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6953:6958 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6947:6951 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6946:6946 Peony.RelocMonoid <> p:36 var
+R6952:6952 Peony.RelocMonoid <> q:37 var
+R6959:6959 Peony.RelocMonoid <> r:38 var
+R6964:6969 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6977:6977 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6963:6963 Peony.RelocMonoid <> p:36 var
+R6971:6975 Peony.RelocMonoid <> :::x_'⊕'_x not
+R6970:6970 Peony.RelocMonoid <> q:37 var
+R6976:6976 Peony.RelocMonoid <> r:38 var
+R6985:6985 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+R7033:7040 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+R7088:7088 Corelib.Init.Logic <> ::type_scope:x_'/\'_x not
+binder 6993:6993 <> p:39
+binder 6995:6995 <> q:40
+R7012:7015 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R6998:7007 Peony.RelocMonoid <> compatible def
+R7009:7009 Peony.RelocMonoid <> p:39 var
+R7011:7011 Peony.RelocMonoid <> q:40 var
+R7023:7025 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R7017:7021 Peony.RelocMonoid <> :::x_'⊕'_x not
+R7016:7016 Peony.RelocMonoid <> p:39 var
+R7022:7022 Peony.RelocMonoid <> q:40 var
+R7027:7031 Peony.RelocMonoid <> :::x_'⊕'_x not
+R7026:7026 Peony.RelocMonoid <> q:40 var
+R7032:7032 Peony.RelocMonoid <> p:39 var
+binder 7048:7048 <> p:41
+binder 7050:7050 <> q:42
+binder 7052:7052 <> m:43
+R7070:7072 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R7055:7057 Peony.RelocMonoid <> act def
+R7061:7065 Peony.RelocMonoid <> :::x_'⊕'_x not
+R7060:7060 Peony.RelocMonoid <> p:41 var
+R7066:7066 Peony.RelocMonoid <> q:42 var
+R7069:7069 Peony.RelocMonoid <> m:43 var
+R7073:7075 Peony.RelocMonoid <> act def
+R7077:7077 Peony.RelocMonoid <> p:41 var
+R7080:7082 Peony.RelocMonoid <> act def
+R7084:7084 Peony.RelocMonoid <> q:42 var
+R7086:7086 Peony.RelocMonoid <> m:43 var
+R7114:7126 Peony.RelocMonoid <> oplus_empty_l thm
+R7114:7126 Peony.RelocMonoid <> oplus_empty_l thm
+R7147:7159 Peony.RelocMonoid <> oplus_empty_r thm
+R7147:7159 Peony.RelocMonoid <> oplus_empty_r thm
+R7180:7190 Peony.RelocMonoid <> oplus_assoc thm
+R7180:7190 Peony.RelocMonoid <> oplus_assoc thm
+R7211:7220 Peony.RelocMonoid <> oplus_comm thm
+R7211:7220 Peony.RelocMonoid <> oplus_comm thm
+R7233:7241 Peony.RelocMonoid <> act_oplus thm
+R7233:7241 Peony.RelocMonoid <> act_oplus thm

@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C3HG5LHWPX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C3HG5LHWPX');
+</script>
+<!-- End Google Analytics -->
+
+  
+  <title>All about Procedure Linkage Table | MaskRay</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <meta name="description" content="Updated in 2024-01. Branch target Many architectures encode a branch&#x2F;jump&#x2F;call instruction with PC-relative addressing, i.e. the distance to the target is encoded in the instruction. In an executable">
+<meta property="og:type" content="article">
+<meta property="og:title" content="All about Procedure Linkage Table">
+<meta property="og:url" content="https://maskray.me/blog/2021-09-19-all-about-procedure-linkage-table">
+<meta property="og:site_name" content="MaskRay">
+<meta property="og:description" content="Updated in 2024-01. Branch target Many architectures encode a branch&#x2F;jump&#x2F;call instruction with PC-relative addressing, i.e. the distance to the target is encoded in the instruction. In an executable">
+<meta property="og:locale" content="en_US">
+<meta property="article:published_time" content="2021-09-19T07:00:00.000Z">
+<meta property="article:modified_time" content="2026-01-20T03:21:30.793Z">
+<meta property="article:author" content="MaskRay">
+<meta property="article:tag" content="linker">
+<meta property="article:tag" content="binutils">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:creator" content="@HaskRay">
+  
+    <link rel="alternate" href="/blog/atom.xml" title="MaskRay" type="application/atom+xml">
+  
+  
+    <link rel="shortcut icon" href="/blog/favicon.png">
+  
+  
+    
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/typeface-source-code-pro@0.0.71/index.min.css">
+
+  
+  
+<link rel="stylesheet" href="/blog/css/style.css">
+
+  
+    
+<link rel="stylesheet" href="/blog/fancybox/jquery.fancybox.min.css">
+
+  
+  
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fork-awesome@1.2.0/css/fork-awesome.min.css">
+
+<meta name="generator" content="Hexo 6.3.0"><style>mjx-container[jax="SVG"] {
+  direction: ltr;
+}
+
+mjx-container[jax="SVG"] > svg {
+  overflow: visible;
+}
+
+mjx-container[jax="SVG"] > svg a {
+  fill: blue;
+  stroke: blue;
+}
+
+mjx-container[jax="SVG"][display="true"] {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+}
+
+mjx-container[jax="SVG"][justify="left"] {
+  text-align: left;
+}
+
+mjx-container[jax="SVG"][justify="right"] {
+  text-align: right;
+}
+
+g[data-mml-node="merror"] > g {
+  fill: red;
+  stroke: red;
+}
+
+g[data-mml-node="merror"] > rect[data-background] {
+  fill: yellow;
+  stroke: none;
+}
+
+g[data-mml-node="mtable"] > line[data-line] {
+  stroke-width: 70px;
+  fill: none;
+}
+
+g[data-mml-node="mtable"] > rect[data-frame] {
+  stroke-width: 70px;
+  fill: none;
+}
+
+g[data-mml-node="mtable"] > .mjx-dashed {
+  stroke-dasharray: 140;
+}
+
+g[data-mml-node="mtable"] > .mjx-dotted {
+  stroke-linecap: round;
+  stroke-dasharray: 0,140;
+}
+
+g[data-mml-node="mtable"] > svg {
+  overflow: visible;
+}
+
+[jax="SVG"] mjx-tool {
+  display: inline-block;
+  position: relative;
+  width: 0;
+  height: 0;
+}
+
+[jax="SVG"] mjx-tool > mjx-tip {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+mjx-tool > mjx-tip {
+  display: inline-block;
+  padding: .2em;
+  border: 1px solid #888;
+  font-size: 70%;
+  background-color: #F8F8F8;
+  color: black;
+  box-shadow: 2px 2px 5px #AAAAAA;
+}
+
+g[data-mml-node="maction"][data-toggle] {
+  cursor: pointer;
+}
+
+mjx-status {
+  display: block;
+  position: fixed;
+  left: 1em;
+  bottom: 1em;
+  min-width: 25%;
+  padding: .2em .4em;
+  border: 1px solid #888;
+  font-size: 90%;
+  background-color: #F8F8F8;
+  color: black;
+}
+
+foreignObject[data-mjx-xml] {
+  font-family: initial;
+  line-height: normal;
+  overflow: visible;
+}
+
+.MathJax path {
+  stroke-width: 3;
+}
+
+mjx-container[display="true"] {
+  overflow: auto hidden;
+}
+
+mjx-container[display="true"] + br {
+  display: none;
+}
+</style></head>
+
+<body>
+  <div id="container">
+    <div id="wrap">
+      <header id="header">
+  <div id="banner"></div>
+  <div id="header-outer" class="outer">
+    <div id="header-title" class="inner">
+      <h1 id="logo-wrap">
+        <a href="/blog/" id="logo">MaskRay</a>
+      </h1>
+      
+    </div>
+    <div id="header-inner" class="inner">
+      <nav id="main-nav">
+        <a id="main-nav-toggle" class="nav-icon"><span class="fa fa-bars"></span></a>
+        
+          <a class="main-nav-link" href="/blog/">Home</a>
+        
+          <a class="main-nav-link" href="/blog/archives/">Archives</a>
+        
+          <a class="main-nav-link" href="/blog/../feeds/">Feeds</a>
+        
+          <a class="main-nav-link" href="/blog/../til/">TIL</a>
+        
+          <a class="main-nav-link" href="/blog/../presentations/">Presentations</a>
+        
+      </nav>
+      <nav id="sub-nav">
+        <a class="nav-icon" href="https://github.com/MaskRay" title="GitHub" target="_blank"><img src="/icon/github.svg"></a>
+        <a class="nav-icon" href="https://twitter.com/HaskRay" title="Twitter" target="_blank"><img src="/icon/twitter.svg"></a>
+        <!-- <a class="nav-icon" href="https://www.zhihu.com/people/maskray" title="知乎" target="_blank"><img src="/icon/zhihu.svg"></a> -->
+        <!-- <a class="nav-icon" href="http://weibo.com/MaskRay" title="微博" target="_blank"><img src="/icon/weibo.svg"></a> -->
+        
+        
+          <a class="nav-icon" href="/blog/atom.xml" title="RSS Feed"><span class="fa fa-rss"></span></a>
+        
+        <a class="nav-icon nav-search-btn" title="Search"><span class="fa fa-search"></span></a>
+      </nav>
+      <div id="search-form-wrap">
+        <form action="//google.com/search" method="get" accept-charset="UTF-8" class="search-form"><input type="search" name="q" class="search-form-input" placeholder="Search"><button type="submit" class="search-form-submit">&#xF002;</button><input type="hidden" name="sitesearch" value="https://maskray.me/blog"></form>
+      </div>
+    </div>
+  </div>
+</header>
+
+      <div class="outer">
+        <section id="main"><article id="post-all-about-procedure-linkage-table" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  <div class="article-meta">
+    <a href="/blog/2021-09-19-all-about-procedure-linkage-table" class="article-date">
+  <time class="dt-published" datetime="2021-09-19T07:00:00.000Z" itemprop="datePublished">2021-09-19</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 class="p-name article-title" itemprop="headline name">
+      All about Procedure Linkage Table
+    </h1>
+  
+
+      </header>
+    
+    <div class="e-content article-entry" itemprop="articleBody">
+      
+        <p>Updated in 2024-01.</p>
+<h2 id="branch-target">Branch target</h2>
+<p>Many architectures encode a branch/jump/call instruction with
+PC-relative addressing, i.e. the distance to the target is encoded in
+the instruction. In an executable or shared object (called a component
+in ELF), if the target is bound to the same component, the instruction
+has a fixed encoding at link time; otherwise the target is unknown at
+link time and there are two choices:</p>
+<ul>
+<li>text relocation</li>
+<li>indirection</li>
+</ul>
+<p>In <a href="/blog/2021-08-29-all-about-global-offset-table">All about
+Global Offset Table</a>, I mentioned that linker/loader developers often
+frowned upon text relocations because the text segment will be
+unshareable. In addition, the number of relocations would be dependent
+on the number of calls, which can be large.</p>
+<span id="more"></span>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">call foo  # R_X86_64_PC32</span><br><span class="line">call foo  # R_X86_64_PC32</span><br><span class="line"></span><br><span class="line">=&gt;</span><br><span class="line"></span><br><span class="line"># The instructions are patched at runtime.</span><br><span class="line"># On ELF x86-64, the R_X86_64_PC32 relocation type is used.</span><br><span class="line">call ...</span><br><span class="line">call ...</span><br></pre></td></tr></table></figure>
+<p>Therefore, the prevailing scheme is to add a level of indirection
+analogous to that provided by the Global Offset Table for data.</p>
+<h2 id="procedure-linkage-table">Procedure Linkage Table</h2>
+<p>ELF uses Procedure Linkage Table to provide the indirection. Here is
+an x86-64 example:</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br></pre></td><td class="code"><pre><span class="line">&lt;.text&gt;:</span><br><span class="line">  call foo</span><br><span class="line">  call bar</span><br><span class="line"></span><br><span class="line">=&gt;</span><br><span class="line"></span><br><span class="line">&lt;.text&gt;:</span><br><span class="line">  call foo</span><br><span class="line">  call bar</span><br><span class="line"></span><br><span class="line">&lt;.plt&gt;:</span><br><span class="line">  pushq .got.plt+8(%rip)</span><br><span class="line">  jmpq *.got.plt+16(%rip)</span><br><span class="line">  nop</span><br><span class="line"></span><br><span class="line">foo@plt:</span><br><span class="line">  jmpq *.got.plt+24(%rip)</span><br><span class="line">  pushq $0</span><br><span class="line">  jmp .plt</span><br><span class="line"></span><br><span class="line">bar@plt:</span><br><span class="line">  jmpq *.got.plt+32(%rip)</span><br><span class="line">  pushq $1</span><br><span class="line">  jmp .plt</span><br><span class="line"></span><br><span class="line">&lt;.got.plt&gt;:</span><br><span class="line">  # First three entries are special.</span><br><span class="line">  .quad link-time address of _DYNAMIC  # set by linker</span><br><span class="line">  .quad Obj_Entry used to indicate the current component  # set by ld.so</span><br><span class="line">  .quad _rtld_bind_start  # set by ld.so</span><br><span class="line"></span><br><span class="line">  .quad ...  # relocated by R_X86_64_JUMP_SLOT referencing foo</span><br><span class="line">  .quad ...  # relocated by R_X86_64_JUMP_SLOT referencing bar</span><br></pre></td></tr></table></figure>
+<p>In the relocatable object file, we have two call instructions. The
+linker synthesizes stubs in <code>.plt</code> and redirects calls into
+the stubs.</p>
+<p>In the assembly dump, <code>foo@plt</code> is such a stub. Note that
+<code>foo@plt</code> is not a symbol table entry. It is just that
+objdump displays the PLT entry as <code>foo@plt</code>. We use the
+notation to describe a stub. The stub consists of 3 instructions. The
+first jmpq instruction loads an entry from <code>.got.plt</code> and
+performs an indirect jump. The remaining two instructions will be
+described when introducing lazy binding.</p>
+<p><code>.got.plt</code> holds an array of word size entries. On some
+architectures (x86-32, x86-64) <code>.got.plt[0]</code> is the link time
+address of <code>_DYNAMIC</code>. <code>.got.plt[1]</code> and
+<code>.got.plt[2]</code> are reserved by ld.so. <code>.got.plt[1]</code>
+is a descriptor of the current component while <code>.got.plt[2]</code>
+is the address of the PLT resolver.</p>
+<p>The subsequent entries are for resolved function addresses. Each
+entry is relocated by an <code>R_*_JUMP_SLOT</code> dynamic relocation
+describing the target function symbol. Resolving a function address is
+also called a binding. There are two binding schemes.</p>
+<p>Note: some architectures use <code>R_*_JMP_SLOT</code> instead of
+<code>R_*_JUMP_SLOT</code> for the dynamic relocation type.</p>
+<h3 id="eager-binding-immediate-binding">Eager binding (immediate
+binding)</h3>
+<p>The simpler scheme is eager binding. Before ld.so transfers control
+to the component, during relocation resolving, ld.so resolves the
+address of <code>foo</code> and writes it into the <code>.got.plt</code>
+entry. Therefore, when the program runs, the <code>.got.plt</code> entry
+is guaranteed to hold the address of the target function.</p>
+<p>This is the model used by musl and Android bionic. In other ld.so
+implementations, lazy binding is usually the default. However, with the
+rise of security hardening on Linux distributions, many have switched to
+full RELRO linking scheme. If the component is linked with
+<code>ld -z now</code>, the linker will set the <code>DF_1_NOW</code>
+dynamic tag, and ld.so will use eager binding.</p>
+<p>Eager binding can also be enabled with the environment variable
+<code>LD_BIND_NOW=1</code>.</p>
+<p>For better understanding, we can ignore many instructions in the
+assembly output above. <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line">&lt;.text&gt;:</span><br><span class="line">  call foo</span><br><span class="line">  call bar</span><br><span class="line"></span><br><span class="line">&lt;.plt&gt;:</span><br><span class="line">  ...</span><br><span class="line"></span><br><span class="line">foo@plt:</span><br><span class="line">  jmpq *.got.plt+24(%rip)</span><br><span class="line">  ...</span><br><span class="line"></span><br><span class="line">bar@plt:</span><br><span class="line">  jmpq *.got.plt+32(%rip)</span><br><span class="line">  ...</span><br><span class="line"></span><br><span class="line">&lt;.got.plt&gt;:</span><br><span class="line">  ...</span><br><span class="line">  .quad ...  # relocated by R_X86_64_JUMP_SLOT referencing foo</span><br><span class="line">  .quad ...  # relocated by R_X86_64_JUMP_SLOT referencing bar</span><br></pre></td></tr></table></figure></p>
+<p>Eager binding has a bonus: it can detect underlinking problems. See
+<a
+href="/static/2021-06-13-dependency-related-linker-options">Dependency
+related linker options</a> for details.</p>
+<h3 id="lazy-binding-deferred-binding">Lazy binding (deferred
+binding)</h3>
+<p>The extra instructions and extra entries in <code>.got.plt</code> are
+all for lazy binding.</p>
+<p>The ELF dynamic shared library scheme postpones binding from the link
+time to the load time. There is some slowdown due to work before the
+program starts. In addition, a shared object has more code than the
+portion linked into the executable with static linking. This is because
+shared objects usually need to export all symbols which can defeat the
+archive member extraction trick and linker garbage collection.</p>
+<p>Anyhow, eagerly resolving all <code>R_*_JUMP_SLOT</code> relocations
+had a significant overhead.</p>
+<p>In the lazy binding scheme, ld.so does minimum work to ensure the jmp
+instruction lands in a trampoline which will tail call the PLT resolver
+in ld.so. On x86-64, the associated <code>.got.plt</code> entry refers
+to the pushq instruction immediately after the jmpq. The pushq
+instructions pushes a descriptor (for the <code>.got.plt</code> entry)
+and jumps to the PLT header. The PLT header is a stub calling the
+function address stored at <code>.got.plt+16</code> (PLT resolver in
+ld.so) with an extra argument (descriptor for the current
+component).</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">&lt;.plt&gt;:</span><br><span class="line">  pushq .got.plt+8(%rip)   # Push the descriptor</span><br><span class="line">  jmpq *.got.plt+16(%rip)  # Jump to the PLT resolver in ld.so</span><br><span class="line">  nop</span><br><span class="line"></span><br><span class="line">foo@plt:</span><br><span class="line">  jmpq *.got.plt+24(%rip)  # The first call</span><br><span class="line">  pushq $0                 #   jumps here</span><br><span class="line">  jmp .plt</span><br></pre></td></tr></table></figure>
+<p>The PLT resolver in ld.so is an assembly trampoline that invokes
+<code>elf/dl-runtime.c:_dl_fixup</code> to resolve the
+<code>.got.plt</code> entry and then perform a tail call to the resolved
+address. <code>_dl_fixup</code> reads <code>r_offset</code> and
+<code>r_info</code> from the JUMP_SLOT entry
+(<code>l_info[DT_JMPREL]</code> plus an offset), looks up the symbol
+with the <code>.got.plt</code> descriptor, then writes the resolved
+address to the <code>.got.plt</code> entry (through
+<code>elf_machine_fixup_plt</code>). Now that the <code>.got.plt</code>
+entry has been updated to the actual function address, subsequent calls
+to <code>foo</code> will bypass the PLT resolver.</p>
+<p>Why is lazy binding slow? I can think of two factors.</p>
+<p>First, binding granularity. The shared library scheme we use today is
+SunOS'. A shared library is a single executable file. There is no
+distinction of different modules within a shared library. The linker and
+the loader are not able to track which module within a shared library
+imports which symbols from other modules. Therefore the linker is forced
+to import a shared library as a whole and the loader has to resolve all
+bindings as a while. (In Multics the shared library is implemented as a
+collection of object files, like an archive.)</p>
+<p>In the absence of <code>LD_PRELOAD</code>, ld.so first looks at the
+symbol table of the executable itself, then at the symbol tables of the
+<code>DT_NEEDED</code> entries (in order), and then at the second level
+<code>DT_NEEDED</code> entries, and so on. You may think that symbol
+search can be optimized if all defined symbols are added in one global
+hash table. However, a global hash table also costs some memory. In
+addition, dlopen, dlmopen, symbol versioning, and probably some features
+I don't know can all introduce complexity in the process and make a
+global hash table complex. Anyway, none of glibc/musl/FreeBSD rtld
+implements it.</p>
+<h2 id="fno-plt"><code>-fno-plt</code></h2>
+<p>After the <code>.got.plt</code> entry is resolved, a function call
+requires the following 3 instructions: <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">In .text: call foo  # 5 bytes</span><br><span class="line">At foo@plt: jmpq *.got.plt+offset(%rip)</span><br><span class="line">In another component: the first instruction of the target function</span><br></pre></td></tr></table></figure></p>
+<p>An optimization idea is that we can just use one instruction (note
+that a GOT entry is eager binding), essentially inlining the PLT entry:
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">In .text: call *.got.plt+offset(%rip)  # 6 bytes</span><br></pre></td></tr></table></figure></p>
+<p>GCC 6.0 added <code>-fno-plt</code> to AArch64 and x86 to perform
+this transformation. The call instruction is one byte longer than the
+<code>R_X86_64_PLT32</code> form.</p>
+<p>If the target symbol is preemptible, there is a
+<code>R_X86_64_GLOB_DAT</code> relocation, and the optimization works as
+intended.</p>
+<p>However, if the target is non-preemptible, i.e. the target is
+resolved to the same component, this is actually a pessimization. The
+linker (GNU ld, gold, and ld.lld) can mitigate the loss by rewriting the
+6 bytes to <code>addr32 call foo</code>. The downside is the
+one-byte-longer code sequence.</p>
+<p>By specifying <code>-fno-plt</code>, the user is making a trade-off
+on a function call which is not known to be bound locally at compile
+time: whether it resolves to the same component. For some benchmarks,
+especially those where libc functions are a bottleneck, there may be a
+performance win. This is however deceiving, as statically linking some
+libc functions will hide the performance win.</p>
+<p>On RISC architectures, there is typically no single instruction which
+can load a GOT entry and perform an indirect call. <code>-fno-plt</code>
+has a longer code quence. For example, AArch64 needs 3 instructions:
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">adrp    x0, _GLOBAL_OFFSET_TABLE_</span><br><span class="line">ldr     x0, [x0, #:gotpage_lo15:bar]</span><br><span class="line">br      x0</span><br></pre></td></tr></table></figure></p>
+<p>The trade-off leans more towards the "useless" side.</p>
+<p>Instead of using a global <code>-fno-plt</code>, the function
+attribute <code>__attribute__((noplt))</code> can be added to individual
+declarations for fine-grained control. The compiler generates GOT
+indirection for calls to annotated functions. The effect is similar to
+Windows <code>__dllspec(dllimport)</code>. The attribute is only useful
+when a function is guaranteed to be in a shared object. However, for
+many use cases static libraries may be used and therefore there is no
+such guarantee.</p>
+<p>GCC's x86 port <a
+target="_blank" rel="noopener" href="https://gcc.gnu.org/git/?p=gcc.git;a=commit;h=e7c77c4f12100602e078cee454b8d0e7433c2660">supports</a>
+<code>-mforce-indirect-call</code> to force register indirect branches
+for function calls. This mode is designed for Intel Processor Trace
+(PT), but can also avoid PLT entries like <code>-fno-plt</code>.
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">movq preemptible@GOTPCREL(%rip), %rax</span><br><span class="line">call *%rax</span><br><span class="line">leaq nonpreemptible(%rip), %rax</span><br><span class="line">call *%rax</span><br></pre></td></tr></table></figure></p>
+<p>I added AArch64 <code>-fno-plt</code> support to LLVM.</p>
+<h2 id="got-setup-is-expensive-without-pc-relative-addressing">GOT setup
+is expensive without PC-relative addressing</h2>
+<p>On some older architectures, PLT may introduce overhead in function
+prologue code. The fundamental problem is that they do not support
+memory load with PC-relative addressing (e.g. x86-64 PC-relative
+instructions). Such architectures typically make a distinction between
+non-PIC PLT and PIC PLT.</p>
+<p>x86-32 is a notorious example. <figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">void</span> <span class="title function_">bar</span><span class="params">(<span class="type">void</span>)</span>;</span><br><span class="line"><span class="type">void</span> <span class="title function_">foo</span><span class="params">(<span class="type">void</span>)</span> &#123; bar(); &#125;</span><br></pre></td></tr></table></figure></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">foo:</span><br><span class="line">  pushl   %ebx</span><br><span class="line">  call    __x86.get_pc_thunk.bx</span><br><span class="line">  addl    $_GLOBAL_OFFSET_TABLE_, %ebx</span><br><span class="line">  subl    $8, %esp</span><br><span class="line">  call    bar@PLT</span><br><span class="line">  addl    $8, %esp</span><br><span class="line">  popl    %ebx</span><br><span class="line">  ret</span><br><span class="line"></span><br><span class="line">.section        .text.__x86.get_pc_thunk.bx,&quot;axG&quot;,@progbits,__x86.get_pc_thunk.bx,comdat</span><br><span class="line">.globl  __x86.get_pc_thunk.bx</span><br><span class="line">.hidden __x86.get_pc_thunk.bx</span><br><span class="line">.type   __x86.get_pc_thunk.bx, @function</span><br><span class="line">__x86.get_pc_thunk.bx:</span><br><span class="line">  movl    (%esp), %ebx</span><br><span class="line">  ret</span><br></pre></td></tr></table></figure>
+<p>What went wrong?</p>
+<p>To work around the lack of PC-relative addressing, the i386 psABI
+reserves the callee-saved register <code>ebx</code> to refer to the GOT
+base (<code>_GLOBAL_OFFSET_TABLE_</code>). Then the PLT entry can load
+the <code>.got.plt</code> entry (by adding an offset to the GOT base)
+and do an indirect jump.</p>
+<p>Using a callee-saved register has pros and cons. On the upside, a
+function just needs to compute <code>_GLOBAL_OFFSET_TABLE_</code> once,
+because callees cannot clobber the register. On the downside, one
+general-purpose register is wasted (significant on x86-32 due to the
+lack of general-purpose registers. Prologue/epilogue code needs to save
+and restore the register, so tail calls are inhibited.</p>
+<p><a target="_blank" rel="noopener" href="https://ewontfix.com/18/">32-bit x86 Position Independent
+Code - It's that bad</a> mentions an alternative scheme which allows a
+tail call: <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">foo:</span><br><span class="line">  call __x86.get_pc_thunk.cx</span><br><span class="line">  jmp  *bar@GOT+_GLOBAL_OFFSET_TABLE_(%ecx)</span><br></pre></td></tr></table></figure></p>
+<p><code>jmp  *bar@GOT+_GLOBAL_OFFSET_TABLE_(%ecx)</code> requires a
+relocation type representing the distance from PC to the GOT entry.
+Unfortunately <code>R_386_GOT32</code> and <code>R_386_GOT32X</code>
+relocation types are misdesigned and do not support the usage. That
+said, adding an extra <code>addl</code> instruction is not too bad. GCC
+since 6.0 can produce the following with <code>-fno-plt</code>:</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">foo:</span><br><span class="line">  call __x86.get_pc_thunk.ax</span><br><span class="line">  addl $_GLOBAL_OFFSET_TABLE_, %eax</span><br><span class="line">  jmp  *bar@GOT(%eax)</span><br></pre></td></tr></table></figure>
+<p>This code sequence uses a GOT-generating relocation which may defeat
+lazy binding, so it is not the default. Thankfully x86-64 supports
+PC-relative addressing and does not have the aforementioned problem.</p>
+<h2 id="life-of-a-.plt.got.plt-entry">Life of a
+<code>.plt</code>/<code>.got.plt</code> entry</h2>
+<p>For a function call, the compiler emits a branch instruction.</p>
+<p>If the branch target is within the same section and the distance
+between the call site and the target is a known constant at assembly
+time, the assembler resolves it; otherwise the assembler needs to
+produce a relocation for the linker to process. The relocation type
+indicates that the linker may create a PLT entry. Such a relocation type
+is sometimes called PLT-generating.</p>
+<p>When the linker sees a PLT-generating relocation, it checks whether
+the referenced symbol is <em>preemptible</em> (<em>interposable</em>),
+i.e., provided by a definition of the same name in another component. If
+the symbol is not preemptible, the relocation can be resolved at link
+time and ld.so will not need to anything.</p>
+<p>If the symbol is preemptible, the linker creates a PLT entry and a
+<code>.got.plt</code> entry relocated by an <code>R_*_JUMP_SLOT</code>
+relocation. For subsequent PLT-generating relocations referencing the
+same symbol, the linker just reuses the entry. The address of the PLT
+entry is insignificant: it can be called, but its address cannot be
+taken by the program.</p>
+<p>Technically the linker can use multiple entries for one symbol. It
+just wastes space for the majority of cases.</p>
+<p>The second case for PLT generation is a non-preemptible ifunc. See <a
+href="/blog/2021-01-18-gnu-indirect-function">GNU indirect functions</a>
+for details.</p>
+<h3 id="canonical-plt-entries">Canonical PLT entries</h3>
+<p>This is the third case a linker needs to create a PLT entry.</p>
+<p>For position dependent code (<code>-fno-pic</code>), traditionally
+the compiler optimizes for statically linked executables and uses direct
+addressing (usually absolute relocations). Taking the address of a
+function does not use GOT indirection. If the symbol turns out to be
+external, the linker has to employ a trick called "canonical PLT entry"
+(<code>st_shndx=0, st_value!=0</code>). The term is a parlance within a
+few ld.lld developers, but not broadly adopted.</p>
+<p>Every PLT entry has an associated <code>R_*_JUMP_SLOT</code> entry
+and has a dynamic symbol (<code>st_shndx=0</code>, display as
+<code>UND</code> in <code>readelf</code> output). If we assign a
+non-zero value to the symbol, we can consider the address of the PLT
+entry as canonical and bind references from executable/shared objects to
+it.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// a.c</span></span><br><span class="line"><span class="keyword">extern</span> <span class="type">void</span> <span class="title function_">foo</span><span class="params">(<span class="type">void</span>)</span>;</span><br><span class="line"><span class="type">int</span> <span class="title function_">main</span><span class="params">()</span> &#123; foo(); &#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// b.c</span></span><br><span class="line"><span class="type">void</span> <span class="title function_">foo</span><span class="params">(<span class="type">void</span>)</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">% gcc -m32 -shared -fuse-ld=bfd -fpic b.c -o b.so</span><br><span class="line">% gcc -m32 -fno-pic -no-pie -fuse-ld=lld a.c ./b.so</span><br><span class="line">% readelf -W --dyn-syms a.out</span><br><span class="line"></span><br><span class="line">Symbol table &#x27;.dynsym&#x27; contains 7 entries:</span><br><span class="line">   Num:    Value  Size Type    Bind   Vis      Ndx Name</span><br><span class="line">...</span><br><span class="line">     6: 00401670     0 FUNC    GLOBAL DEFAULT  UND foo</span><br></pre></td></tr></table></figure>
+<p>If <code>b.so</code> binds <code>foo</code> locally, e.g. if it is
+linked with <code>-Bsymbolic-functions</code>, taking the address from
+the executable and from the shared object will get different
+results.</p>
+<p>To fix this (C and C++ require address uniqueness), compilers need to
+use GOT indirection. See <a
+href="2021-01-09-copy-relocations-canonical-plt-entries-and-protected">Copy
+relocations, canonical PLT entries and protected visibility</a>, sadly
+it doesn't seem that GCC folks want to take action.</p>
+<p>x86-32 has an extra problem that it uses <code>R_386_PC32</code> to
+represent a function call from non-PIC code. See my article for
+details.</p>
+<h2 id="stack-unwinding">Stack unwinding</h2>
+<p>As linker synthesized code, the PLT entries may not have unwind
+tables information. Unwinders using <code>.eh_frame</code> needs to
+recognize the <code>_PROCEDURE_LINKAGE_TABLE_</code> region. See <a
+href="/blog/2020-11-15-explain-gnu-linker-options">Explain GNU style
+linker options</a> <code>--no-ld-generated-unwind-info</code> (the
+positive option is unnecessary in my opinion) for details.</p>
+<h2 id="mach-o-stub">Mach-O stub</h2>
+<p>Mach-O's stub scheme is similar to Procedure Linkage Table. We can
+make the conceptual mapping:</p>
+<ul>
+<li><code>__TEXT,__stubs</code>: <code>.plt</code> entries</li>
+<li><code>__TEXT,__stubs_helper</code>: <code>.plt</code> header and
+PowerPC's glink entries</li>
+<li><code>__DATA,__la_symbol_ptr</code>: <code>.got.plt</code></li>
+</ul>
+<p>For an external function call, the text section calls a stub in
+<code>__TEXT,__stubs</code>. The stub loads a
+<code>__la_symbol_ptr</code> entry which initially points in the middle
+of <code>__TEXT,__stubs_helper</code>. The code pushes on the stack the
+offset into <code>__la_symbol_ptr</code>, then branches to the start of
+<code>__TEXT,__stubs_helper</code>. The start of
+<code>__TEXT,__stubs_helper</code> pushes the address of
+<code>_dyld_private</code> and jumps to
+<code>libdyld.dylib`dyld_stub_binder</code>.</p>
+<h2 id="case-study">Case study</h2>
+<h3 id="aarch64">AArch64</h3>
+<p>AArch64 has the best PLT design in my opinion.</p>
+<p><code>R_AARCH64_CALL26</code>, <code>R_AARCH64_JUMP26</code>, and
+<code>R_AARCH64_PLT32</code> are PLT-generating relocation types.</p>
+<p>PLT header</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">stp    x16, x30, [sp,#-16]!</span><br><span class="line">adrp   x16, Page(&amp;(.got.plt[2]))</span><br><span class="line">ldr    x17, [x16, Offset(&amp;(.got.plt[2]))]</span><br><span class="line">add    x16, x16, Offset(&amp;(.got.plt[2]))</span><br><span class="line">br     x17</span><br><span class="line">nop</span><br><span class="line">nop</span><br><span class="line">nop</span><br></pre></td></tr></table></figure>
+<p>.plt[n]</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">adrp x16, Page(&amp;(.got.plt[n]))</span><br><span class="line">ldr  x17, [x16, Offset(&amp;(.got.plt[n]))]</span><br><span class="line">add  x16, x16, Offset(&amp;(.got.plt[n]))</span><br><span class="line">br   x17</span><br></pre></td></tr></table></figure>
+<p><code>x16</code> holds the address of the <code>.got.plt</code> entry
+and <code>x17</code> holds the target address. The PLT resolver (e.g.
+<code>_rtld_bind_start</code> in FreeBSD rtld) can compute the
+<code>R_AARCH64_JUMP_SLOT</code> index from <code>x16</code> and
+<code>x17</code>.</p>
+<p>When Arm v8.5 Branch Target Enablement is enabled, all indirect
+branches must land on a <code>bti</code> instruction. A PLT entry may
+indirectly branch to the PLT header, so the PLT header needs a
+<code>bti</code> instruction. <figure class="highlight txt"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">% aarch64-linux-gnu-gcc -fpic -mbranch-protection=standard -shared a.c -o a.so</span><br></pre></td></tr></table></figure></p>
+<p>In glibc, the PLT resolver does not preserve all the registers
+required for AdvSIMD and SVE vector calls. Saving and restoring all
+registers would use more stack space and break existing binaries. To
+support such a variant procedure call standard with different register
+usage convention, the following scheme is used.</p>
+<p>Function symbols with the variant procedure call standard have the
+<code>STO_AARCH64_VARIANT_PCS</code> bit. The linker adds the
+<code>DT_AARCH64_VARIANT_PCS</code> dynamic tag if there is at least one
+PLT referencing an <code>STO_AARCH64_VARIANT_PCS</code> symbol. In glibc
+ld.so, when <code>DT_AARCH64_VARIANT_PCS</code> is set, the relocation
+resolver scans all <code>R_*_JUMP_SLOT</code> relocations and eagerly
+resolves <code>STO_AARCH64_VARIANT_PCS</code> entries.</p>
+<p>For Mach-O, the stub helper and a stub look like: <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line">__stub_helper:</span><br><span class="line">  adrp  x17, _dyld_private@page</span><br><span class="line">  add   x17, x17, _dyld_private@pageoff</span><br><span class="line">  stp   x16/x17, [sp, #-16]!</span><br><span class="line">  adrp  x16, dyld_stub_binder@page</span><br><span class="line">  ldr   x16, [x16, dyld_stub_binder@pageoff]</span><br><span class="line">  br    x16</span><br><span class="line"></span><br><span class="line">  ldr   w16, 1f</span><br><span class="line">  b     __stub_helper</span><br><span class="line">  1: .long lazy_bind_offset_0</span><br><span class="line"></span><br><span class="line">  ldr   w16, 1f</span><br><span class="line">  b     __stub_helper</span><br><span class="line">  1: .long lazy_bind_offset_1</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">one stub:</span><br><span class="line">  adrp  x16, (__la_symbol_ptr+offset)@page</span><br><span class="line">  ldr   x16, [x16, (__la_symbol_ptr+offset)@pageoff]</span><br><span class="line">  br x16</span><br></pre></td></tr></table></figure></p>
+<p>The content of <code>__stub_helper</code> is similar to PowerPC64
+<code>__glink_PLTresolve</code> and the subsequent <code>b</code>
+instructions. The advantage compared with ELF is one fewer instruction
+in the call stub.</p>
+<h3 id="mips">MIPS</h3>
+<p>I know really little about MIPS and cannot add much description.</p>
+<p>The normal code generation is like <code>-fno-plt</code>. MIPS did
+not use PLT at all until ~2008-2009.</p>
+<p><code>-mno-abicalls</code>, which is only available for
+<code>-fno-pic</code>, can generate <code>j</code> and <code>jal</code>
+instructions. However, GNU ld has a warning
+<code>linking abicalls files with non-abicalls files</code>.</p>
+<h3 id="pa-risc">PA-RISC</h3>
+<p>In <em>The Hewlett-Packard Journal, June 1992</em>, <em>Shared
+libraries for HP-UX</em> says:</p>
+<blockquote>
+<p>Dedicated linkage Table Pointer. Since code and data could not be
+mapped contiguously, the linkage tables could not be accessed with a
+pc-relative code sequence generated at compile time. Therefore, we chose
+a general register (gr19) as a place for holding the pointer for shared
+library linkage.</p>
+</blockquote>
+<p>gr19 appears to be a callee-saved register. This gives a clue why
+older architectures do not use PC-relative addressing. Today for
+non-FDPIC ABI, the distance from code to data should be a link-time
+constant for performance reasons. (Well, secruity researchers may want
+to proceed this road for more randomness.)</p>
+<p>Cary Coutant kindly shared with me the answer. There were two
+reasons.</p>
+<p>First, PA-RISC could not maintain a link-time constant delta between
+code and data segments. PA-RISC (and, later, Itanium) used a global
+virtual addressing model, with virtually-addressed caches, and segment
+(or region) registers that extended the virtual addresses from a
+per-process address space into a global address space. Code, which can
+be shared across processes, must be placed in one quadrant of the
+address space (octant for Itanium), private data in another, and shared
+data in yet another.</p>
+<p>Second, PC-relative instructions would be expensive. Because of the
+deep instruction pipeline and out-of-order execution, routing the PC
+over to an adder for the purpose of computing an effective address would
+have forced PA-RISC to increase the basic cycle time of the CPU.</p>
+<p>The reason appears to be shared with many processors at that time.
+With improvement of chip design, PC-relative instructions are no longer
+expensive.</p>
+<h3 id="powerpc32">PowerPC32</h3>
+<p><em>Power Architecture® 32-bit Application Binary Interface
+Supplement 1.0 - Linux® &amp; Embedded</em> specifies two PLT ABIs:
+BSS-PLT and Secure-PLT.</p>
+<p>BSS-PLT is the older one. While <code>.plt</code> on other
+architectures are created by the linker, BSS-PLT let ld.so generate the
+PLT entries. This has the advantage that the section can be made
+<code>SHT_NOBITS</code> and therefore not occupy file size. The downside
+is the security concern of writable and executable memory pages. Even
+worse, as an implementation issue, GNU ld places <code>.plt</code> in
+the text segment and therefore the whole text segment is writable and
+executable. <code>-z relro -z now</code> has no effect.</p>
+<p>In the newer Secure-PLT ABI, <code>.plt</code> holds the table of
+function addresses. This usage is weird, because on other architectures
+such a section is called <code>.got.plt</code>.</p>
+<p>Like x86-32, PowerPC32 lacks memory load with relative addressing and
+has a distinction between non-PIC PLT and PIC PLT.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br></pre></td><td class="code"><pre><span class="line">00000000.plt_call32.f:</span><br><span class="line">  lis 11, .plt[n]@ha</span><br><span class="line">  lwz 11, .plt[n]@l(11)</span><br><span class="line">  mtctr 11</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">00000000.plt_pic32.f:</span><br><span class="line">  ## If the GOT offset is beyond 64KiB</span><br><span class="line">  addis 11, 30, .plt[n]-_GLOBAL_OFFSET_TABLE_@ha(30)</span><br><span class="line">  lwz 11, .plt[n]-_GLOBAL_OFFSET_TABLE_@l(30)</span><br><span class="line">  mtctr 11</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">  ## If the GOT offset is within 64KiB</span><br><span class="line">  # lwz 11, .plt[n]-_GLOBAL_OFFSET_TABLE_(30)</span><br><span class="line">  # mtctr 11</span><br><span class="line">  # bctr</span><br><span class="line">  # nop</span><br><span class="line"></span><br><span class="line">00000000.got2.plt_pic32.f:</span><br><span class="line">  ## .got2 refers to the copy belonging to the current translation unit.</span><br><span class="line">  ## Different translation units have to use different stubs.</span><br><span class="line">  addis 11, 30, .plt[n]-(.got2+0x8000)(30)</span><br><span class="line">  lwz 11, .plt[n]-(.got2+0x8000)@l(30)</span><br><span class="line">  mtctr 11</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">  ## The case when the GOT offset is within 64KiB is similar to plt_pic32.f.</span><br></pre></td></tr></table></figure>
+<p>The call-clobbered register r11 is used to compute the
+<code>.plt</code> entry address. For a non-PIC PLT, just use absolute
+addressing.</p>
+<p>For a PIC PLT, the callee-saved register r30 holds the GOT base.
+PowerPC32 is one of the few old architectures where GCC
+<code>-fpic</code> and <code>-fPIC</code> are different. For
+<code>-fpic</code>, the GOT base is at
+<code>_GLOBAL_OFFSET_TABLE_</code> in the component. For
+<code>-fPIC</code>, the GOT base is at <code>.got2</code> for the
+current translation unit. The component may have multiple translation
+units and each has a different <code>.got2</code>.</p>
+<p>Unlike x86 (which just places the lazy binding code after the initial
+<code>jmpq</code> instruction), the Secure-PLT ABI places the lazy
+binding code in <code>__glink_PLTresolve</code> (like PLT header on x86)
+and following entries. When I added PowerPC32 port to ld.lld, I picked
+the glink code in a separate section <code>.glink</code> for
+clarity.</p>
+<p>For PIC function prologue code, setting up r30 is expensive. The
+previous foo tail calling bar C code requires these many
+instructions.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">&lt;foo&gt;:</span><br><span class="line">  stwu 1, -16(1)      # allocate stack</span><br><span class="line">  mflr 0</span><br><span class="line">  bcl 20, 31, 0x1bc   # set lr to PC</span><br><span class="line">  stw 30, 8(1)        # save r30 which is used as the GOT base</span><br><span class="line">  mflr 30</span><br><span class="line">  addis 30, 30, 2     # high 16 bits of the GOT base (.got2+0x8000)</span><br><span class="line">  stw 0, 20(1)        # save lr (copied to r0)</span><br><span class="line">  addi 30, 30, 32140  # low 16 bits of the GOT base (.got2+0x8000)</span><br><span class="line">  bl 0x1f0</span><br><span class="line">  lwz 0, 20(1)</span><br><span class="line">  lwz 30, 8(1)</span><br><span class="line">  addi 1, 1, 16</span><br><span class="line">  mtlr 0</span><br><span class="line">  blr</span><br></pre></td></tr></table></figure>
+<h3 id="powerpc64-elfv1">PowerPC64 ELFv1</h3>
+<p>The latest ABI is <em>64-bit PowerPC ELF Application Binary Interface
+Supplement 1.9</em>. It defines the TOC ("Table of Contents") section
+which combines the functions of the GOT and the small data section. To
+optimize for inter-component calls, the ABI tries to avoid the
+per-function TOC base setup code. The TOC base address is stored in r2
+which is not clobbered by inter-component calls. We will see later that
+as a result intra-component calls are slower.</p>
+<p>The single <code>.got.plt</code> entry on other architectures is
+replaced by a function descriptor which contains 3 entries:</p>
+<ul>
+<li>The first doubleword contains the address of the entry point of the
+function.</li>
+<li>The second doubleword contains the TOC base address for the
+function.</li>
+<li>The third doubleword contains the environment pointer for languages
+such as Pascal and PL/1.</li>
+</ul>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br></pre></td><td class="code"><pre><span class="line">00000000000002c0 &lt;0000001a.plt_call.bar&gt;:</span><br><span class="line">  std     r2,40(r1)       # Save the TOC base address</span><br><span class="line">  ld      r12,-32488(r2)  # Load the function address from the function descriptor</span><br><span class="line">  mtctr   r12</span><br><span class="line">  ld      r2,-32480(r2)   # Load the TOC base address from the function descriptor</span><br><span class="line">  cmpldi  r2,0            # Non-zero indicates that the function descriptor has been resolved</span><br><span class="line">  bnectr+                 # Just branch there</span><br><span class="line">  b       344 &lt;bar@plt&gt;   # otherwise, call the glink entry to resolve the function descriptor</span><br><span class="line">  .long 0x0</span><br><span class="line"></span><br><span class="line">00000000000002e0 &lt;.foo&gt;:</span><br><span class="line">  mflr    r0</span><br><span class="line">  std     r0,16(r1)</span><br><span class="line">  stdu    r1,-112(r1)</span><br><span class="line">  bl      2c0 &lt;0000001a.plt_call.bar&gt;  # Branch to the call stub</span><br><span class="line">  ld      r2,40(r1)                    # Restore the TOC base address</span><br><span class="line">  addi    r1,r1,112</span><br><span class="line">  ld      r0,16(r1)</span><br><span class="line">  mtlr    r0</span><br><span class="line">  blr</span><br><span class="line">  .long 0x0</span><br><span class="line">  .long 0x1000000</span><br><span class="line">  .long 0x80</span><br><span class="line">  .long 0x1fce0</span><br><span class="line">  .long 0x0</span><br><span class="line"></span><br><span class="line">0000000000000318 &lt;__glink_PLTresolve&gt;:</span><br><span class="line">  mflr    r12</span><br><span class="line">  bcl     20,4*cr7+so,320 &lt;__glink_PLTresolve+0x8&gt;</span><br><span class="line">  mflr    r11</span><br><span class="line">  ld      r2,-16(r11)</span><br><span class="line">  mtlr    r12</span><br><span class="line">  add     r11,r2,r11</span><br><span class="line">  ld      r12,0(r11)</span><br><span class="line">  ld      r2,8(r11)</span><br><span class="line">  mtctr   r12</span><br><span class="line">  ld      r11,16(r11)</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">0000000000000344 &lt;bar@plt&gt;:</span><br><span class="line">  li      r0,0            # Pass an argument to describe the entry index</span><br><span class="line">  b       318 &lt;__glink_PLTresolve&gt;</span><br></pre></td></tr></table></figure>
+<p><code>bl 0x2c0</code> jumps to the call stub. The call stub loads the
+function address and the TOC base address from the function descriptor.
+If the TOC base address is zero, which means the function descriptor
+hasn't been resolved, branch to the glink entry to resolve the function
+descriptor; otherwise branch to the resolved function address. In both
+cases, r2 has been updated to the new TOC base address.</p>
+<p>After returning from the callee, the linker synthesized
+<code>ld r2,40(r1)</code> is executed to restore the TOC base
+address.</p>
+<p>When the target function is bound locally, the instruction after
+<code>bl</code> is a <code>nop</code> (instead of
+<code>ld r2,40(r1)</code>). This scheme is better than the compiler
+unconditionally generating a code sequence to load the TOC base
+address.</p>
+<p>When the target function is external, the scheme pays the cost in the
+call stub. This scheme is worse than the compiler unconditionally
+generating a code sequence to load the TOC base address.</p>
+<h3 id="powerpc64-elfv2">PowerPC64 ELFv2</h3>
+<p><code>R_PPC64_REL14</code>, <code>R_PPC64_REL24</code>, and
+<code>R_PPC64_REL24_NOTOC</code> are PLT-generating relocation
+types.</p>
+<p>Here are the main pain points with ELFv1:</p>
+<ul>
+<li>Function descriptors waste space.</li>
+<li>Call stubs are too long (7 instructions padded by one nop).</li>
+</ul>
+<p>The idea is to move the TOC base address setup code from call stubs
+to the start of functions.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br></pre></td><td class="code"><pre><span class="line">00000000000002c0 &lt;0000001a.plt_call.bar&gt;:</span><br><span class="line">  std     r2,24(r1)                    # Save the TOC base address</span><br><span class="line">  ld      r12,-32496(r2)               # Load function address from .plt entry</span><br><span class="line">  mtctr   r12</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">00000000000002e0 &lt;foo&gt;:</span><br><span class="line"># globalentry: functions with a different TOC jump here.</span><br><span class="line">  addis   r2,r12,2                     # Compute the TOC base address</span><br><span class="line">  addi    r2,r2,31776</span><br><span class="line"># localentry: functions with the same TOC jump here.</span><br><span class="line">  mflr    r0</span><br><span class="line">  std     r0,16(r1)</span><br><span class="line">  stdu    r1,-32(r1)</span><br><span class="line">  bl      2c0 &lt;0000001a.plt_call.bar&gt;  # Branch to the call stub</span><br><span class="line">  ld      r2,24(r1)                    # Restore the TOC base address</span><br><span class="line">  addi    r1,r1,32</span><br><span class="line">  ld      r0,16(r1)</span><br><span class="line">  mtlr    r0</span><br><span class="line">  blr</span><br><span class="line"></span><br><span class="line">0000000000000348 &lt;__glink_PLTresolve&gt;:</span><br><span class="line">  mflr    r0</span><br><span class="line">  bcl     20,4*cr7+so,350 &lt;__glink_PLTresolve+0x8&gt;</span><br><span class="line">  mflr    r11</span><br><span class="line">  mtlr    r0</span><br><span class="line">  ld      r0,-16(r11)</span><br><span class="line">  subf    r12,r11,r12</span><br><span class="line">  add     r11,r0,r11</span><br><span class="line">  addi    r0,r12,-44</span><br><span class="line">  ld      r12,0(r11)</span><br><span class="line">  rldicl  r0,r0,62,2</span><br><span class="line">  mtctr   r12</span><br><span class="line">  ld      r11,8(r11)</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">000000000000037c &lt;bar@plt&gt;:</span><br><span class="line">  b       348 &lt;__glink_PLTresolve&gt;</span><br></pre></td></tr></table></figure>
+<p>The distance between the global entry and the local entry is normally
+8 bytes (2 instructions), but there can be more in the large code model.
+I have seen BoringSSL using more instructions to <a
+target="_blank" rel="noopener" href="https://github.com/google/boringssl/blob/master/crypto/fipsmodule/FIPS.md">instrument
+assembly files</a> to avoid relocations from text to data.</p>
+<p>The globalentry/localentry scheme requires caution in many parts of
+the toolchain: taking addresses, <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D56586">copying symbols</a>, <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D61058">computing branch distance for
+range extension thunks</a>, etc.</p>
+<p>In POWER10, IBM finally decided to add PC-relative instructions
+(Prefixed Load).</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line">0000000000000300 &lt;0000001a.plt_call.bar&gt;:</span><br><span class="line">  pld     r12,130320      # 20010 [bar@plt]</span><br><span class="line">  mtctr   r12</span><br><span class="line">  bctr</span><br><span class="line"></span><br><span class="line">0000000000000340 &lt;foo&gt;:</span><br><span class="line">  mflr    r0</span><br><span class="line">  std     r0,16(r1)</span><br><span class="line">  stdu    r1,-32(r1)</span><br><span class="line">  bl      300 &lt;0000001a.plt_call.bar&gt;</span><br><span class="line">  addi    r1,r1,32</span><br><span class="line">  ld      r0,16(r1)</span><br><span class="line">  mtlr    r0</span><br><span class="line">  blr</span><br><span class="line"></span><br><span class="line"># __glink_PLTresolve and bar@plt are the same.</span><br></pre></td></tr></table></figure>
+<p>So why do we still need glink entries? Well, the <code>pld</code>
+instruction loads the <code>.plt</code> entry (<code>.got.plt</code> on
+other architectures), but the address of the <code>.plt</code> entry is
+not communicated to the PLT resolver. This means that for the small code
+model the <code>pld</code> scheme is not optimal.</p>
+<p>Compatibility is a thing. How to make the PC-relative instructions
+work with TOC and globalentry/localentry need a lot of thought and some
+complexity in the linker. I am sure that if you read the GNU ld or gold
+code, you will be amused:)</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (plt) &#123;</span><br><span class="line">  <span class="keyword">if</span> (is(R_PPC64_REL24_NOTOC))</span><br><span class="line">    use PC-relative PLT call <span class="title function_">stub</span> <span class="params">(`__plt_pcrel_$&#123;name&#125;`)</span></span><br><span class="line">  <span class="keyword">else</span></span><br><span class="line">    use TOC PLT call stub</span><br><span class="line">&#125; <span class="keyword">else</span> <span class="title function_">if</span> <span class="params">((is(R_PPC64_REL14) || is(R_PPC64_REL24)) &amp;&amp; (st_other&gt;&gt;<span class="number">5</span>) == <span class="number">1</span>)</span> &#123;</span><br><span class="line">  <span class="comment">// The caller requires valid r2 but the callee may not preserve r2.</span></span><br><span class="line">  use r2 save stub</span><br><span class="line">&#125; <span class="keyword">else</span> <span class="keyword">if</span> (is(R_PPC64_REL24_NOTOC)) &#123;</span><br><span class="line">  <span class="keyword">if</span> ((st_other&gt;&gt;<span class="number">5</span>) &gt; <span class="number">1</span>)</span><br><span class="line">    use r12 setup stub (`__gep_setup_$&#123;name&#125;`)</span><br><span class="line">  <span class="keyword">else</span></span><br><span class="line">    use PC-relative <span class="type">long</span> branch thunk (`__long_branch_pcrel_$&#123;name&#125;`)</span><br><span class="line">&#125; <span class="keyword">else</span> &#123;</span><br><span class="line">  <span class="keyword">if</span> (shared || pie)</span><br><span class="line">    use TOC position-independent <span class="type">long</span> branch thunk (`__long_branch_$&#123;name&#125;`)</span><br><span class="line">  <span class="keyword">else</span></span><br><span class="line">    use TOC position-dependent <span class="type">long</span> branch thunk (`__long_branch_$&#123;name&#125;`)</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h3 id="risc-v">RISC-V</h3>
+<p><code>R_RISCV_CALL</code> and <code>R_RISCV_CALL_PLT</code> are the
+only two PLT-generating relocation types. The GNU toolchain use them in
+non-PIC and PIC code, respectively.</p>
+<p>However, RISC-V supports memory load with PC-relative addressing, so
+it doesn't need non-PIC PLT vs PIC PLT distinction. I filed <a
+target="_blank" rel="noopener" href="https://github.com/riscv-non-isa/riscv-elf-psabi-doc/issues/98"><code>R_RISCV_CALL vs R_RISCV_CALL_PLT</code></a>
+about deprecation for the former.</p>
+<p>Otherwise, its PLT scheme is quite good. <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">Disassembly of section .plt:</span><br><span class="line"></span><br><span class="line">0000000000000270 &lt;.plt&gt;:</span><br><span class="line"> 270:   00002397                auipc   t2,0x2</span><br><span class="line"> 274:   41c30333                sub     t1,t1,t3</span><br><span class="line"> 278:   d903be03                ld      t3,-624(t2) # 2000 &lt;.got&gt;</span><br><span class="line"> 27c:   fd430313                addi    t1,t1,-44</span><br><span class="line"> 280:   d9038293                addi    t0,t2,-624</span><br><span class="line"> 284:   00135313                srli    t1,t1,0x1</span><br><span class="line"> 288:   0082b283                ld      t0,8(t0)</span><br><span class="line"> 28c:   000e0067                jr      t3</span><br><span class="line"></span><br><span class="line">0000000000000290 &lt;bar@plt&gt;:</span><br><span class="line"> 290:   00002e17                auipc   t3,0x2</span><br><span class="line"> 294:   d80e3e03                ld      t3,-640(t3) # 2010 &lt;bar&gt;</span><br><span class="line"> 298:   000e0367                jalr    t1,t3</span><br><span class="line"> 29c:   00000013                nop</span><br></pre></td></tr></table></figure></p>
+<p>The address of an anchor in the PLT entry is available in t1, so the
+<code>R_*_JUMP_SLOT</code> index can be computed in the PLT header.</p>
+<h3 id="x86">x86</h3>
+<p>For x86-32, <code>R_386_PLT32</code> is the only PLT-generating
+relocation type. Unfortunately non-PIC code uses <code>R_386_PC32</code>
+which can trigger caninical PLT entries.</p>
+<p>For x86-64, <code>R_X86_64_PLT32</code> is the only PLT-generating
+relocation type.</p>
+<p>ld.lld supports <code>-z retpolineplt</code> for Spectre v2
+mitigation. The indirection branch needs to be protected by a special
+code sequence.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br></pre></td><td class="code"><pre><span class="line">000000000000142c &lt;foo&gt;:</span><br><span class="line">    142c: 55                            pushq   %rbp</span><br><span class="line">    142d: 48 89 e5                      movq    %rsp, %rbp</span><br><span class="line">    1430: e8 5b 00 00 00                callq   0x1490 &lt;bar+0x1490&gt;</span><br><span class="line">    1435: 90                            nop</span><br><span class="line">    1436: 5d                            popq    %rbp</span><br><span class="line">    1437: c3                            retq</span><br><span class="line"></span><br><span class="line">0000000000001460 &lt;.plt&gt;:</span><br><span class="line">    1460: ff 35 4a 21 00 00             pushq   8522(%rip)              # 0x35b0 &lt;_GLOBAL_OFFSET_TABLE_+0x8&gt;</span><br><span class="line">    1466: 4c 8b 1d 4b 21 00 00          movq    8523(%rip), %r11        # 0x35b8 &lt;_GLOBAL_OFFSET_TABLE_+0x10&gt;</span><br><span class="line">    146d: e8 0e 00 00 00                callq   0x1480 &lt;.plt+0x20&gt;</span><br><span class="line">    1472: f3 90                         pause</span><br><span class="line">    1474: 0f ae e8                      lfence</span><br><span class="line">    1477: eb f9                         jmp     0x1472 &lt;.plt+0x12&gt;</span><br><span class="line">    1479: cc                            int3</span><br><span class="line">    147a: cc                            int3</span><br><span class="line">    147b: cc                            int3</span><br><span class="line">    147c: cc                            int3</span><br><span class="line">    147d: cc                            int3</span><br><span class="line">    147e: cc                            int3</span><br><span class="line">    147f: cc                            int3</span><br><span class="line">    1480: 4c 89 1c 24                   movq    %r11, (%rsp)</span><br><span class="line">    1484: c3                            retq</span><br><span class="line">    1485: cc                            int3</span><br><span class="line">    1486: cc                            int3</span><br><span class="line">    1487: cc                            int3</span><br><span class="line">    1488: cc                            int3</span><br><span class="line">    1489: cc                            int3</span><br><span class="line">    148a: cc                            int3</span><br><span class="line">    148b: cc                            int3</span><br><span class="line">    148c: cc                            int3</span><br><span class="line">    148d: cc                            int3</span><br><span class="line">    148e: cc                            int3</span><br><span class="line">    148f: cc                            int3</span><br><span class="line">    1490: 4c 8b 1d 29 21 00 00          movq    8489(%rip), %r11        # 0x35c0 &lt;_GLOBAL_OFFSET_TABLE_+0x18&gt;</span><br><span class="line">    1497: e8 e4 ff ff ff                callq   0x1480 &lt;.plt+0x20&gt;</span><br><span class="line">    149c: e9 d1 ff ff ff                jmp     0x1472 &lt;.plt+0x12&gt;</span><br><span class="line">    14a1: 68 00 00 00 00                pushq   $0</span><br><span class="line">    14a6: e9 b5 ff ff ff                jmp     0x1460 &lt;.plt&gt;</span><br><span class="line">    14ab: cc                            int3</span><br><span class="line">    14ac: cc                            int3</span><br><span class="line">    14ad: cc                            int3</span><br><span class="line">    14ae: cc                            int3</span><br><span class="line">    14af: cc                            int3</span><br></pre></td></tr></table></figure>
+<p>With <code>-z now</code>, the code sequence can be simplified a
+bit.</p>
+<p>As part of Intel's Control-flow Enforcement Technology, Indirect
+Branch Tracking requires that indirect jumps land on an
+<code>endbr</code> instruction.</p>
+<figure class="highlight txt"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">% gcc -fpic -fcf-protection=full -shared a.c -o a.so</span><br></pre></td></tr></table></figure>
+<p>An <code>endbr64</code> instruction takes 4 bytes and does not fit in
+the current 16-byte PLT entry scheme. They somehow decided to add a new
+section <code>.plt.sec</code>. The linker uses <code>endbr64</code> if
+all object files have the <code>GNU_PROPERTY_X86_FEATURE_1_IBT</code>
+GNU property.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line">Disassembly of section .plt:</span><br><span class="line"></span><br><span class="line">0000000000001000 &lt;.plt&gt;:</span><br><span class="line">    1000:       ff 35 02 30 00 00       push   0x3002(%rip)          # 4008 &lt;_GLOBAL_OFFSET_TABLE_+0x8&gt;</span><br><span class="line">    1006:       f2 ff 25 03 30 00 00    bnd jmp *0x3003(%rip)        # 4010 &lt;_GLOBAL_OFFSET_TABLE_+0x10&gt;</span><br><span class="line">    100d:       0f 1f 00                nopl   (%rax)</span><br><span class="line">    1010:       f3 0f 1e fa             endbr64                      # Jumps here if not resolved yet</span><br><span class="line">    1014:       68 00 00 00 00          push   $0x0</span><br><span class="line">    1019:       f2 e9 e1 ff ff ff       bnd jmp 1000 &lt;bar@plt-0x20&gt;</span><br><span class="line">    101f:       90                      nop</span><br><span class="line"></span><br><span class="line">Disassembly of section .plt.sec:</span><br><span class="line"></span><br><span class="line">0000000000001020 &lt;bar@plt&gt;:</span><br><span class="line">    1020:       f3 0f 1e fa             endbr64</span><br><span class="line">    1024:       f2 ff 25 ed 2f 00 00    bnd jmp *0x2fed(%rip)        # 4018 &lt;bar+0x2fd8&gt;</span><br><span class="line">    102b:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)</span><br><span class="line"></span><br><span class="line">Disassembly of section .text:</span><br><span class="line"></span><br><span class="line">0000000000001030 &lt;foo&gt;:</span><br><span class="line">    1030:       f3 0f 1e fa             endbr64</span><br><span class="line">    1034:       e9 e7 ff ff ff          jmp    1020 &lt;bar@plt&gt;</span><br><span class="line">    1039:       0f 1f 80 00 00 00 00    nopl   0x0(%rax)</span><br></pre></td></tr></table></figure>
+<p><code>foo</code> will jump to <code>bar@plt</code> in
+<code>.plt.sec</code>, then either jump to the corresponding
+<code>.plt</code> entry or the target function directly.</p>
+<p>Let me register a complaint here. I think <code>.plt.sec</code> is
+unneeded complexity and I <a
+target="_blank" rel="noopener" href="https://groups.google.com/g/x86-64-abi/c/Z6GqQDy_NaI/m/_ok9VVyPAgAJ">proposed</a>:</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">endbr64</span><br><span class="line">jmpq *xxx(%rip)  # jump to the next endbr64 for lazy binding</span><br><span class="line">endbr64</span><br><span class="line">pushq relocaton_index</span><br><span class="line">jmpq *xxx(%rip)  # jump to .plt</span><br></pre></td></tr></table></figure>
+<p><a target="_blank" rel="noopener" href="https://groups.google.com/g/x86-64-abi/c/sQcX3__r4c0"
+class="uri">https://groups.google.com/g/x86-64-abi/c/sQcX3__r4c0</a> has
+more discussions. Most folks agreed that the 2-PLT scheme was
+over-engineered. After this event, I subscribed to x86-64-abi in case I
+missed such over-engineering designs in the future.</p>
+<p>If we can clobber r11, we can use the following <a
+target="_blank" rel="noopener" href="https://groups.google.com/g/x86-64-abi/c/oi3i85b1uI0/m/MAOvvMMSBAAJ">scheme</a>:
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line">plt_header:</span><br><span class="line">f3 0f 1e fa        endbr64</span><br><span class="line">41 53              push %r11</span><br><span class="line">ff 35 00 00 00 00  push GOT[1]</span><br><span class="line">ff 25 00 00 00 00  jmp *GOT[2]</span><br><span class="line">0f 1f 40 00        nop</span><br><span class="line">0f 1f 40 00        nop</span><br><span class="line">0f 1f 40 00        nop</span><br><span class="line">66 90              nop</span><br><span class="line"></span><br><span class="line">plt[n]:</span><br><span class="line">f3 0f 1e fa        endbr64</span><br><span class="line">41 bb 00 00 00 00  mov $index, %r11d</span><br><span class="line">ff 25 00 00 00 00  jmp *.got.plt[index]</span><br></pre></td></tr></table></figure></p>
+<p>We can optimize out the unconditional <code>mov</code> instruction by
+computing the PLT index with the return address: <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">plt_header:</span><br><span class="line">  pop %r11</span><br><span class="line">  sub %r11d, plt_header</span><br><span class="line">  shr $0x5, %r11</span><br><span class="line">  push %r11</span><br><span class="line">  push GOT[1]</span><br><span class="line">  jmp *GOT[2]</span><br><span class="line"></span><br><span class="line">plt[n]:</span><br><span class="line">  endbr64</span><br><span class="line">  jmp GOT[foo]</span><br><span class="line">  call plt_header</span><br></pre></td></tr></table></figure></p>
+<h4 id="x86-plt-rewriting">x86 PLT rewriting</h4>
+<p>In 2023-09, GNU ld's x86-64 port <a
+target="_blank" rel="noopener" href="https://sourceware.org/git/?p=binutils-gdb.git;a=commit;h=832ca732b8a96ff9a3e7c4abf24098bf2a59a96d">introduced
+<code>-z mark-plt</code></a> to communicate information to rtld to
+rewrite eligible indirect jump instructions to direct jump
+instructions.</p>
+<ul>
+<li>The linker adds dynamic tags
+<code>DT_X86_64_PLT/DT_X86_64_PLTSZ/DT_X86_64_PLTENT</code>.</li>
+<li>The addend in <code>R_X86_64_JUMP_SLOT</code> relocations are
+adjusted to indicate the offset of the indirect jump instruction.</li>
+</ul>
+<p>Since 2024-01, if binutils is configured with
+<code>--enable-mark-plt</code>, <code>-z mark-plt</code> will be the
+default.</p>
+<p>In glibc, when <code>GLIBC_TUNABLES=glibc.cpu.plt_rewrite=1</code> or
+2 is specified, lazy PLT binding is disabled, and an object file enables
+<code>DT_X86_64_PLT/DT_X86_64_PLTSZ/DT_X86_64_PLTENT</code> tags, glibc
+<a
+target="_blank" rel="noopener" href="https://sourceware.org/git/?p=glibc.git;a=commit;h=848746e88ec2aa22e8dea25f2110e2b2c59c712e">rewrites
+eligible PLT entries</a>. After relocating an object file,
+<code>x86_64_dynamic_after_reloc</code> (due to the
+<code>ELF_DYNAMIC_AFTER_RELOC</code> hook) calls
+<code>x86_64_rewrite_plt_in_place</code>, which changes the permission
+of the <code>.plt</code> memory page (<code>MAP_PRIVATE</code>) to
+<code>PROT_READ|PROT_WRITE</code>, rewrites eligible PLT entries, then
+changes the page to <code>PROT_READ|PROT_EXEC</code>.</p>
+<p>For each <code>R_X86_64_JUMP_SLOT</code> relocation,
+<code>x86_64_rewrite_plt_in_place</code> reads the target address from
+the <code>.got.plt</code> entry, computes the indirect jump address
+using the addend, then checks whether the jump target is reachable with
+a direct JMP instruction. If so, the indirect jump instruction is
+rewritten to <code>jmp $target</code>; otherwise, when
+<code>GLIBC_TUNABLES=glibc.cpu.plt_rewrite=2</code> is specified on APX
+processors, the indirect jump instruction is rewritten to
+<code>jmpabs $target</code> (64-bit absolute jump).</p>
+<p>The mprotect operations increase private data uses and are
+incompatible with <a
+target="_blank" rel="noopener" href="https://git.kernel.org/linus/b507808ebce23561d4ff8c2aa1fb949fe402bc61">memory-deny-write-execute</a>.
+One primary cost of PLT is the use of an extra instruction cache line.
+Rewriting jump instruction does not eliminate this overhead.</p>
+<p>Since the main executable is far away from shared objects in the
+address space, in the absence of APX <code>jmpabs</code>, the PLT
+rewriting will very likely not occur.</p>
+<p>PowerPC32 has a BSS-PLT ABI that generates PLT entries on the fly,
+which shares some similarity. BSS-PLT is obsoleted primarily due to
+security concerns. glibc also implements runtime PLT generation for
+alpha and sparc32/sparc64.</p>
+<p>As a minor note, this optimization will <a
+target="_blank" rel="noopener" href="https://groups.google.com/g/x86-64-abi/c/vbuHVMK_RIA/m/zi0qi_0pBQAJ">nullify</a>
+the <a
+href="/blog/2021-08-29-all-about-global-offset-table#combining-.got-and-.got.plt"><code>.plt.got</code>
+optimization (little benefit, but clever)</a>.</p>
+<p><code>-fno-plt</code> may also do better than this PLT
+optimization.</p>
+<h2 id="summary">Summary</h2>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (supports memory load with PC-relative addressing) &#123;</span><br><span class="line">  You made the right design choice!</span><br><span class="line">  Non-PIC PLT and PIC PLT can be the same.</span><br><span class="line">  See AArch64, RISC-V, x86<span class="number">-64.</span></span><br><span class="line">  <span class="keyword">if</span> (letting one <span class="keyword">register</span> hold the .got.plt address is efficient)</span><br><span class="line">    See AArch64 PLT.</span><br><span class="line">  <span class="keyword">else</span></span><br><span class="line">    See PowerPC64 call stub and Mach-O AArch64 stub.</span><br><span class="line">&#125; <span class="keyword">else</span> <span class="keyword">if</span> (-fno-plt) &#123;</span><br><span class="line">  Use a call-clobbered <span class="keyword">register</span> to store _GLOBAL_OFFSET_TABLE_.</span><br><span class="line">  Call sites are longer.</span><br><span class="line">  Every call site needs re-computing _GLOBAL_OFFSET_TABLE_.</span><br><span class="line">  The computation is unneeded <span class="keyword">for</span> inter-component calls.</span><br><span class="line">  No lazy binding.</span><br><span class="line">  <span class="keyword">if</span> (optimize inter-component calls)</span><br><span class="line">    Add linker optimization/relaxation.</span><br><span class="line">&#125; <span class="keyword">else</span> <span class="keyword">if</span> (optimize inter-component calls) &#123;</span><br><span class="line">  Use the PowerPC64 style TOC.</span><br><span class="line">  <span class="keyword">if</span> (Don<span class="number">&#x27;</span>t mind having two entry points at function start)</span><br><span class="line">    See ELFv2 global/local entries.</span><br><span class="line">  <span class="keyword">else</span></span><br><span class="line">    See ELFv1 function descriptors.</span><br><span class="line">&#125; <span class="keyword">else</span> &#123;</span><br><span class="line">  Use the x86<span class="number">-32</span> scheme.</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h1 id="appendix">Appendix</h1>
+<h2 id="the-history-of-nix-shared-library-support">The history of *NIX
+shared library support</h2>
+<p>... according to my archaeology.</p>
+<p>The a.out format was designed for PDP-11. The 16-bit design could be
+naturally extended to 32-bit, which was suitable for many 32-bit
+machines and operating systems.</p>
+<p>Outside the UNIX world, VAX/VMS had dynamic linking earlier than
+Unix.</p>
+<p>In <em>1984 USENIX UniForum Conference Proceedings</em>,
+<em>Transparent Implementation of Shared Libraries</em> described a
+library stub and link table scheme which is similar to <code>.plt</code>
+plus <code>.got.plt</code> used today.</p>
+<p>System V release 3 switched to the COFF format. In <em>1986 Summer
+USENIX Technical Conference &amp; Exhibition Proceedings</em>,
+<em>Shared Libraries on UNIX System V</em> from AT&amp;T described a
+shared library design. Its shared library must have a fixed virtual
+address, which is called "static shared library" in <em>Linkers and
+Loaders</em>'s term.</p>
+<p>In 1988, SunOS 4.0 was released with an extended a.out binary format
+with dynamic shared library support. Unlike previous static shared
+library schemes, the a.out shared libraries are position independent and
+can be loaded at different addresses. The GOT and PLT schemes are what
+we see today. In 1992, SunOS 5.0 (Solaris 2.0) switched to ELF.</p>
+<p>The first System V release 4 ABI (using ELF) is from around that
+time. The work was a cooperative effort between AT&amp;T and Sun.
+AT&amp;T contributed the ELF object format. Sun contributed all of the
+dynamic linking implementation from SunOS 4.x.</p>
+<p>In January 1991, HP-UX 8.0 (developed since around 1989) added
+dynamic shared libraries to Spectrum Object Module. In 1996, they
+switched to ELF for 64-bit runtime on PA-RISC 2.0. SOM was kept for
+32-bit runtime. HP-UX on Itanium used ELF exclusively.</p>
+<p>IRIX 5.0, released in 1993, included ELF support.</p>
+<p>In 1993, on NetBSD, <a
+target="_blank" rel="noopener" href="https://github.com/NetBSD/src/commit/97ca10e37476fb84a20a8ec4b0be3188db703670"
+class="uri">https://github.com/NetBSD/src/commit/97ca10e37476fb84a20a8ec4b0be3188db703670</a>
+(<code>A linker supporting shared libraries.</code>) and <a
+target="_blank" rel="noopener" href="https://github.com/NetBSD/src/commit/3d68d0acaed0a32f929b2c174146c62940005a18"
+class="uri">https://github.com/NetBSD/src/commit/3d68d0acaed0a32f929b2c174146c62940005a18</a>
+(<code>A linker supporting shared libraries (run-time part).</code>)
+added shared library support similar to the SunOS scheme. In 2000,
+NetBSD 1.5 switched to ELF by default.</p>
+<p>In 1994, GNU ld added ELF shared library support.</p>
+<p>The Linux was using a static shared library variant of a.out. In
+1995, glibc added ELF shared library support.</p>
+<p>FreeBSD ported shared library code from NetBSD since 1994. In 1998,
+FreeBSD 3.0 switched to ELF by default.</p>
+<p>Dynamic shared library support on Mach-O was later. In a NeXTSTEP
+manual released in 1995, I can find <code>MH_FVMLIB</code> (fixed
+virtual memory library, which appears to be a static shared library
+scheme) but not <code>MH_DYLIB</code> (used by modern macOS for .dylib
+files).</p>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="https://maskray.me/blog/2021-09-19-all-about-procedure-linkage-table" data-id="cmklyfnrq00bcngin63ahftxj" data-title="All about Procedure Linkage Table" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      
+      
+      
+  <ul class="article-tag-list" itemprop="keywords"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/binutils/" rel="tag">binutils</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/linker/" rel="tag">linker</a></li></ul>
+
+    </footer>
+  </div>
+  
+    
+<nav id="article-nav">
+  
+    <a href="/blog/2021-09-26-competitive-programming-in-nim" id="article-nav-newer" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">Newer</strong>
+      <div class="article-nav-title">
+        
+          Competitive programming in Nim
+        
+      </div>
+    </a>
+  
+  
+    <a href="/blog/2021-09-05-build-glibc-with-lld" id="article-nav-older" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">Older</strong>
+      <div class="article-nav-title">Build glibc with LLD 13</div>
+    </a>
+  
+</nav>
+
+  
+</article>
+
+
+<section class="giscus"></section>
+<script src="https://giscus.app/client.js"
+ data-repo="MaskRay/maskray.me"
+ data-repo-id="R_kgDON7L_CQ"
+ data-category="Blog Post Comments"
+ data-category-id="DIC_kwDON7L_Cc4CnDq4"
+ data-mapping="pathname"
+ data-strict="0"
+ data-reactions-enabled="1"
+ data-emit-metadata="0"
+ data-input-position="bottom"
+ data-theme="preferred_color_scheme"
+ data-lang="en"
+ data-loading="lazy"
+ crossorigin="anonymous"
+ async>
+</script>
+
+
+
+
+</section>
+        
+          <aside id="sidebar">
+  
+    
+  <div class="widget-wrap">
+    <h3 class="widget-title">Popular</h3>
+    <div class="widget">
+      <ul class="entry" id="js-popular">
+      </ul>
+    </div>
+  </div>
+
+
+  
+    
+  <div class="widget-wrap">
+    <h3 class="widget-title">Tag Cloud</h3>
+    <div class="widget tagcloud">
+      <a href="/blog/tags/adc/" style="font-size: 10.5px;">adc</a> <a href="/blog/tags/ai9/" style="font-size: 10px;">ai9</a> <a href="/blog/tags/algorithm/" style="font-size: 18.5px;">algorithm</a> <a href="/blog/tags/arm/" style="font-size: 10px;">arm</a> <a href="/blog/tags/asc/" style="font-size: 10px;">asc</a> <a href="/blog/tags/assembler/" style="font-size: 16px;">assembler</a> <a href="/blog/tags/automaton/" style="font-size: 10px;">automaton</a> <a href="/blog/tags/awesome/" style="font-size: 10px;">awesome</a> <a href="/blog/tags/bctf/" style="font-size: 11px;">bctf</a> <a href="/blog/tags/binary/" style="font-size: 11.5px;">binary</a> <a href="/blog/tags/binutils/" style="font-size: 19px;">binutils</a> <a href="/blog/tags/bmc/" style="font-size: 10px;">bmc</a> <a href="/blog/tags/build-system/" style="font-size: 10px;">build system</a> <a href="/blog/tags/c/" style="font-size: 11px;">c</a> <a href="/blog/tags/cpp/" style="font-size: 14.5px;">c++</a> <a href="/blog/tags/ccls/" style="font-size: 11.5px;">ccls</a> <a href="/blog/tags/cgc/" style="font-size: 10px;">cgc</a> <a href="/blog/tags/chroot/" style="font-size: 10px;">chroot</a> <a href="/blog/tags/clang/" style="font-size: 16.5px;">clang</a> <a href="/blog/tags/clang-format/" style="font-size: 10px;">clang-format</a> <a href="/blog/tags/codinsanity/" style="font-size: 10px;">codinsanity</a> <a href="/blog/tags/coffee-script/" style="font-size: 10px;">coffee script</a> <a href="/blog/tags/compiler/" style="font-size: 14px;">compiler</a> <a href="/blog/tags/compression/" style="font-size: 10.5px;">compression</a> <a href="/blog/tags/computer-security/" style="font-size: 10px;">computer security</a> <a href="/blog/tags/contest/" style="font-size: 16px;">contest</a> <a href="/blog/tags/csv/" style="font-size: 10px;">csv</a> <a href="/blog/tags/ctf/" style="font-size: 17.5px;">ctf</a> <a href="/blog/tags/data-structure/" style="font-size: 14px;">data structure</a> <a href="/blog/tags/data-structures/" style="font-size: 10px;">data-structures</a> <a href="/blog/tags/debug/" style="font-size: 12px;">debug</a> <a href="/blog/tags/defcon/" style="font-size: 14px;">defcon</a> <a href="/blog/tags/desktop/" style="font-size: 11px;">desktop</a> <a href="/blog/tags/docker/" style="font-size: 10.5px;">docker</a> <a href="/blog/tags/elf/" style="font-size: 13px;">elf</a> <a href="/blog/tags/emacs/" style="font-size: 15.5px;">emacs</a> <a href="/blog/tags/email/" style="font-size: 11.5px;">email</a> <a href="/blog/tags/emoji/" style="font-size: 10px;">emoji</a> <a href="/blog/tags/emscripten/" style="font-size: 10px;">emscripten</a> <a href="/blog/tags/event/" style="font-size: 10px;">event</a> <a href="/blog/tags/expect/" style="font-size: 11.5px;">expect</a> <a href="/blog/tags/ext4/" style="font-size: 10px;">ext4</a> <a href="/blog/tags/fdpic/" style="font-size: 10px;">fdpic</a> <a href="/blog/tags/feeds/" style="font-size: 10px;">feeds</a> <a href="/blog/tags/firmware/" style="font-size: 10px;">firmware</a> <a href="/blog/tags/floating-point/" style="font-size: 10px;">floating point</a> <a href="/blog/tags/forensics/" style="font-size: 11px;">forensics</a> <a href="/blog/tags/fp/" style="font-size: 10px;">fp</a> <a href="/blog/tags/freebsd/" style="font-size: 10px;">freebsd</a> <a href="/blog/tags/game/" style="font-size: 10.5px;">game</a> <a href="/blog/tags/gcc/" style="font-size: 18px;">gcc</a> <a href="/blog/tags/gdb/" style="font-size: 10px;">gdb</a> <a href="/blog/tags/gentoo/" style="font-size: 10.5px;">gentoo</a> <a href="/blog/tags/git/" style="font-size: 10px;">git</a> <a href="/blog/tags/github/" style="font-size: 10.5px;">github</a> <a href="/blog/tags/glibc/" style="font-size: 16px;">glibc</a> <a href="/blog/tags/graph/" style="font-size: 10px;">graph</a> <a href="/blog/tags/graph-drawing/" style="font-size: 10px;">graph drawing</a> <a href="/blog/tags/gtk/" style="font-size: 10.5px;">gtk</a> <a href="/blog/tags/hacker-culture/" style="font-size: 10px;">hacker culture</a> <a href="/blog/tags/hackerrank/" style="font-size: 10px;">hackerrank</a> <a href="/blog/tags/hanoi/" style="font-size: 10px;">hanoi</a> <a href="/blog/tags/haskell/" style="font-size: 15px;">haskell</a> <a href="/blog/tags/hpc/" style="font-size: 10.5px;">hpc</a> <a href="/blog/tags/image/" style="font-size: 10px;">image</a> <a href="/blog/tags/inotify/" style="font-size: 10px;">inotify</a> <a href="/blog/tags/ipsec/" style="font-size: 10px;">ipsec</a> <a href="/blog/tags/irc/" style="font-size: 12.5px;">irc</a> <a href="/blog/tags/isc/" style="font-size: 10.5px;">isc</a> <a href="/blog/tags/j/" style="font-size: 10px;">j</a> <a href="/blog/tags/javascript/" style="font-size: 12px;">javascript</a> <a href="/blog/tags/josephus-problem/" style="font-size: 10px;">josephus problem</a> <a href="/blog/tags/jq/" style="font-size: 10px;">jq</a> <a href="/blog/tags/kernel/" style="font-size: 11.5px;">kernel</a> <a href="/blog/tags/kythe/" style="font-size: 10px;">kythe</a> <a href="/blog/tags/ld/" style="font-size: 10px;">ld</a> <a href="/blog/tags/leetcode/" style="font-size: 11.5px;">leetcode</a> <a href="/blog/tags/libunwind/" style="font-size: 10px;">libunwind</a> <a href="/blog/tags/linker/" style="font-size: 19.5px;">linker</a> <a href="/blog/tags/linux/" style="font-size: 12.5px;">linux</a> <a href="/blog/tags/lld/" style="font-size: 10.5px;">lld</a> <a href="/blog/tags/lldb/" style="font-size: 10px;">lldb</a> <a href="/blog/tags/llvm/" style="font-size: 20px;">llvm</a> <a href="/blog/tags/lsp/" style="font-size: 13px;">lsp</a> <a href="/blog/tags/m68k/" style="font-size: 10px;">m68k</a> <a href="/blog/tags/makefile/" style="font-size: 12.5px;">makefile</a> <a href="/blog/tags/math/" style="font-size: 10px;">math</a> <a href="/blog/tags/maze/" style="font-size: 11px;">maze</a> <a href="/blog/tags/mirror/" style="font-size: 10px;">mirror</a> <a href="/blog/tags/ml/" style="font-size: 13px;">ml</a> <a href="/blog/tags/musl/" style="font-size: 10px;">musl</a> <a href="/blog/tags/mutt/" style="font-size: 10px;">mutt</a> <a href="/blog/tags/n-body/" style="font-size: 10px;">n-body</a> <a href="/blog/tags/neovim/" style="font-size: 10px;">neovim</a> <a href="/blog/tags/network/" style="font-size: 10.5px;">network</a> <a href="/blog/tags/nginx/" style="font-size: 10px;">nginx</a> <a href="/blog/tags/nim/" style="font-size: 10px;">nim</a> <a href="/blog/tags/nlp/" style="font-size: 10px;">nlp</a> <a href="/blog/tags/node-js/" style="font-size: 11px;">node.js</a> <a href="/blog/tags/noip/" style="font-size: 10px;">noip</a> <a href="/blog/tags/notmuch/" style="font-size: 10px;">notmuch</a> <a href="/blog/tags/npm/" style="font-size: 10px;">npm</a> <a href="/blog/tags/ocaml/" style="font-size: 14.5px;">ocaml</a> <a href="/blog/tags/offlineimap/" style="font-size: 10px;">offlineimap</a> <a href="/blog/tags/oi/" style="font-size: 13px;">oi</a> <a href="/blog/tags/oj/" style="font-size: 10.5px;">oj</a> <a href="/blog/tags/openwrt/" style="font-size: 10px;">openwrt</a> <a href="/blog/tags/parallel/" style="font-size: 10px;">parallel</a> <a href="/blog/tags/parser-generator/" style="font-size: 10px;">parser generator</a> <a href="/blog/tags/performance/" style="font-size: 10.5px;">performance</a> <a href="/blog/tags/perl/" style="font-size: 10px;">perl</a> <a href="/blog/tags/powerpc/" style="font-size: 10px;">powerpc</a> <a href="/blog/tags/presentation/" style="font-size: 10.5px;">presentation</a> <a href="/blog/tags/puzzle/" style="font-size: 10.5px;">puzzle</a> <a href="/blog/tags/python/" style="font-size: 13px;">python</a> <a href="/blog/tags/qq/" style="font-size: 10.5px;">qq</a> <a href="/blog/tags/radare2/" style="font-size: 10px;">radare2</a> <a href="/blog/tags/regex/" style="font-size: 10.5px;">regex</a> <a href="/blog/tags/regular-expression/" style="font-size: 10px;">regular expression</a> <a href="/blog/tags/release/" style="font-size: 14px;">release</a> <a href="/blog/tags/reverse-engineering/" style="font-size: 11px;">reverse engineering</a> <a href="/blog/tags/review/" style="font-size: 10px;">review</a> <a href="/blog/tags/riscv/" style="font-size: 11px;">riscv</a> <a href="/blog/tags/router/" style="font-size: 10px;">router</a> <a href="/blog/tags/rtld/" style="font-size: 10px;">rtld</a> <a href="/blog/tags/ruby/" style="font-size: 11.5px;">ruby</a> <a href="/blog/tags/ructfe/" style="font-size: 10px;">ructfe</a> <a href="/blog/tags/s390x/" style="font-size: 10px;">s390x</a> <a href="/blog/tags/sanitizer/" style="font-size: 11.5px;">sanitizer</a> <a href="/blog/tags/scheme/" style="font-size: 10px;">scheme</a> <a href="/blog/tags/search/" style="font-size: 10px;">search</a> <a href="/blog/tags/security/" style="font-size: 17px;">security</a> <a href="/blog/tags/sframe/" style="font-size: 10.5px;">sframe</a> <a href="/blog/tags/shell/" style="font-size: 10.5px;">shell</a> <a href="/blog/tags/ssh/" style="font-size: 10px;">ssh</a> <a href="/blog/tags/stringology/" style="font-size: 11.5px;">stringology</a> <a href="/blog/tags/student-festival-puzzle/" style="font-size: 10px;">student festival puzzle</a> <a href="/blog/tags/suffix-array/" style="font-size: 10px;">suffix array</a> <a href="/blog/tags/suffix-automaton/" style="font-size: 10px;">suffix automaton</a> <a href="/blog/tags/summary/" style="font-size: 14.5px;">summary</a> <a href="/blog/tags/suricata/" style="font-size: 10px;">suricata</a> <a href="/blog/tags/telegram/" style="font-size: 10px;">telegram</a> <a href="/blog/tags/telegramircd/" style="font-size: 10px;">telegramircd</a> <a href="/blog/tags/terminal/" style="font-size: 10.5px;">terminal</a> <a href="/blog/tags/tls/" style="font-size: 10px;">tls</a> <a href="/blog/tags/travel/" style="font-size: 10px;">travel</a> <a href="/blog/tags/traversal/" style="font-size: 10.5px;">traversal</a> <a href="/blog/tags/tree/" style="font-size: 10.5px;">tree</a> <a href="/blog/tags/trendmicro/" style="font-size: 10px;">trendmicro</a> <a href="/blog/tags/udev/" style="font-size: 10px;">udev</a> <a href="/blog/tags/unicode/" style="font-size: 10px;">unicode</a> <a href="/blog/tags/unix/" style="font-size: 10px;">unix</a> <a href="/blog/tags/usb/" style="font-size: 10px;">usb</a> <a href="/blog/tags/vim/" style="font-size: 10px;">vim</a> <a href="/blog/tags/vpn/" style="font-size: 10px;">vpn</a> <a href="/blog/tags/vte/" style="font-size: 10.5px;">vte</a> <a href="/blog/tags/wargame/" style="font-size: 10.5px;">wargame</a> <a href="/blog/tags/web-analytics/" style="font-size: 10px;">web analytics</a> <a href="/blog/tags/webqqircd/" style="font-size: 10.5px;">webqqircd</a> <a href="/blog/tags/website/" style="font-size: 13.5px;">website</a> <a href="/blog/tags/wechat/" style="font-size: 11.5px;">wechat</a> <a href="/blog/tags/wechatircd/" style="font-size: 11px;">wechatircd</a> <a href="/blog/tags/window-manager/" style="font-size: 10px;">window manager</a> <a href="/blog/tags/windows/" style="font-size: 10px;">windows</a> <a href="/blog/tags/x86/" style="font-size: 10.5px;">x86</a> <a href="/blog/tags/xbindkeys/" style="font-size: 10px;">xbindkeys</a> <a href="/blog/tags/xmonad/" style="font-size: 10.5px;">xmonad</a> <a href="/blog/tags/xz/" style="font-size: 10px;">xz</a> <a href="/blog/tags/yanshi/" style="font-size: 10px;">yanshi</a>
+    </div>
+  </div>
+
+  
+    <div class="widget-wrap">
+  <h3 class="widget-title">Blogroll</h3>
+  <div class="widget">
+    <ul>
+      <li><a href='https://byvoid.com' rel='friend' target='_blank'>BYVoid</a></li>
+      <li><a href='https://fqj.me' rel='friend' target='_blank'>fqj1994</a></li>
+      <li><a href='http://ppwwyyxx.com' rel='friend' target='_blank'>ppwwyyxx</a></li>
+    </ul>
+  </div>
+</div>
+
+  
+</aside>
+        
+      </div>
+      <footer id="footer">
+  
+  <div class="outer">
+    <div id="footer-info" class="inner">
+      
+      &copy; 2026 MaskRay<br>
+      Powered by <a href="https://hexo.io/" target="_blank">Hexo</a>
+    </div>
+  </div>
+</footer>
+
+    </div>
+    <nav id="mobile-nav">
+  
+    <a href="/blog/" class="mobile-nav-link">Home</a>
+  
+    <a href="/blog/archives/" class="mobile-nav-link">Archives</a>
+  
+    <a href="/blog/../feeds/" class="mobile-nav-link">Feeds</a>
+  
+    <a href="/blog/../til/" class="mobile-nav-link">TIL</a>
+  
+    <a href="/blog/../presentations/" class="mobile-nav-link">Presentations</a>
+  
+</nav>
+    
+
+
+<script src="/blog/js/jquery-3.6.4.min.js"></script>
+
+
+
+  
+<script src="/blog/fancybox/jquery.fancybox.min.js"></script>
+
+
+
+
+<script src="/blog/js/script.js"></script>
+
+
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C3HG5LHWPX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C3HG5LHWPX');
+</script>
+<!-- End Google Analytics -->
+
+
+
+<script src="/js/popular.js"></script>
+
+  </div>
+</body>
+</html>

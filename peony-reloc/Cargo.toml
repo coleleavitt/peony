@@ -1,0 +1,15 @@
+[package]
+name = "peony-reloc"
+description = "Relocation scanning and application (x86-64 ELF focus)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peony-object      = { path = "../peony-object" }
+peony-symbols     = { path = "../peony-symbols" }
+peony-layout      = { path = "../peony-layout" }
+rayon.workspace      = true
+rustc-hash.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true

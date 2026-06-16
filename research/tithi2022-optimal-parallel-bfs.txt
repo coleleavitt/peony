@@ -1,0 +1,324 @@
+Brief Announcement: An Optimal Level-synchronous
+Shared-memory Parallel BFS Algorithm with Optimal
+parallel Prefix-sum Algorithm and its Implications for
+Energy Consumption
+Jesmin Jahan Tithi, Yonatan Fogel, Rezaul Chowdhury
+Department of Computer Science, Stony Brook University, New York, 11790-4400, USA
+
+arXiv:2209.08764v1 [cs.DC] 19 Sep 2022
+
+E-mail:{rezaul, yfogel, jtithi}@cs.stonybrook.edu
+Abstract. We present a work-efficient parallel level-synchronous
+Breadth First Search (BFS) algorithm for shared-memory
+architectures which achieves the theoretical lower bound on
+parallel running time. The optimality holds regardless of the
+shape of the graph. We also demonstrate the implication of
+this optimality for the energy consumption of the program
+empirically. The key idea is to never use more processing
+cores than necessary to complete the work in any computation step efficiently. We keep rest of the cores idle to save
+energy and to reduce other resource contentions (e.g., bandwidth, shared caches, etc). Our BFS does not use locks
+and atomic-instructions and is easily extendible to sharedmemory coprocessors.
+Introduction. Breadth First Search (BFS) is one of the
+most widely studied graph traversal algorithms with applications spanning from social networks to computational
+biology. Given a graph G = (V, E), with vertex set V
+(|V | = n), edge set E (|E| = m) and diameter D, a levelsynchronous BFS traverses the graph from a given source
+vertex, s level by level, exploring the first level neighbors of
+s first, then the second level neighbors and so on until all
+vertices reachable from the s are explored. A straightforward way to implement a parallel level-synchronous BFS is
+to explore all vertices at a given level as well as all neighbors
+of a given vertex in parallel which takes O (D log(m + n))
+time using O(n + m) cores since launching and synchronizing m + n threads requires Θ (log(m + n)) time. In practice,
+the number of available processors P  m + n. In this
+paper, we first analyze the theoretical lower bound for a
+level-synchronous BFS on shared-memory architectures assuming that k threads can be launched and synchronized
+in O (log k) time, and then show that our BFS algorithm is
+able to archive that optimal lower bound.
+Motivation. It has been observed that for most practical
+graphs, the number of vertices explored at the beginning and
+at the end of a BFS exploration is significantly smaller than
+in the middle levels [2]. Therefore, using the same amount
+of computational resources (i.e., number of cores/threads,
+even caches) at all levels of the BFS is neither economi-
+
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for profit or commercial advantage and that copies
+bear this notice and the full citation on the first page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior specific
+permission and/or a fee.
+Copyright 20XX ACM X-XXXXX-XX-X/XX/XX ...$15.00.
+
+cal nor efficient. Indeed, with the increase of the number
+of active threads synchronization overheads, false sharing,
+conflict misses and DRAM and CPU energy/power also increase, and without enough work these overheads may dominate the running time. Motivated by this, we have developed
+a BFS algorithm in which we fix the number of cores based
+on the amount of work needs to be done at each computation step instead of using all fixed number of cores across
+the entire BFS. We demonstrate the impact of this choice
+on theoretical optimality as well as on energy performance
+on modern multicores.
+Algorithm. Our BFS algorithm (see Figure 1) uses parallel
+prefix-Sum, Splitting and Scanning (hence named S3BFS)
+to achieve work-optimality for arbitrary shaped graphs. We
+use the CurLevelVertices array to store vertices that are
+going to be explored in a level. The parallel for loops are
+implemented using recursive divide-and-conquer where the
+recursion stops and switches to an iterative loop when the
+size becomes ≤ grainsize and then each thread executes
+one of those loops in parallel with others. All major computations in S3BFS are performed using parallel fors.
+The main loop in lines 9−31 executes until CurLevelVertices
+becomes empty. The degrees of the vertices in CurLevelVertices
+are collected in EdgeSum and then Parallel-Prefix-Sum
+[1] is used to count the number of edges to be explored in
+the current level. Then each thread in parallel determines
+its start location (start vertex and start edge of that vertex)
+in CurLevelVertices assuming an (almost) equal division
+of work. Each active thread explores its assigned segment
+of edges and stores the newly discovered vertices in a private queue. A thread also marks itself as an owner of a
+vertex that it stores in its queue for the next level. If multiple threads claims ownership of a vertex, only one of them
+becomes the owner (benign race). After the exploration,
+each thread deduplicates its own output queue by keeping
+only the vertices for which it is the final owner. Next, each
+thread copies the unique vertices left in its queue to the
+CurLevelVertices, and the next level of BFS starts.
+Analysis. Let Ts be the running time of the most efficient serial level-synchronous BFS algorithm, let TP be the running
+time of such a parallel BFS algorithm on P ≥ 1 processing
+cores.
+Lower Bound for Parallel BFS: Since Ts = Θ (m + n),
+. If Wl is the amount of work at level l
+clearly, TP = Ω m+n
+P
+of a level-synchronous BFS, an optimal algorithm will incur
+Θ (log min (P, Wl )) synchronization overheadin that level.
+P
+Hence, TP = Ω m+n
++ D
+l=1 log min (P, Wl ) .
+P
+S3BF S achieves the lower bound above as follows. The
+
+entire BFS algorithm can be divided into D levels where each
+level l consists of a constant (say, c) number of steps. All
+of these steps are implemented using parallel for loops. For
+each such step i with work Wl,i , we choose Pl,i = min(P, Wl,i ).
+We distribute the work among Pl,i threads in Θ (log Pl,i )
+Wl,i
+parallel time. After that each thread performs Pl,i
+work
+serially.
+Hence,
+the
+parallel
+running
+time
+of
+that
+step
+is
+
+
+
+
+W
+Wl,i
++ log Pl,i which reduces to O Pl,i + log P when
+O Pl,i
+Pl,i = P , and to O (log Wl,i +1) when Pl,i = Wl,i . Hence,
+Wl,i
++ log min(P, Wl,i ) + 1
+P
+
+O
+is the parallel running time
+covering both cases.
+
+
+Pc
+P
+Wl,i
+O
+Therefore, TP = D
++
+log
+min(P,
+W
+)
++
+1
+l,i
+i=1
+l=1
+P
+
+ PD Pc
+PD Pc
+i=1 Wl,i
+l=1
+log
+min(P, Wl,i ) + cD =
+=O
++
+i+1
+l=1
+P
+
+
+Pc
+P
+O m+n
++ D
+i=1 (Wl,i ).
+l=1 log min(P, Wl ) , where Wl =
+P
+The Find-StartExpPoint in Line 17 is used to find the
+starting exploration location of each active thread. Instead
+of binary search we use the following approach so that it can
+be executed as a parallel for. For each entry of the EdgeSum
+array, in parallel we first determine a thread id, ts that can
+start at that location (i.e., a thread that should start exploring an edge connected to that node) and a thread id, te that
+could possibly end at that node. Note that this range will
+be empty for all except ≤ Pl,i of them. For each nonempty
+range, we write this node’s position as the corresponding
+thread’s start location.
+Experimental Results. We implemented our work-sensitive
+S3BFS using Intel’s Cilk Plus. To show the energy benefits of choosing an optimal number of cores at each computation step, we profiled S3BFS while running on the wikipedia
+graph with 1000 random sources. We repeated each run 30
+times with each source, and the entire experiment 4 times,
+and took the average. We ran a work-insensitive version of
+S3BFS in which the maximum number of cores were used
+for the entire computation. Figure 2(a) shows a performance
+comparison of these two versions. In this figure a ratio of
+> 1 means that the work-sensitive S3BF S is doing better, otherwise, the work-insensitive version is doing better.
+Since the first two BFS levels of the wikipedia graph typically have very few vertices and edges, the work-sensitive
+version should win which is, indeed, the case in the Figure.
+Since in level 3 the amount of work at each step is more
+than the maximum number of cores in our multicore machine (16-core Xeon Sandybridge), the ratios drop slightly
+bellow 1. Even then interestingly the ratio of DRAM energy
+consumption is still > 1.This shows potential energy benefit
+of S3BFS especially while running on thousands of cores.
+Figure 2(b) shows scalability of S3BFS on a 61-core Intel
+Xeon Phi architecture in its native mode on different realworld and synthetic graphs. It shows that S3BFS scales
+almost linearly till 120 threads on Xeon Phi for large enough
+graphs.
+Conclusion. We present a theoretically optimal level-synchronous
+parallel BFS algorithm which achieves optimality and reduces energy consumption by actively controlling the number of cores used in each computation step. We empirically
+show that for levels where the amount of work is significantly less than the available cores, this approach reduces
+energy and power considerably. This algorithm can bring
+more energy benefits while running BFS on thousands of
+processing cores and can be optimized with all known opti-
+
+Parallel-BFS( s, P ) s is the source vertex from which distance is
+calculated. P is the maximum number of processors to use. Returns
+d[0 : n − 1] which represents the distance from s to each vertex.
+1. Pl ← Min( P, n )
+2. parallel for u ← 0 to n − 1 do //for grainsize = n/Pl .
+3.
+
+d[u] ← ∞, Owner[u] ← P //initialize distance & owner.
+
+4. d[s] ← 0, Owner[s] ← 0 //initialize source values.
+5. CurLevelVertices ← array[0 : n − 1] //current level nodes.
+6. EdgeSum ← array[0 : n − 1]//holds prefixsum of degrees.
+7. CurLevelVertices[0] ← s //insert source vertex.
+8. l ← 0, Pl ← 1 //initial level and number of threads.
+9. while nl ← |CurLevelVertices| > 0 do //any vertex left.
+10.
+
+l ← l + 1 //nl = #vertices at level l.
+
+11.
+
+Pl ← min(P, nl )//Pl chosen based on max work.
+
+12.
+
+parallel for u ← 0 to nl − 1 do //for grainsize = nl /Pl .
+
+13.
+
+EdgeSum[u] ← Degree[CurLevelVertices[u]]
+
+14.
+
+Parallel-Prefix-Sum( EdgeSum, nl , Pl ) //degree sum.
+
+15.
+
+el ← EdgeSum[nl − 1] //total edges going to be explored.
+
+16.
+
+Pl ← Min( P, el )//Pl chosen based on max work.
+
+//Find starting exploration point for each active thread.
+17. StartExpPoint ← Find-StartExpPoint( EdgeSum, el , Pl )
+18.
+
+//Main Exploration with optimal number of threads.
+Q ← EXPLORE-VERTEX (CurLevelVertices, EdgeSum,
+StartExpPoint, d, Neighbor, Degree, el , Pl , l)
+//deduplication (keep single copy of a vertex).
+
+19.
+
+Sizes ← array[0 : Pl − 1] //stores output Q sizes.
+
+20.
+
+parallel for i ← 0 to Pl − 1 do //for grainsize = 1.
+
+21.
+22.
+
+Q-New ← queue //temporary local queue.
+for v ∈ Q[i] do if Owner[v] = i then Q-New.Enqueue( v )
+
+23.
+
+Q[i] ← Q-New, Sizes[i] ← |Q[i]|
+
+24.
+
+Parallel-Prefix-Sum( Sizes, Pl , P )
+//linearization (copy from distributed Q to a linear Q).
+
+25.
+
+CurLevelVertices ← array[0 : Sizes[Pl − 1]]
+
+26.
+
+parallel for i ← 0 to Pl − 1 do
+
+27.
+
+if i = 0 then Offset ← 0 else Offset ← Sizes[i − 1]
+
+28.
+
+for j ← Offset to Offset + |Q[i]| do
+
+29.
+
+CurLevelVertices[j] ← Q[i].Dequeue( )
+
+Figure 1: S3BFS: level-synchronous parallel breadth-first
+search.
+
+Figure 2: (a) Energy consumption (Package = Socket
+(CPUs), PP0 = Power Plane0), (b) Scalability on Xeon Phi.
+mizations (e.g., direction optimizations). We believe similar
+techniques can be used for distributed and coprocessor settings, which probably can bring even more energy savings.
+
+1.
+
+REFERENCES
+
+[1] E Blelloch Guy. Prefix sums and their applications.
+Technical report, Tech. rept. CMU-CS-90-190. School
+of Computer Science, Carnegie Mellon . . . , 1990.
+[2] S. Hong, T. Oguntebi, and K. Olukotun. Efficient
+parallel graph exploration on multicore cpu and gpu.
+International Conference on Parallel Architectures and
+Compilation Techniques, (PACT’11), 99:100–113, 2011.
+
+

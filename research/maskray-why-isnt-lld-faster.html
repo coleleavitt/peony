@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C3HG5LHWPX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C3HG5LHWPX');
+</script>
+<!-- End Google Analytics -->
+
+  
+  <title>Why isn&#39;t ld.lld faster? | MaskRay</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <meta name="description" content="Updated in 2022-11. LLD is the LLVM linker. Its ELF port is typically installed as ld.lld. This article makes an in-depth analysis of ld.lld&#39;s performance. The topic has been in my mind for a while. R">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Why isn&#39;t ld.lld faster?">
+<meta property="og:url" content="https://maskray.me/blog/2021-12-19-why-isnt-ld.lld-faster">
+<meta property="og:site_name" content="MaskRay">
+<meta property="og:description" content="Updated in 2022-11. LLD is the LLVM linker. Its ELF port is typically installed as ld.lld. This article makes an in-depth analysis of ld.lld&#39;s performance. The topic has been in my mind for a while. R">
+<meta property="og:locale" content="en_US">
+<meta property="article:published_time" content="2021-12-19T08:00:00.000Z">
+<meta property="article:modified_time" content="2026-01-20T03:21:30.808Z">
+<meta property="article:author" content="MaskRay">
+<meta property="article:tag" content="llvm">
+<meta property="article:tag" content="linker">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:creator" content="@HaskRay">
+  
+    <link rel="alternate" href="/blog/atom.xml" title="MaskRay" type="application/atom+xml">
+  
+  
+    <link rel="shortcut icon" href="/blog/favicon.png">
+  
+  
+    
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/typeface-source-code-pro@0.0.71/index.min.css">
+
+  
+  
+<link rel="stylesheet" href="/blog/css/style.css">
+
+  
+    
+<link rel="stylesheet" href="/blog/fancybox/jquery.fancybox.min.css">
+
+  
+  
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fork-awesome@1.2.0/css/fork-awesome.min.css">
+
+<meta name="generator" content="Hexo 6.3.0"><style>mjx-container[jax="SVG"] {
+  direction: ltr;
+}
+
+mjx-container[jax="SVG"] > svg {
+  overflow: visible;
+}
+
+mjx-container[jax="SVG"] > svg a {
+  fill: blue;
+  stroke: blue;
+}
+
+mjx-container[jax="SVG"][display="true"] {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+}
+
+mjx-container[jax="SVG"][justify="left"] {
+  text-align: left;
+}
+
+mjx-container[jax="SVG"][justify="right"] {
+  text-align: right;
+}
+
+g[data-mml-node="merror"] > g {
+  fill: red;
+  stroke: red;
+}
+
+g[data-mml-node="merror"] > rect[data-background] {
+  fill: yellow;
+  stroke: none;
+}
+
+g[data-mml-node="mtable"] > line[data-line] {
+  stroke-width: 70px;
+  fill: none;
+}
+
+g[data-mml-node="mtable"] > rect[data-frame] {
+  stroke-width: 70px;
+  fill: none;
+}
+
+g[data-mml-node="mtable"] > .mjx-dashed {
+  stroke-dasharray: 140;
+}
+
+g[data-mml-node="mtable"] > .mjx-dotted {
+  stroke-linecap: round;
+  stroke-dasharray: 0,140;
+}
+
+g[data-mml-node="mtable"] > svg {
+  overflow: visible;
+}
+
+[jax="SVG"] mjx-tool {
+  display: inline-block;
+  position: relative;
+  width: 0;
+  height: 0;
+}
+
+[jax="SVG"] mjx-tool > mjx-tip {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+mjx-tool > mjx-tip {
+  display: inline-block;
+  padding: .2em;
+  border: 1px solid #888;
+  font-size: 70%;
+  background-color: #F8F8F8;
+  color: black;
+  box-shadow: 2px 2px 5px #AAAAAA;
+}
+
+g[data-mml-node="maction"][data-toggle] {
+  cursor: pointer;
+}
+
+mjx-status {
+  display: block;
+  position: fixed;
+  left: 1em;
+  bottom: 1em;
+  min-width: 25%;
+  padding: .2em .4em;
+  border: 1px solid #888;
+  font-size: 90%;
+  background-color: #F8F8F8;
+  color: black;
+}
+
+foreignObject[data-mjx-xml] {
+  font-family: initial;
+  line-height: normal;
+  overflow: visible;
+}
+
+.MathJax path {
+  stroke-width: 3;
+}
+
+mjx-container[display="true"] {
+  overflow: auto hidden;
+}
+
+mjx-container[display="true"] + br {
+  display: none;
+}
+</style></head>
+
+<body>
+  <div id="container">
+    <div id="wrap">
+      <header id="header">
+  <div id="banner"></div>
+  <div id="header-outer" class="outer">
+    <div id="header-title" class="inner">
+      <h1 id="logo-wrap">
+        <a href="/blog/" id="logo">MaskRay</a>
+      </h1>
+      
+    </div>
+    <div id="header-inner" class="inner">
+      <nav id="main-nav">
+        <a id="main-nav-toggle" class="nav-icon"><span class="fa fa-bars"></span></a>
+        
+          <a class="main-nav-link" href="/blog/">Home</a>
+        
+          <a class="main-nav-link" href="/blog/archives/">Archives</a>
+        
+          <a class="main-nav-link" href="/blog/../feeds/">Feeds</a>
+        
+          <a class="main-nav-link" href="/blog/../til/">TIL</a>
+        
+          <a class="main-nav-link" href="/blog/../presentations/">Presentations</a>
+        
+      </nav>
+      <nav id="sub-nav">
+        <a class="nav-icon" href="https://github.com/MaskRay" title="GitHub" target="_blank"><img src="/icon/github.svg"></a>
+        <a class="nav-icon" href="https://twitter.com/HaskRay" title="Twitter" target="_blank"><img src="/icon/twitter.svg"></a>
+        <!-- <a class="nav-icon" href="https://www.zhihu.com/people/maskray" title="知乎" target="_blank"><img src="/icon/zhihu.svg"></a> -->
+        <!-- <a class="nav-icon" href="http://weibo.com/MaskRay" title="微博" target="_blank"><img src="/icon/weibo.svg"></a> -->
+        
+        
+          <a class="nav-icon" href="/blog/atom.xml" title="RSS Feed"><span class="fa fa-rss"></span></a>
+        
+        <a class="nav-icon nav-search-btn" title="Search"><span class="fa fa-search"></span></a>
+      </nav>
+      <div id="search-form-wrap">
+        <form action="//google.com/search" method="get" accept-charset="UTF-8" class="search-form"><input type="search" name="q" class="search-form-input" placeholder="Search"><button type="submit" class="search-form-submit">&#xF002;</button><input type="hidden" name="sitesearch" value="https://maskray.me/blog"></form>
+      </div>
+    </div>
+  </div>
+</header>
+
+      <div class="outer">
+        <section id="main"><article id="post-why-isnt-ld.lld-faster" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  <div class="article-meta">
+    <a href="/blog/2021-12-19-why-isnt-ld.lld-faster" class="article-date">
+  <time class="dt-published" datetime="2021-12-19T08:00:00.000Z" itemprop="datePublished">2021-12-19</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 class="p-name article-title" itemprop="headline name">
+      Why isn&#39;t ld.lld faster?
+    </h1>
+  
+
+      </header>
+    
+    <div class="e-content article-entry" itemprop="articleBody">
+      
+        <p>Updated in 2022-11.</p>
+<p>LLD is the LLVM linker. Its ELF port is typically installed as
+<code>ld.lld</code>. This article makes an in-depth analysis of ld.lld's
+performance. The topic has been in my mind for a while. Recently Rui
+Ueyama released <a target="_blank" rel="noopener" href="https://github.com/rui314/mold">mold</a> 1.0
+and people wonder why with multi-threading its ELF port is faster than
+ld.lld. So I finally completed the article.</p>
+<p>First of all, I am very glad that Rui Ueyama started mold. Our world
+has a plethora of compilers, but not many people learn or write linkers.
+As its design documentation says, there are many drastically different
+designs which haven't been explored. In my view, mold is innovative in
+that it introduced parallel symbol table initialization, symbol
+resolution, and relocation scan which to my knowledge hadn't been
+implemented before, and showed us amazing results. The innovation gives
+existing and future linkers incentive to optimize further.</p>
+<span id="more"></span>
+<p>TODO At some point I will move large portion of "how to implement an
+ELF linker" to a separate article.</p>
+<h2 id="generic-elf-linker-passes">Generic ELF linker passes</h2>
+<p>Before jumping into the analysis, let me introduce the generic passes
+to be referenced by subsequent chapters.</p>
+<p>Here are the passes a typical linker has.</p>
+<ul>
+<li>Parse command line options</li>
+<li>Find and scan input files (.o, .so, .a), interleaved with symbol
+resolution</li>
+<li>Global transforms (section based garbage collection, identical code
+folding, etc)</li>
+<li>Create synthetic sections</li>
+<li>Map input sections and synthetic (linker-generated) sections into
+output sections</li>
+<li>Scan relocations</li>
+<li>Finalize synthetic sections</li>
+<li>Layout and assign addresses (thunks, sections with varying sizes,
+symbol assignments)</li>
+<li>Write headers</li>
+<li>Copy section contents to output and resolve relocations</li>
+</ul>
+<h2 id="ld.lld">ld.lld</h2>
+<p>In the past people advocated "ld.lld focuses on speed". This
+impression was mainly driven by the comparison with GNU ld and gold.
+People say that ld.lld is at least 2x faster than gold, sometimes 4x or
+more.</p>
+<p>As I have observed the codebase and code review activity, the focus
+is probably more on parity on important features, ideal semantics, code
+readability, portability and generality, but less on performance and
+specifically multi-threading performance. In some cases, simpler code is
+preferred over little performance improvement.</p>
+<p>ld.lld has parallelism in a few places like writing sections and
+computing the content for a few synthetic sections, but some critical
+paths do not have parallelism. If you experiment with
+<code>--threads=N</code>, you may find that the speed-up is not large,
+as shown by the Chrome example below.</p>
+<h3 id="linking-chrome">Linking Chrome</h3>
+<p>In Chrome, <code>chrome</code> is a large executable. In the default
+build configuration (no debug information), (circa Dec 2021) there are
+8905295 sections (not counting the NULL section at index zero), 3325621
+discarded COMDAT sections, 1372104 input sections (mostly
+<code>SHT_PROGBITS</code>, not counting <code>SHT_RELA/SHT_SYMTAB</code>
+or discarded COMDAT sections).</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"># Input relocations for chrome (no debug information)</span><br><span class="line">R_X86_64_PLT32: 167558</span><br><span class="line">R_X86_64_64: 381017</span><br><span class="line">R_X86_64_32: 39455</span><br><span class="line">R_X86_64_GOTPCREL: 28125</span><br><span class="line">R_X86_64_REX_GOTPCRELX: 3</span><br></pre></td></tr></table></figure>
+<p>Below I will compare lld 13.0.1 with mold 1.0.1. mold's build system
+uses mimalloc by default. For a fair comparison, I link mimalloc into
+lld
+(<code>-DCMAKE_EXE_LINKER_FLAGS=-Wl,--push-state,$HOME/Dev/mimalloc/out/release/libmimalloc.a,--pop-state</code>).
+I build both lld and mold with
+<code>-O3 -fno-exceptions -fno-pic -no-pie</code>. The default build of
+Chrome uses <code>--gdb-index</code>, which is ignored by mold but takes
+some time for ld.lld. We should remove it for a fair comparison.</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br></pre></td><td class="code"><pre><span class="line">% hyperfine --warmup 2 --min-runs 16 &quot;numactl -C 20-20 &quot;&#123;/tmp/link-with-lld,/tmp/link-with-mold&#125;&quot; --threads=1&quot;</span><br><span class="line">Benchmark 1: numactl -C 20-20 /tmp/link-with-lld --threads=1</span><br><span class="line">  Time (mean ± σ):      8.314 s ±  0.007 s    [User: 6.118 s, System: 2.190 s]</span><br><span class="line">  Range (min … max):    8.304 s …  8.326 s    16 runs</span><br><span class="line"></span><br><span class="line">Benchmark 2: numactl -C 20-20 /tmp/link-with-mold --threads=1</span><br><span class="line">  Time (mean ± σ):     12.684 s ±  0.009 s    [User: 0.063 s, System: 0.004 s]</span><br><span class="line">  Range (min … max):   12.670 s … 12.706 s    16 runs</span><br><span class="line"></span><br><span class="line">Summary</span><br><span class="line">  &#x27;numactl -C 20-20 /tmp/link-with-lld --threads=1&#x27; ran</span><br><span class="line">    1.53 ± 0.00 times faster than &#x27;numactl -C 20-20 /tmp/link-with-mold --threads=1&#x27;</span><br><span class="line"></span><br><span class="line">% hyperfine --warmup 2 --min-runs 16 &quot;numactl -C 20-21 &quot;&#123;/tmp/link-with-lld,/tmp/link-with-mold&#125;&quot; --threads=2&quot;</span><br><span class="line">Benchmark 1: numactl -C 20-21 /tmp/link-with-lld --threads=2</span><br><span class="line">  Time (mean ± σ):      7.551 s ±  0.099 s    [User: 6.249 s, System: 2.292 s]</span><br><span class="line">  Range (min … max):    7.369 s …  7.728 s    16 runs</span><br><span class="line"></span><br><span class="line">Benchmark 2: numactl -C 20-21 /tmp/link-with-mold --threads=2</span><br><span class="line">  Time (mean ± σ):      6.519 s ±  0.019 s    [User: 0.064 s, System: 0.006 s]</span><br><span class="line">  Range (min … max):    6.502 s …  6.578 s    16 runs</span><br><span class="line"></span><br><span class="line">Summary</span><br><span class="line">  &#x27;numactl -C 20-21 /tmp/link-with-mold --threads=2&#x27; ran</span><br><span class="line">    1.16 ± 0.02 times faster than &#x27;numactl -C 20-21 /tmp/link-with-lld --threads=2&#x27;</span><br><span class="line"></span><br><span class="line">% hyperfine --warmup 2 --min-runs 16 &quot;numactl -C 20-23 &quot;&#123;/tmp/link-with-lld,/tmp/link-with-mold&#125;&quot; --threads=4&quot;</span><br><span class="line">Benchmark 1: numactl -C 20-23 /tmp/link-with-lld --threads=4</span><br><span class="line">  Time (mean ± σ):      6.981 s ±  0.036 s    [User: 6.441 s, System: 2.393 s]</span><br><span class="line">  Range (min … max):    6.899 s …  7.046 s    16 runs</span><br><span class="line"></span><br><span class="line">Benchmark 2: numactl -C 20-23 /tmp/link-with-mold --threads=4</span><br><span class="line">  Time (mean ± σ):      3.511 s ±  0.006 s    [User: 0.066 s, System: 0.006 s]</span><br><span class="line">  Range (min … max):    3.501 s …  3.521 s    16 runs</span><br><span class="line"></span><br><span class="line">Summary</span><br><span class="line">  &#x27;numactl -C 20-23 /tmp/link-with-mold --threads=4&#x27; ran</span><br><span class="line">    1.99 ± 0.01 times faster than &#x27;numactl -C 20-23 /tmp/link-with-lld --threads=4&#x27;</span><br><span class="line"></span><br><span class="line">% hyperfine --warmup 2 --min-runs 16 &quot;numactl -C 20-27 &quot;&#123;/tmp/link-with-lld,/tmp/link-with-mold&#125;&quot; --threads=8&quot;</span><br><span class="line">Benchmark 1: numactl -C 20-27 /tmp/link-with-lld --threads=8</span><br><span class="line">  Time (mean ± σ):      6.635 s ±  0.036 s    [User: 6.573 s, System: 2.436 s]</span><br><span class="line">  Range (min … max):    6.569 s …  6.684 s    16 runs</span><br><span class="line"></span><br><span class="line">Benchmark 2: numactl -C 20-27 /tmp/link-with-mold --threads=8</span><br><span class="line">  Time (mean ± σ):      2.034 s ±  0.008 s    [User: 0.066 s, System: 0.006 s]</span><br><span class="line">  Range (min … max):    2.019 s …  2.043 s    16 runs</span><br><span class="line"></span><br><span class="line">Summary</span><br><span class="line">  &#x27;numactl -C 20-27 /tmp/link-with-mold --threads=8&#x27; ran</span><br><span class="line">    3.26 ± 0.02 times faster than &#x27;numactl -C 20-27 /tmp/link-with-lld --threads=8&#x27;</span><br></pre></td></tr></table></figure>
+<p>With <code>--threads=1</code>, ld.lld is faster than mold. This may
+be due to mold's cost on splitting symbol processing passes. However,
+ld.lld has very few parallel passes and leverage little from
+multi-threading, so mold get faster with more threads.</p>
+<p>Let's examine the time spent on each pass of ld.lld. I measured the
+following with <code>ld.lld --threads=&#123;1,8&#125; --time-trace</code> and
+<code>jq -r '.traceEvents[] | select(.name|startswith("Total")) | "\(.dur/1000000) \(.name)"'</code>.
+The unindented lines indicate the <code>--threads=1</code> run while the
+indented lines indicate what <code>--threads=8</code> can
+parallelize.</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><span class="line">8.143089 Total ExecuteLinker</span><br><span class="line">8.055836 Total Link</span><br><span class="line">3.172682 Total Parse input files</span><br><span class="line">2.96519 Total Write output file</span><br><span class="line">  --threads=8: 1.40027 Total Write output file</span><br><span class="line">0.409991 Total Scan relocations</span><br><span class="line">0.24452 Total Assign sections</span><br><span class="line">0.176667 Total Finalize synthetic sections</span><br><span class="line">0.167634 Total Split sections</span><br><span class="line">  --threads=8: 0.033665 Total Split sections</span><br><span class="line">0.149345 Total Add local symbols</span><br><span class="line">0.142135 Total Process symbol versions</span><br><span class="line">0.132731 Total LTO</span><br><span class="line">0.119289 Total Finalize .eh_frame</span><br><span class="line">0.101507 Total Add symbols to symtabs</span><br><span class="line">0.100241 Total Merge/finalize input sections</span><br><span class="line">0.086993 Total Load input files</span><br><span class="line">0.064616 Total Finalize address dependent content</span><br><span class="line">0.041352 Total Redirect symbols</span><br><span class="line">0.03537 Total markLive</span><br><span class="line">0.028474 Total Aggregate sections</span><br><span class="line">0.026615 Total Strip sections</span><br><span class="line">0.022518 Total Sort sections</span><br><span class="line">0.021364 Total Combine EH sections</span><br><span class="line">0.014919 Total Demote shared symbols</span><br><span class="line">0.014668 Total Replace common symbols</span><br><span class="line">0.000454 Total Locate library</span><br><span class="line">0.000264 Total Read linker script</span><br><span class="line">7.9e-05 Total Create output files</span><br><span class="line">0 Total Resolve SHF_LINK_ORDER</span><br><span class="line">0 Total Diagnose orphan sections</span><br></pre></td></tr></table></figure>
+<p>You can map these metrics to the generic linker passes.</p>
+<p>Note that with 8 threads, "Parse input files" took 48% time. This is
+significant. mold has demonstrated by parallelizing this pass we can get
+a noticeable speed-up.</p>
+<h3 id="linking-other-executables">Linking other executables</h3>
+<p>In Chrome, symbol table initialization and symbol resolution appear
+to take a significant portion of time.</p>
+<p>In another large executable with no debug information, there are
+8381112 sections, 1222292 discarded COMDAT sections, and 3269857 input
+sections. I measured lower "Parse input files" contribution.</p>
+<ul>
+<li>32% Parse input files</li>
+<li>15% Write output</li>
+<li>14% Scan relocations</li>
+<li>12% <code>--gc-sections</code></li>
+<li>5% Load input files</li>
+<li>2% Merge/finalize input sections</li>
+</ul>
+<p>In <code>-DCMAKE_BUILD_TYPE=RelWithDebInfo</code> build of Clang,
+(circa Dec 2021) there are 689777 sections, 140402 discarded COMDAT
+sections, 229044 input sections. <figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"># Input relocations for no-pie RelWithDebInfo clang</span><br><span class="line">R_X86_64_64: 1253965</span><br><span class="line">R_X86_64_32: 1203807</span><br><span class="line">R_X86_64_GOTPCREL: 19597</span><br><span class="line">R_X86_64_PLT32: 33927</span><br><span class="line">R_X86_64_REX_GOTPCRELX: 1</span><br></pre></td></tr></table></figure></p>
+<p>I measured the following:</p>
+<ul>
+<li>66.54% Total Merge/finalize input sections</li>
+<li>15.96% Total Write output file</li>
+<li>15.86% Total Write sections</li>
+<li>5.04% Total Parse input files</li>
+<li>4.28% Total Split sections</li>
+<li>3.07% Total Scan relocations</li>
+<li>1.93% Total Add local symbols</li>
+<li>0.81% Total Finalize synthetic sections</li>
+<li>0.69% Total Assign sections</li>
+<li>0.43% Total Finalize <code>.eh_frame</code></li>
+<li>0.22% Total Finalize address dependent content</li>
+<li>0.22% Total Add symbols to symtabs</li>
+</ul>
+<p>Next, I will describe performance significant options and rudimentary
+performance analysis.</p>
+<h2 id="performance-significant-options">Performance significant
+options</h2>
+<p>Different programs have different link characteristics. For the same
+program, we can get vastly different results with different compiler and
+linker options. The percentage numbers in this article are rough, just
+indicating the few applications that I tested. YMMV.</p>
+<p>The most significant compiler options for link time are:</p>
+<ul>
+<li><code>-O</code>: the input size matters</li>
+<li><code>-g</code>: leads to large portion of time spent on writing
+<code>.debug_*</code> sections, diluting the significance of the
+performance of other passess</li>
+<li><code>-gz</code> (compile action): zlib-compressed debug sections
+require uncompression on the linker side</li>
+<li><code>-gz</code> (link action): passes
+<code>--compress-debug-sections=zlib</code> to the linker</li>
+<li><code>-ffunction-sections</code>: often used with
+<code>-fdata-sections</code>. <code>-fno-unique-section-names</code> may
+help.</li>
+</ul>
+<p>The most significant linker options for link time are:</p>
+<ul>
+<li><code>--compress-debug-sections=zlib</code>: Compress output
+<code>.debug_*</code> sections with zlib</li>
+<li>(ld.lld specific) <code>-O0</code> (<code>-Wl,-O0</code> in compiler
+drivers) disables <code>SHF_MERGE</code> duplicate elimination. This can
+tremendously decrease link time for a program with large
+<code>.debug_str</code>, but you will get a huge <code>.debug_str</code>
+as the penalty.</li>
+<li><code>-z nocombreloc</code>: Don't sort dynamic relocations in
+<code>.rela.dyn</code>. This is a large bottleneck when you have
+millions of relocations in a mostly statically linked executable. Well,
+this is the cost of PIE.</li>
+<li><code>--icf=&#123;safe,all&#125;</code>: The section-based deduplication
+requires extensive computation on contents and relocations.</li>
+<li><code>--gc-sections</code>: Discard unreferenced input sections</li>
+<li><code>--build-id</code>: Compute a message digest from the file
+content</li>
+</ul>
+<p>Now let me make an in-depth analysis of various passes in ld.lld.</p>
+<h2 id="find-and-load-input-files">Find and load input files</h2>
+<p>For each input file, ld.lld calls <code>open</code> and
+<code>mmap</code>, then checks its file type by scanning the initial
+bytes (magic): relocatable object file, shared object, archive, lazy
+object file, LLVM bitcode file, or a linker script. The process is
+sequential and synchronous. In the absence of debug information, this
+pass may take 5% time.</p>
+<p>lld-link does asynchronous file load which can speed up a bit.
+Parallelizing this pass can improve the performance a little, but it may
+cost the readability a bit.</p>
+<h2 id="parse-input-and-perform-symbol-resolution">Parse input and
+perform symbol resolution</h2>
+<h3 id="relocatable-object-files">Relocatable object files</h3>
+<p>A relocatable object file contributes symbols, sections, and
+relocations to the link process. ld.lld reads sections and makes
+in-memory representations of sections, then reads the symbol table. In a
+symbol table, all symbols with <code>STB_LOCAL</code> binding precede
+the weak and global symbols. The local part is file-local while the
+non-local part requires resolution with other files.</p>
+<p>The non-local part consists of <code>STB_GLOBAL</code>,
+<code>STB_WEAK</code>, and (GCC specific) <code>STB_GNU_UNIQUE</code>
+symbols. An entry may be defined (<code>Defined</code>) or undefined
+(<code>Undefined</code>). ld.lld inserts each entry to the global symbol
+table and resolves the entry.</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">class</span> <span class="title class_">ELFT</span>&gt; <span class="type">void</span> ObjFile&lt;ELFT&gt;::<span class="built_in">initializeSymbols</span>() &#123;</span><br><span class="line">  ArrayRef&lt;Elf_Sym&gt; eSyms = <span class="keyword">this</span>-&gt;<span class="built_in">getELFSyms</span>&lt;ELFT&gt;();</span><br><span class="line">  <span class="comment">// firstGlobal == sh_info of SHT_SYMTAB, the number of local symbols.</span></span><br><span class="line">  <span class="keyword">for</span> (<span class="type">size_t</span> i = <span class="number">0</span>; i != firstGlobal; ++i) &#123;</span><br><span class="line">    <span class="type">const</span> Elf_Sym &amp;eSym = eSyms[i];</span><br><span class="line">    InputSectionBase *sec = <span class="keyword">this</span>-&gt;sections[secIdx];</span><br><span class="line">    <span class="keyword">if</span> (eSym.st_shndx == SHN_UNDEF || sec == &amp;InputSection::discarded)</span><br><span class="line">      <span class="keyword">new</span> (<span class="keyword">this</span>-&gt;symbols[i]) <span class="built_in">Undefined</span>(...);</span><br><span class="line">    <span class="keyword">else</span></span><br><span class="line">      <span class="built_in">new</span> (<span class="keyword">this</span>-&gt;symbols[i]) <span class="built_in">Defined</span>(...);</span><br><span class="line">  &#125;</span><br><span class="line"></span><br><span class="line">  <span class="keyword">for</span> (<span class="type">size_t</span> i = firstGlobal, end = eSyms.<span class="built_in">size</span>(); i != end; ++i)</span><br><span class="line">    <span class="keyword">if</span> (!<span class="keyword">this</span>-&gt;symbols[i])</span><br><span class="line">      <span class="keyword">this</span>-&gt;symbols[i] = symtab-&gt;<span class="built_in">insert</span>(eSyms[i].<span class="built_in">getName</span>());</span><br><span class="line"></span><br><span class="line">  <span class="keyword">for</span> (<span class="type">size_t</span> i = firstGlobal, end = eSyms.<span class="built_in">size</span>(); i != end; ++i) &#123;</span><br><span class="line">    <span class="type">const</span> Elf_Sym &amp;eSym = eSyms[i];</span><br><span class="line">    <span class="keyword">if</span> (eSym.st_shndx == SHN_UNDEF) &#123;</span><br><span class="line">      undefines.<span class="built_in">push_back</span>(i);</span><br><span class="line">      <span class="keyword">continue</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    Resolve <span class="keyword">this</span>-&gt;symbols[i] with eSyms[i];</span><br><span class="line">  &#125;</span><br><span class="line">  <span class="comment">// Introduced by https://reviews.llvm.org/D95985 to stabilize symbol resolution behaviors.</span></span><br><span class="line">  <span class="keyword">for</span> (<span class="type">unsigned</span> i : undefineds) &#123;</span><br><span class="line">    <span class="type">const</span> Elf_Sym &amp;eSym = eSyms[i];</span><br><span class="line">    <span class="keyword">this</span>-&gt;symbols[i]-&gt;<span class="built_in">resolve</span>(<span class="built_in">Undefined</span>(...));</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h3 id="shared-objects">Shared objects</h3>
+<p>A shared object contributes just symbols to the link process. For a
+shared object, ld.lld reads its dynamic symbol table
+(<code>SHT_DYNSYM</code>) which consists of undefined symbols
+(represented identically to an undefined in a relocatable object file)
+and defined symbols (represented as a <code>Shared</code>).</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">class</span> <span class="title class_">ELFT</span>&gt; <span class="function"><span class="type">void</span> <span class="title">SharedFile::parse</span><span class="params">()</span> </span>&#123;</span><br><span class="line">  ArrayRef&lt;Elf_Sym&gt; syms = <span class="keyword">this</span>-&gt;<span class="built_in">getGlobalELFSyms</span>&lt;ELFT&gt;();</span><br><span class="line">  <span class="keyword">for</span> (<span class="type">size_t</span> i = <span class="number">0</span>, e = syms.<span class="built_in">size</span>(); i != e; ++i) &#123;</span><br><span class="line">    <span class="type">const</span> Elf_Sym &amp;sym = syms[i];</span><br><span class="line">    StringRef name = sym.<span class="built_in">getName</span>(<span class="keyword">this</span>-&gt;stringTable);</span><br><span class="line">    <span class="type">uint16_t</span> idx = versyms[i] &amp; ~VERSYM_HIDDEN; <span class="comment">// SHT_GNU_versym index</span></span><br><span class="line">    <span class="keyword">if</span> (sym.<span class="built_in">isUndefined</span>()) &#123;</span><br><span class="line">      <span class="keyword">if</span> (idx != VER_NDX_LOCAL &amp;&amp; idx != VER_NDX_GLOBAL)</span><br><span class="line">        name = saver.<span class="built_in">save</span>((name + <span class="string">&quot;@&quot;</span> + verneedName).<span class="built_in">toStringRef</span>();</span><br><span class="line">      Symbol *s = symtab-&gt;<span class="built_in">insert</span>(name);</span><br><span class="line">      s-&gt;<span class="built_in">resolve</span>(<span class="built_in">Undefined</span>(<span class="keyword">this</span>, name, ...));</span><br><span class="line">      <span class="keyword">continue</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (!(versyms[i] &amp; VERSYM_HIDDEN)) &#123;</span><br><span class="line">      <span class="comment">// Handle the unversioned definition.</span></span><br><span class="line">      Symbol *s = symtab-&gt;<span class="built_in">insert</span>(name);</span><br><span class="line">      s-&gt;<span class="built_in">resolve</span>(<span class="built_in">SharedSymbol</span>(*<span class="keyword">this</span>, name, ...));</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (idx == VER_NDX_GLOBAL)</span><br><span class="line">      <span class="keyword">continue</span>;</span><br><span class="line">    <span class="comment">// Handle the versioned definition.</span></span><br><span class="line">    <span class="keyword">if</span> (idx &gt;= verdefs.<span class="built_in">size</span>() || idx == VER_NDX_LOCAL)</span><br><span class="line">      <span class="built_in">error</span>(...);</span><br><span class="line">    <span class="keyword">else</span> &#123;</span><br><span class="line">      name = saver.<span class="built_in">save</span>((name + <span class="string">&quot;@&quot;</span> + verdefName).<span class="built_in">toStringRef</span>());</span><br><span class="line">      Symbol *s = symtab-&gt;<span class="built_in">insert</span>(name);</span><br><span class="line">      s-&gt;<span class="built_in">resolve</span>(<span class="built_in">SharedSymbol</span>(*<span class="keyword">this</span>, name, ...));</span><br><span class="line">    &#125;</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<h3 id="archives">Archives</h3>
+<p>This is an ancient trick to decrease linker work: initially every
+archive member is in a lazy state, if an archive member provides a
+definition resolving an undefined symbol, it will be extracted.
+Extraction may trigger recursive extraction within (default) the archive
+or (<code>--start-group</code>) other archives.</p>
+<h3 id="symbol-resolution">Symbol resolution</h3>
+<p>TODO: move some part to "how to implement an ELF linker"</p>
+<p>The resolution between two .o defined/undefined symbols is
+associative. In the absence of weak symbols and duplicate definition
+errors, the interaction is also commutative.</p>
+<p>The resolution between a .o and a .so is commutative and
+associative.</p>
+<p>The resolution between two .so is associative. If two .so don't
+define the same symbol, the resolution is also commutative.</p>
+<p>For an archive symbol, its interaction with any other file kind is
+neither commutative nor associative.</p>
+<p>When linking a large program with little debug information,
+<code>ld.lld --time-trace</code> shows some symbol resolution passes
+which take varying time from 0.x~3%. Anyhow, an empty global symbol
+table iteration takes 0.x% time. In the presence of
+<code>--dynamic-list</code> and <code>--version-script</code>, the upper
+bound can go higher because wildcard pattern matching can be slow. Some
+passes are related to ideal symbol resolution semantics which are not
+needed by 99.9% software in the wild: demote shared symbols/archives,
+parse symbol versions, redirect symbols (for edge-case
+<code>--wrap</code> and unversioned symbol elimination).</p>
+<p>I believe mold handles fewer cases and will take similar performance
+hits if the tricky cases are handled.</p>
+<h3 id="what-can-be-parallelized">What can be parallelized</h3>
+<p>"Parse input and perform symbol resolution" is typically the largest
+bottleneck in a link and can be parallelized in three places.</p>
+<ul>
+<li>initialization of sections (embarrassingly parallel)</li>
+<li>COMDAT group resolution</li>
+<li>initialization of local symbols (embarrassingly parallel)</li>
+<li>initialization of non-local symbols</li>
+<li>symbol resolution</li>
+</ul>
+<h4 id="parallel-initialization-of-sections">Parallel initialization of
+sections</h4>
+<p>In my estimate this takes 40% time of "Parse input files".</p>
+<p>ld.lld does not parse sections from archive members and lazy object
+files. Eagerly parsing sections will make the linker more prepared for
+parallelism with a hit to the single-threading performance. If many
+archive members end up to be extracted, this may end up to be a good
+trade-off for multi-threading. For the <code>chrome</code> executable in
+Chrome, the utilitization ratio is very high (79%).</p>
+<p>Tips: <code>ld.lld --print-archive-stats=-</code> writes the
+utilitization ratio of archives to <code>-</code> (stdout).</p>
+<h4 id="parallel-comdat-group-resolution">Parallel COMDAT group
+resolution</h4>
+<p>See <a
+href="https://maskray.me/blog/2021-07-25-comdat-and-section-group">COMDAT
+and section group</a>.</p>
+<h4 id="parallel-initialization-of-local-symbols">Parallel
+initialization of local symbols</h4>
+<p>Initialization of local symbols is embarrassingly parallel. As of
+13.0.0, ld.lld called <code>make&lt;Defined&gt;</code> or
+<code>make&lt;Undefined&gt;</code> for each symbol entry where
+<code>make</code> is backed up by the non-thread-safe
+<code>BumpPtrAllocator</code>. I recently changed the code to batch
+allocate <code>SymbolUnion</code>. Is this part ready to be
+parallelized? Not yet.</p>
+<p>To support linker scripts, a defined symbol may be relative to either
+an output section or an input section. The symbol representation has
+<code>struct Defined : Symbol &#123; ... SectionBase *section; &#125;</code>,
+which means we need to have the section representation first. To
+diagnose relocations referencing a local symbol defined in a discarded
+section (due to COMDAT rules), a local symbol may be represented as
+<code>Undefined</code>. This needs the section pointer and COMDAT group
+resolution to decide whether a local symbol should be
+<code>Defined</code> or <code>Undefined</code>.</p>
+<p>For relocatable object files, ld.lld initialize sections before
+symbols. To know the sections we need to eagerly parse archives and lazy
+object files.</p>
+<p>If we do parallel initialization, the <code>section</code> member may
+need to be fixed after COMDAT group resolution. The symbol kind may
+change from <code>Defined</code> to <code>Undefined</code> as well. Note
+that the symbol kind may not need to be explicit through C++ class
+inheritance, though ld.lld currently does this and is different to
+change at this point due to the numerous references.</p>
+<p>ld.lld may need an option to choose whether to eagerly parse archive
+and lazy object files.</p>
+<h4 id="parallel-initialization-of-non-local-symbols">Parallel
+initialization of non-local symbols</h4>
+<p>If both <code>a.o</code> and <code>b.o</code> have a non-local symbol
+<code>foo</code>, they need to refer to the same entry in the global
+symbol table. Conceptually an object file needs a data structure like
+<code>vector&lt;Symbol *&gt; symbols;</code>. In the database world,
+this is a hash join or sort merge join problem. Every linker
+implementation uses a hash join.</p>
+<p>ld.lld represents the global symbol table with
+<code>llvm::DenseMap&lt;llvm::CachedHashStringRef, int&gt; symMap; std::vector&lt;Symbol *&gt; symVector;</code>.
+For each symbol table entry, ld.lld reserves a symbol in the global
+symbol table if it does not exist yet. If we had a concurrent hash
+table, the insertion could obviously be parallelized. In April 2021,
+there was a llvm-dev thread "Concurrent Hashmap?" but we haven't taken
+any action.</p>
+<p>One trivial concurrent hash table which may be suitable for lld is
+shards plus spin locks.</p>
+<p>According to my estimate, <code>symtab-&gt;insert</code> takes 35%
+time of "Parse input files".</p>
+<p>mold uses a concurrent hash table from Intel oneTBB.</p>
+<h4 id="parallel-symbol-resolution">Parallel symbol resolution</h4>
+<p>I previously mentioned that the resolution of archive symbols is not
+associative, therefore parallelism is difficult. mold seems to be
+willing to sacrifice the compatibility a bit.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"># RUN: rm -rf %t &amp;&amp; split-file %s %t</span><br><span class="line"># RUN: llvm-mc -filetype=obj -triple=x86_64 %t/a.s -o %t/a.o</span><br><span class="line"># RUN: llvm-mc -filetype=obj -triple=x86_64 %t/b.s -o %t/b.o</span><br><span class="line"># RUN: llvm-mc -filetype=obj -triple=x86_64 %t/c.s -o %t/c.o</span><br><span class="line"># RUN: llvm-ar rc %t/b.a %t/b.o</span><br><span class="line"># RUN: ld.lld -shared -soname=b %t/b.o -o %t/b.so</span><br><span class="line"># RUN: ld.lld -shared -soname=b %t/c.o -o %t/c.so</span><br><span class="line"># RUN: ld.lld %t/a.o %t/c.so %t/b.a -o %t/out</span><br><span class="line"></span><br><span class="line">#--- a.s</span><br><span class="line">.globl _start</span><br><span class="line">_start:</span><br><span class="line"></span><br><span class="line">#--- b.s</span><br><span class="line">.globl foo</span><br><span class="line">foo:</span><br><span class="line"></span><br><span class="line">#--- c.s</span><br><span class="line">call foo</span><br></pre></td></tr></table></figure>
+<p>In GNU ld, gold, and ld.lld, the undefined symbol in
+<code>c.so</code> causes <code>b.a</code> to be extracted. In mold,
+<code>b.a</code> is not extracted. If <code>b.a</code> has a strong
+definition which can override a weak definition in <code>a.o</code>,
+mold'semantics will not make that happen. The semantics also suppresses
+a possible duplicate definition error.</p>
+<p>I know 99.99% software don't leverage this point, but personally I
+think the 0.01% case is important and indicates a symbol resolution
+ideal I want to keep up with.</p>
+<p>mold assigns lower priorities to archive symbols than shared symbols.
+The <code>b.so</code> definition wins, regardless of the position of
+<code>a.a</code>.</p>
+<p>According to mold <code>--perf</code>, the symbol initialization and
+resolution performance is like the following:</p>
+<ul>
+<li>1 thread: 1.3x slower than ld.lld (locks, atomics, and split passes
+have costs)</li>
+<li>2 threads: 1.75x faster than 1 thread</li>
+<li>4 threads: 3x faster than 1 thread</li>
+<li>8 threads: 5.3x faster than 1 thread</li>
+<li>16 threads: 5.4x faster than 1 thread</li>
+</ul>
+<h2 id="relocation-scanning">Relocation scanning</h2>
+<p>ld.lld's relocation scanning is noteworthily slower than mold's. I
+think there are two reasons:</p>
+<ul>
+<li>Generic relocation type abstraction (<code>RelExpr</code>) and
+virtual function calls have overhead.</li>
+<li><code>InputSectionBase::relocations</code> is present. For an
+<code>InputSection</code> with N relocations, the field needs to
+allocate N entries.</li>
+<li>(minor) Mips hacks and more sophisticated error checking add some
+small overhead.</li>
+</ul>
+<p><code>InputSectionBase::relocations</code> seems wasteful at the
+first glance, but it provides some flexibility. Relocation computation
+can be centralized, preventing architecture-specific errors. Range
+extension thunks can be generalized a bit and avoid re-analyzing the
+relocation type. In the future, when we introduce a more compact format
+for static relocations (compacter than REL), we can keep the information
+extraction in one place instead of scattering it all over the code
+base.</p>
+<p>Updated in 2022:
+<code>sec-&gt;relocations.reserve(rels.size());</code> in a function
+called by <code>elf::scanRelocations</code> is now parallel. However,
+the simple malloc-once-in-a-parallel-task pattern poses challenges to
+many malloc implementations. On the machine I tested, with more than 8
+threads, glibc malloc is very slow. Even with some fast malloc
+implementations, more-than-16 threads may show slowdown. See my testing
+with many malloc implementations: <a
+target="_blank" rel="noopener" href="https://gist.github.com/MaskRay/219effe23a767b85059097f863ebc085"
+class="uri">https://gist.github.com/MaskRay/219effe23a767b85059097f863ebc085</a></p>
+<h2 id="global-transforms">Global transforms</h2>
+<h3 id="gc-sections"><code>--gc-sections</code></h3>
+<p>See <a
+href="https://maskray.me/blog/2021-02-28-linker-garbage-collection">Linker
+garbage collection</a>. For a
+<code>-ffunction-sections -fdata-sections</code> build, GC can take
+little time (say, 2%) if there is debug information or a lot (10%) when
+there is little debug information. <code>.debug_*</code> sections are
+large and monolithic (fewer than <code>.text.*</code> and
+<code>.data.*</code>) and take significant write time, so they dilute
+the proportion of GC time.</p>
+<p>The code is straightforward to parallelize, unfortunately
+llvm-project does not provide a parallel producer–consumer framework
+like oneTBB <code>[algorithms.parallel_for_each.feeder]</code>. Once the
+library is available, it is not difficult to parallelize this part.</p>
+<h3 id="icf"><code>--icf</code></h3>
+<p>If enabled, the pass may take 3~15% time. It is more expensive than
+the current sequential <code>--gc-sections</code>.</p>
+<p>That said, ld.lld's algorithm is pretty good. It computes a
+lightweight message digest for each section, then collects hashes into
+buckets. For each bucket, it does pairwise comparison which is easy to
+reason about and expensive computation can be lazy.</p>
+<p>Another idea is to use message digests to fully describe a section
+(mold). The message digest can be more expensive to compute as the
+pairwise comparison approach may skip many condition branches.</p>
+<p>My test shows that mold's algorithm is sometimes slower, for example
+when linking Clang.</p>
+<p>ICF costs ld.lld <code>SectionBase::repl</code> and indirection costs
+in several places. There is complexity in <code>.eh_frame</code>
+deduplication (<code>EhFrameSection::isFdeLive</code>) and dead reloc
+resolution for debug informtion.</p>
+<h2 id="scan-relocations">Scan relocations</h2>
+<p>An input section may have a dependent
+<code>SHT_REL</code>/<code>SHT_RELA</code>. ld.lld scans relocation
+records to decide what actions are taken:</p>
+<ul>
+<li>link-time constants: the location should be updated in-place</li>
+<li>GOT: <code>.got</code> and <code>.rela.dyn</code> need an
+update</li>
+<li>PLT: <code>.plt</code>, <code>.got.plt</code>, and
+<code>.rela.plt</code> need an update</li>
+<li><a
+href="https://maskray.me/blog/2021-01-09-copy-relocations-canonical-plt-entries-and-protected#summary">copy
+relocations, canonical PLT entries</a></li>
+<li>TLS dynamic relocations</li>
+<li>report a diagnostic</li>
+</ul>
+<p>For single-threading, the speed of mold's relocation scan is 1.7~2.3x
+of ld.lld's. I think fundamentally it is because ld.lld does more work.
+It has more dispatches and abstraction costs (e.g. virtual function),
+and provides more diagnostics and handles many tricky cases that mold
+doesn't do:</p>
+<ul>
+<li>support all of REL/RELA/mips64el for one architecture (even if the
+architecture typically doesn't use REL)</li>
+<li>use a generic relocation expression (RelExpr) design which costs two
+virtual functions processing one relocation</li>
+<li>handle non-preemptible <a
+href="https://maskray.me/blog/2021-01-18-gnu-indirect-function">GNU
+indirect function</a></li>
+<li>retain otherwise unused <code>.got</code> and <code>.got.plt</code>
+for certain relocation types</li>
+<li>Hexagon/Mips/PowerPC hacks</li>
+<li>Unfortunate Fortran COMMON symbol semantics (only needed by
+PowerPC64 AFAIK)</li>
+</ul>
+<p>Every check has a small cost. Many a little makes a mickle.</p>
+<p>I have a patch refactoring the way ld.lld does relocations but it may
+increase lines of code a lot: <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D113228"
+class="uri">https://reviews.llvm.org/D113228</a>. I do not know whether
+it will be a right trade-off.</p>
+<p>Another thing worth pointing out is that this process passes some
+relocations (<code>InputSectionBase::relocations</code>) which are
+needed by subsequent passes like range extension thunks. Many input
+relocations are currently pass-through, so we pay <code>push_back</code>
+time and memory. If we speculately think most relocations will be
+pass-through we can omit <code>InputSectionBase::relocations</code>, but
+subsequent passes will take input which is more difficult to deal
+with.</p>
+<p>Except for the constraints mentioned above, relocation scan is
+conceptually straightforward to parallelize. Local symbols do not need
+communication while non-local symbols just need atomic states.</p>
+<p>My <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D114783"
+class="uri">https://reviews.llvm.org/D114783</a> is an important
+refactoring in ld.lld's relocation scan. To enable parallelism, there is
+still much to do. We would lightly have to exclude some architectures
+needing special treatment Mips/PowerPC. With other constraints it may or
+may not be a good trade-off.</p>
+<p>One way to reduce dispatch and virtual function costs is to change
+<code>template &lt;class ELFT, class RelTy&gt; void scanRelocs(...)</code>
+to
+<code>template &lt;class Arch, class RelTy&gt; void scanRelocs(...)</code>.
+For one architecture, dead code elimination will help. This approach
+will however lead to some code bloat.</p>
+<h3 id="mold">mold</h3>
+<p>In a Clang build, I measured the following for mold:</p>
+<ul>
+<li>1 thread: 2.3x faster than ld.lld</li>
+<li>2 threads: 1.88x faster than 1 thread</li>
+<li>4 threads: 3.28x faster than 1 thread</li>
+<li>16 threads: 11.13x faster than 1 thread</li>
+</ul>
+<p>On the other hand, with little debug information, relocation scan
+takes 15% total time. IMO parallelism does not pay off if we don't
+optimize other critical paths to stand out the 15% time. I raised this
+point during the 2021 LLVM Dev Meeting round table "LLD for Mach-O".</p>
+<h2
+id="map-input-sections-and-synthetic-sections-into-output-sections">Map
+input sections and synthetic sections into output sections</h2>
+<p>To support linker scripts, ld.lld's model was designed for output
+section descriptions and input section descriptions. A typical scenario
+where a user complains about link performance does not involve a linker
+script. Nevertheless, the mapping process takes a slight performance hit
+as we reuse the framework in the absence of a <code>SECTIONS</code>
+command. For a large executable with little debug information "Assign
+sections" took 2% time.</p>
+<p>If we want to optimize this case, we will need to introduce a
+separate code path which will lead to implementation complexity.</p>
+<h2 id="shf_merge-duplicate-elimination"><code>SHF_MERGE</code>
+duplicate elimination</h2>
+<p>A section with the <code>SHF_MERGE|STRINGS</code> flags has data
+elements consisting of NUL-terminated strings. In a program with debug
+information, <code>.debug_str</code> (with the
+<code>SHF_MERGE|STRINGS</code> flags) may be the hottest pass. A section
+with just the <code>SHF_MERGE</code> flag has data elements of a uniform
+size. In either case, duplicate elements can be eliminated as an
+optional optimization. ld.lld performs the optimization with (the
+default) <code>-O1</code> and above.</p>
+<p>ld.lld splits the section content into pieces, collects pieces from
+all sections, then eliminates duplicates with a hash table. An obvious
+idea is to use a concurrent hash table. As said previously, llvm-project
+does not provide one. ld.lld duplicates work and does the following
+instead:</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">size_t</span> concurrency = <span class="built_in">PowerOf2Floor</span>(numThreads, <span class="number">32</span>);</span><br><span class="line"><span class="keyword">for</span> each thread &#123;</span><br><span class="line">  <span class="keyword">for</span> (MergeInputSection *sec : sections)</span><br><span class="line">    <span class="keyword">for</span> (<span class="keyword">auto</span> &amp;piece : sec-&gt;pieces)</span><br><span class="line">      <span class="keyword">if</span> (piece.live &amp;&amp; (piece.shardId &amp; (concurrency<span class="number">-1</span>)) == threadId)</span><br><span class="line">        shards[piece.shardId].<span class="built_in">add</span>(piece.data);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// Compute an in-section offset for each shard.</span></span><br><span class="line"><span class="type">size_t</span> off = <span class="number">0</span>;</span><br><span class="line"><span class="keyword">for</span> (<span class="type">size_t</span> i = <span class="number">0</span>; i &lt; numShards; ++i) &#123;</span><br><span class="line">  shards[i].<span class="built_in">finalizeInOrder</span>();</span><br><span class="line">  <span class="keyword">if</span> (shards[i].<span class="built_in">getSize</span>() &gt; <span class="number">0</span>)</span><br><span class="line">    off = <span class="built_in">alignTo</span>(off, alignment);</span><br><span class="line">  shardOffsets[i] = off;</span><br><span class="line">  off += shards[i].<span class="built_in">getSize</span>();</span><br><span class="line">&#125;</span><br><span class="line">size = off;</span><br><span class="line"></span><br><span class="line"><span class="built_in">parallelForEach</span>(sections, [&amp;](MergeInputSection *sec) &#123;</span><br><span class="line">  <span class="keyword">for</span> (<span class="keyword">auto</span> &amp;piece : sec-&gt;pieces)</span><br><span class="line">    <span class="keyword">if</span> (piece.live)</span><br><span class="line">      piece.outputOff += shardOffsets[<span class="built_in">getShardId</span>(piece.hash)];</span><br><span class="line">&#125;);</span><br></pre></td></tr></table></figure>
+<p>It would be nice if we could explore alternative algorithms.</p>
+<h2 id="open-output-file">Open output file</h2>
+<p>For <code>-o out</code>, ld.lld unlinks <code>out</code>
+asynchronously, creates <code>out</code> in read-write mode, and resizes
+<code>out</code> to the output size. The output size is computed in the
+writer and has to wait after output section addresses are assigned, so
+it is difficult to overlap this time consuming pass with other
+passes.</p>
+<p>I recently noticed that the way LLVM's Support library resizes the
+file is problematic for Linux tmpfs. The API calls
+<code>posix_fallocate</code> which has a nice property of reporting
+<code>ENOSPC</code> for some filesystems in some operating systems but
+may be bad for tmpfs. See <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D115957"
+class="uri">https://reviews.llvm.org/D115957</a>. In my system,
+<code>posix_fallocate</code> on an 1.4GiB output costs 0.3s, which is
+significant.</p>
+<p>An alternative design is to overwrite the output. This would lead to
+old/new file inconsistency problems. If the old file has hard links,
+this would corrupt the other links. Also, you have to be carefuly to
+zero all bytes, otherwise you may get non-reproducible output.</p>
+<h2 id="write-sections">Write sections</h2>
+<p>Some output sections contain one single synthetic section. I plan to
+analyze some expensive sections more carefully. For my experiments this
+week I use the additional time tracing (<a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D115984"
+class="uri">https://reviews.llvm.org/D115984</a>) a lot.</p>
+<p>I found that <code>.rela.dyn</code> sorting
+(<code>-z combreloc</code>) took 10+% time for a position-independent
+executable with millions of relocations. I make it parallel and
+optimized it further in <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D115993"
+class="uri">https://reviews.llvm.org/D115993</a>. This is a great
+example demonstrating that generality and feature creep bring us
+constraints and abstraction costs:</p>
+<ul>
+<li><code>outputSec</code> is in the dynamic relocation representation
+because of Mips.</li>
+<li>We want to support all of REL/RELA/mips64el. We value code brevity,
+so manual loop unswitching would not be OK.</li>
+<li>We support ld.lld's partition feature, so obtaining the symbol index
+has an extra condition which adds a little cost.</li>
+<li>We support Android packed relocations which have very different
+encoding schemes, so refactoring <code>encodeDynamicReloc</code> needs
+to touch it.</li>
+</ul>
+<p>ld.lld iterates over output sections and parallelizes input sections
+for each output section. This strategy works well when an output section
+has many input sections. However, for output sections created by linker
+(<code>.rela.dyn</code>, <code>.eh_frame</code>, <code>.symtab</code>,
+<code>.strtab</code>, etc), an output section typically has only one
+input section. Many synthetic sections are not parallelized.</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">class</span> <span class="title class_">ELFT</span>&gt; <span class="type">void</span> Writer&lt;ELFT&gt;::<span class="built_in">writeSections</span>() &#123;</span><br><span class="line">  ...</span><br><span class="line">  <span class="comment">// In -r or --emit-relocs mode, write the relocation sections first as in</span></span><br><span class="line">  <span class="comment">// ELf_Rel targets we might find out that we need to modify the relocated</span></span><br><span class="line">  <span class="comment">// section while doing it.</span></span><br><span class="line">  <span class="keyword">for</span> (OutputSection *sec : outputSections)</span><br><span class="line">    <span class="keyword">if</span> (sec-&gt;type == SHT_REL || sec-&gt;type == SHT_RELA)</span><br><span class="line">      sec-&gt;<span class="built_in">writeTo</span>&lt;ELFT&gt;(Out::bufferStart + sec-&gt;offset);</span><br><span class="line"></span><br><span class="line">  <span class="keyword">for</span> (OutputSection *sec : outputSections)</span><br><span class="line">    <span class="keyword">if</span> (sec-&gt;type != SHT_REL &amp;&amp; sec-&gt;type != SHT_RELA)</span><br><span class="line">      sec-&gt;<span class="built_in">writeTo</span>&lt;ELFT&gt;(Out::bufferStart + sec-&gt;offset);</span><br><span class="line">  ...</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">class</span> <span class="title class_">ELFT</span>&gt; <span class="function"><span class="type">void</span> <span class="title">OutputSection::writeTo</span><span class="params">(<span class="type">uint8_t</span> *buf)</span> </span>&#123;</span><br><span class="line">  ...</span><br><span class="line">  <span class="comment">// sections.size() is typically one for .rela.dyn/.eh_frame/.symtab while many for .text/.data/.rodata.</span></span><br><span class="line">  <span class="built_in">parallelForEachN</span>(<span class="number">0</span>, sections.<span class="built_in">size</span>(), [&amp;](<span class="type">size_t</span> i) &#123;</span><br><span class="line">    ...</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>Unfortunately <code>llvm::parallelForEachN</code> does not support
+nesting (when nested, only the outmost loop is parallel). Intel oneTBB's
+ABIs support nesting.</p>
+<h3
+id="compress-debug-sectionszlib"><code>--compress-debug-sections=zlib</code></h3>
+<p>In one invocation linking a Clang executable
+(<code>-DCMAKE_BUILD_TYPE=RelWithDebInfo</code>), ld.lld spent 36.7s
+compressing <code>.debug_*</code> sections while the total link time was
+41.5s.</p>
+<p>There are several problems.</p>
+<ul>
+<li>No format except zlib is standard. This is a big ecosystem issue.
+ld.lld is part of the ecosystem and can drive it, but with significant
+buy-in from debug information consumers. As a generic ELF feature, a new
+format needs a generic-abi discussion.</li>
+<li>llvm-project offloads to the system zlib. It does not leverage
+parallelism.</li>
+<li>Technically ld.lld can compress different <code>.debug_*</code>
+output sections but the degree of parallelism would be slow and there
+would be implementation complexity.</li>
+</ul>
+<p>See <a href="/blog/2022-01-23-compressed-debug-sections">Compressed
+debug sections</a> that this has been parallelized in 14.0.0.</p>
+<h2 id="build-id"><code>--build-id</code></h2>
+<p>According to <a
+target="_blank" rel="noopener" href="https://fedoraproject.org/w/index.php?title=RolandMcGrath/BuildID&amp;oldid=16098"
+class="uri">https://fedoraproject.org/w/index.php?title=RolandMcGrath/BuildID&amp;oldid=16098</a>,
+the feature was added as approximation of true uniqueness across all
+binaries that might be used by overlapping sets of people".</p>
+<p>In ld.lld, <code>--build-id</code> is implemented as a tree hash,
+which is pretty fast. The performance is limited by the library code
+checked into llvm-project. Some library code is not optimal (see <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D69295"
+class="uri">https://reviews.llvm.org/D69295</a> for SHA-1).</p>
+<p>Note: ld.lld's <code>--build-id</code> feature, as I know, has no
+validation tool.</p>
+<h2 id="malloc-implementation">malloc implementation</h2>
+<p>mold uses mimalloc by default. The llvm-project build system just
+uses the system malloc, i.e. glibc on a typical Linux distribution.</p>
+<p>If I link lld against a mimalloc static library with
+<code>-DCMAKE_EXE_LINKER_FLAGS=-Wl,--push-state,/tmp/p/mimalloc/out/release/libmimalloc.a,--pop-state</code>,
+ld.lld linking Chrome and Clang is 1.12x as fast.</p>
+<h2 id="executable-size">Executable size</h2>
+<p>The excutable size costs a little of performance. This matters very
+little but I still want to mention it.</p>
+<p>The lld codebase has <code>make&lt;XXX&gt;</code> for types which
+need a dedicated <code>BumpPtrAllocator</code>. Many singleton objects
+unfortunately use <code>make&lt;XXX&gt;</code> as well. The return value
+references the first element in a 4096-byte slab. <figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">Configuration *elf::config;</span><br><span class="line"></span><br><span class="line"><span class="function"><span class="type">bool</span> <span class="title">elf::link</span><span class="params">(...)</span> </span>&#123;</span><br><span class="line">  <span class="built_in">errorHandler</span>().cleanupCallback = []() &#123;</span><br><span class="line">    <span class="built_in">freeArena</span>(); <span class="comment">// destroy `make&lt;XXX&gt;` allocated objects</span></span><br><span class="line">  &#125;;</span><br><span class="line"></span><br><span class="line">  config = <span class="built_in">make</span>&lt;Configuration&gt;();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure> Every
+<code>XXX</code> pulls in lots of template code from
+<code>BumpPtrAllocator</code> and makes the x86-64 executable more than
+1KiB larger.</p>
+<ul>
+<li>If we change the global variable to
+<code>std::unique_ptr&lt;XXX&gt;</code>, there will be a non-trivial
+destructor at exit time. Fortunately lld exits via
+<code>_exit</code>...</li>
+<li>If we manually destroy global variables, it would be bad
+ergonomics.</li>
+<li>Global states are difficult to remove from ld.lld.</li>
+</ul>
+<p>If your lld executable is a position-independent executable or is
+linked against <code>libLLVM.so</code> or <code>libLLD*.so</code>, you
+pay some relocation processing costs in ld.so. For an <code>lld</code>
+executable, the <code>-pie</code> one spends extra 8ms to resolve the
+34000+ more relocations (mostly are <code>R_X86_64_RELATIVE</code>).</p>
+<p>lld is large because LTO pulls in a substantial portion of LLVM
+libraries, including middle-end optimizations and code generation. I did
+an experiment (<a target="_blank" rel="noopener" href="https://github.com/MaskRay/picolld"
+class="uri">https://github.com/MaskRay/picolld</a>) that if one removed
+LTO and non-ELF ports, the ELF lld executable was just ~3MiB on Linux
+x86-64. This is competitive as the universal-targeting (supporting
+multiple architectures in one executable) gold is more than 2MiB.</p>
+<h2 id="map"><code>-Map</code></h2>
+<p>The feature is for debugging and binary analysis. The link map output
+is tremendous so therefore inherently slow. ld.lld parallelizes the
+computation of some symbol properties.</p>
+<p>ld64.lld adopts an approach that makes the link map computation
+asynchronous, interleaved with other parallelizable passes.</p>
+<h2 id="cost-of-new-features">Cost of new features</h2>
+<p>Most links don't have <code>--strip-debug</code> or
+<code>--strip-all</code>. However, "Split sections" is used by
+partitions, so we cannot simply drop the code path for the common case.
+"Split sections" may cost 1~2% link time.</p>
+<h2 id="new-hope">New hope?</h2>
+<p>With multi-threading, why is mold faster than ld.lld? Ordered by my
+rough estimate of importance:</p>
+<ul>
+<li><code>SHF_MERGE</code> duplicate elimination</li>
+<li>eager loading of archive members and lazy object files</li>
+<li>parallel section/symbol table initialization</li>
+<li>parallel relocation scan</li>
+<li>faster synthetic sections</li>
+<li>parallel --gc-sections</li>
+<li>parallel symbol resolution</li>
+</ul>
+<p>I think ld.lld should explore parallel symbol table initialization
+and (with an option) eager loading of archive members and lazy object
+files. Because of some constraints I mentioned, the degree of
+parallelism is limited and the speed-up may never be as amazing as
+mold.</p>
+<p>The lack of concurrent LLVM data structures and parallel facility
+reduce some parallelism design space we can make. We should solve this
+problem.</p>
+<p>See <a href="/blog/2022-02-20-lld-14-elf-changes">lld 14 ELF
+changes</a> and <a href="/blog/2022-09-05-lld-15-elf-changes">lld 15 ELF
+changes</a> that the two releases have improved performance a lot. It
+requires significant changes to various passes, but I will work on the
+performance improvement from time to time.</p>
+<h2 id="epilogue">Epilogue</h2>
+<p>mold brings more parallelizable passes to the table. This is
+great.</p>
+<p>Features and generality require abstraction. Abstraction has costs.
+Costs can be tangible (performance) and intangible (reduced design
+space). For symbol table initialization, symbol resolution, relocation
+scan, I believe ld.lld has found a good balancing among different
+trade-offs. These passes have been ruthlessly challenged by mold.
+However, with various constraints they may be difficult to change and
+there is an upper bound on what we can improve. Perhaps 99% people will
+not feel sympathy for that:( When archive semantics and COMDAT were
+designed, did the designers anticipated that after some decades there
+are linker developers struggling with finding a good balance? :)</p>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="https://maskray.me/blog/2021-12-19-why-isnt-ld.lld-faster" data-id="cmklyfnrr00bmnginaqm6eo25" data-title="Why isn&#39;t ld.lld faster?" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      
+      
+      
+  <ul class="article-tag-list" itemprop="keywords"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/linker/" rel="tag">linker</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/llvm/" rel="tag">llvm</a></li></ul>
+
+    </footer>
+  </div>
+  
+    
+<nav id="article-nav">
+  
+    <a href="/blog/2021-12-31-summary" id="article-nav-newer" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">Newer</strong>
+      <div class="article-nav-title">
+        
+          2021年总结
+        
+      </div>
+    </a>
+  
+  
+    <a href="/blog/2021-11-07-init-ctors-init-array" id="article-nav-older" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">Older</strong>
+      <div class="article-nav-title">.init, .ctors, and .init_array</div>
+    </a>
+  
+</nav>
+
+  
+</article>
+
+
+<section class="giscus"></section>
+<script src="https://giscus.app/client.js"
+ data-repo="MaskRay/maskray.me"
+ data-repo-id="R_kgDON7L_CQ"
+ data-category="Blog Post Comments"
+ data-category-id="DIC_kwDON7L_Cc4CnDq4"
+ data-mapping="pathname"
+ data-strict="0"
+ data-reactions-enabled="1"
+ data-emit-metadata="0"
+ data-input-position="bottom"
+ data-theme="preferred_color_scheme"
+ data-lang="en"
+ data-loading="lazy"
+ crossorigin="anonymous"
+ async>
+</script>
+
+
+
+
+</section>
+        
+          <aside id="sidebar">
+  
+    
+  <div class="widget-wrap">
+    <h3 class="widget-title">Popular</h3>
+    <div class="widget">
+      <ul class="entry" id="js-popular">
+      </ul>
+    </div>
+  </div>
+
+
+  
+    
+  <div class="widget-wrap">
+    <h3 class="widget-title">Tag Cloud</h3>
+    <div class="widget tagcloud">
+      <a href="/blog/tags/adc/" style="font-size: 10.5px;">adc</a> <a href="/blog/tags/ai9/" style="font-size: 10px;">ai9</a> <a href="/blog/tags/algorithm/" style="font-size: 18.5px;">algorithm</a> <a href="/blog/tags/arm/" style="font-size: 10px;">arm</a> <a href="/blog/tags/asc/" style="font-size: 10px;">asc</a> <a href="/blog/tags/assembler/" style="font-size: 16px;">assembler</a> <a href="/blog/tags/automaton/" style="font-size: 10px;">automaton</a> <a href="/blog/tags/awesome/" style="font-size: 10px;">awesome</a> <a href="/blog/tags/bctf/" style="font-size: 11px;">bctf</a> <a href="/blog/tags/binary/" style="font-size: 11.5px;">binary</a> <a href="/blog/tags/binutils/" style="font-size: 19px;">binutils</a> <a href="/blog/tags/bmc/" style="font-size: 10px;">bmc</a> <a href="/blog/tags/build-system/" style="font-size: 10px;">build system</a> <a href="/blog/tags/c/" style="font-size: 11px;">c</a> <a href="/blog/tags/cpp/" style="font-size: 14.5px;">c++</a> <a href="/blog/tags/ccls/" style="font-size: 11.5px;">ccls</a> <a href="/blog/tags/cgc/" style="font-size: 10px;">cgc</a> <a href="/blog/tags/chroot/" style="font-size: 10px;">chroot</a> <a href="/blog/tags/clang/" style="font-size: 16.5px;">clang</a> <a href="/blog/tags/clang-format/" style="font-size: 10px;">clang-format</a> <a href="/blog/tags/codinsanity/" style="font-size: 10px;">codinsanity</a> <a href="/blog/tags/coffee-script/" style="font-size: 10px;">coffee script</a> <a href="/blog/tags/compiler/" style="font-size: 14px;">compiler</a> <a href="/blog/tags/compression/" style="font-size: 10.5px;">compression</a> <a href="/blog/tags/computer-security/" style="font-size: 10px;">computer security</a> <a href="/blog/tags/contest/" style="font-size: 16px;">contest</a> <a href="/blog/tags/csv/" style="font-size: 10px;">csv</a> <a href="/blog/tags/ctf/" style="font-size: 17.5px;">ctf</a> <a href="/blog/tags/data-structure/" style="font-size: 14px;">data structure</a> <a href="/blog/tags/data-structures/" style="font-size: 10px;">data-structures</a> <a href="/blog/tags/debug/" style="font-size: 12px;">debug</a> <a href="/blog/tags/defcon/" style="font-size: 14px;">defcon</a> <a href="/blog/tags/desktop/" style="font-size: 11px;">desktop</a> <a href="/blog/tags/docker/" style="font-size: 10.5px;">docker</a> <a href="/blog/tags/elf/" style="font-size: 13px;">elf</a> <a href="/blog/tags/emacs/" style="font-size: 15.5px;">emacs</a> <a href="/blog/tags/email/" style="font-size: 11.5px;">email</a> <a href="/blog/tags/emoji/" style="font-size: 10px;">emoji</a> <a href="/blog/tags/emscripten/" style="font-size: 10px;">emscripten</a> <a href="/blog/tags/event/" style="font-size: 10px;">event</a> <a href="/blog/tags/expect/" style="font-size: 11.5px;">expect</a> <a href="/blog/tags/ext4/" style="font-size: 10px;">ext4</a> <a href="/blog/tags/fdpic/" style="font-size: 10px;">fdpic</a> <a href="/blog/tags/feeds/" style="font-size: 10px;">feeds</a> <a href="/blog/tags/firmware/" style="font-size: 10px;">firmware</a> <a href="/blog/tags/floating-point/" style="font-size: 10px;">floating point</a> <a href="/blog/tags/forensics/" style="font-size: 11px;">forensics</a> <a href="/blog/tags/fp/" style="font-size: 10px;">fp</a> <a href="/blog/tags/freebsd/" style="font-size: 10px;">freebsd</a> <a href="/blog/tags/game/" style="font-size: 10.5px;">game</a> <a href="/blog/tags/gcc/" style="font-size: 18px;">gcc</a> <a href="/blog/tags/gdb/" style="font-size: 10px;">gdb</a> <a href="/blog/tags/gentoo/" style="font-size: 10.5px;">gentoo</a> <a href="/blog/tags/git/" style="font-size: 10px;">git</a> <a href="/blog/tags/github/" style="font-size: 10.5px;">github</a> <a href="/blog/tags/glibc/" style="font-size: 16px;">glibc</a> <a href="/blog/tags/graph/" style="font-size: 10px;">graph</a> <a href="/blog/tags/graph-drawing/" style="font-size: 10px;">graph drawing</a> <a href="/blog/tags/gtk/" style="font-size: 10.5px;">gtk</a> <a href="/blog/tags/hacker-culture/" style="font-size: 10px;">hacker culture</a> <a href="/blog/tags/hackerrank/" style="font-size: 10px;">hackerrank</a> <a href="/blog/tags/hanoi/" style="font-size: 10px;">hanoi</a> <a href="/blog/tags/haskell/" style="font-size: 15px;">haskell</a> <a href="/blog/tags/hpc/" style="font-size: 10.5px;">hpc</a> <a href="/blog/tags/image/" style="font-size: 10px;">image</a> <a href="/blog/tags/inotify/" style="font-size: 10px;">inotify</a> <a href="/blog/tags/ipsec/" style="font-size: 10px;">ipsec</a> <a href="/blog/tags/irc/" style="font-size: 12.5px;">irc</a> <a href="/blog/tags/isc/" style="font-size: 10.5px;">isc</a> <a href="/blog/tags/j/" style="font-size: 10px;">j</a> <a href="/blog/tags/javascript/" style="font-size: 12px;">javascript</a> <a href="/blog/tags/josephus-problem/" style="font-size: 10px;">josephus problem</a> <a href="/blog/tags/jq/" style="font-size: 10px;">jq</a> <a href="/blog/tags/kernel/" style="font-size: 11.5px;">kernel</a> <a href="/blog/tags/kythe/" style="font-size: 10px;">kythe</a> <a href="/blog/tags/ld/" style="font-size: 10px;">ld</a> <a href="/blog/tags/leetcode/" style="font-size: 11.5px;">leetcode</a> <a href="/blog/tags/libunwind/" style="font-size: 10px;">libunwind</a> <a href="/blog/tags/linker/" style="font-size: 19.5px;">linker</a> <a href="/blog/tags/linux/" style="font-size: 12.5px;">linux</a> <a href="/blog/tags/lld/" style="font-size: 10.5px;">lld</a> <a href="/blog/tags/lldb/" style="font-size: 10px;">lldb</a> <a href="/blog/tags/llvm/" style="font-size: 20px;">llvm</a> <a href="/blog/tags/lsp/" style="font-size: 13px;">lsp</a> <a href="/blog/tags/m68k/" style="font-size: 10px;">m68k</a> <a href="/blog/tags/makefile/" style="font-size: 12.5px;">makefile</a> <a href="/blog/tags/math/" style="font-size: 10px;">math</a> <a href="/blog/tags/maze/" style="font-size: 11px;">maze</a> <a href="/blog/tags/mirror/" style="font-size: 10px;">mirror</a> <a href="/blog/tags/ml/" style="font-size: 13px;">ml</a> <a href="/blog/tags/musl/" style="font-size: 10px;">musl</a> <a href="/blog/tags/mutt/" style="font-size: 10px;">mutt</a> <a href="/blog/tags/n-body/" style="font-size: 10px;">n-body</a> <a href="/blog/tags/neovim/" style="font-size: 10px;">neovim</a> <a href="/blog/tags/network/" style="font-size: 10.5px;">network</a> <a href="/blog/tags/nginx/" style="font-size: 10px;">nginx</a> <a href="/blog/tags/nim/" style="font-size: 10px;">nim</a> <a href="/blog/tags/nlp/" style="font-size: 10px;">nlp</a> <a href="/blog/tags/node-js/" style="font-size: 11px;">node.js</a> <a href="/blog/tags/noip/" style="font-size: 10px;">noip</a> <a href="/blog/tags/notmuch/" style="font-size: 10px;">notmuch</a> <a href="/blog/tags/npm/" style="font-size: 10px;">npm</a> <a href="/blog/tags/ocaml/" style="font-size: 14.5px;">ocaml</a> <a href="/blog/tags/offlineimap/" style="font-size: 10px;">offlineimap</a> <a href="/blog/tags/oi/" style="font-size: 13px;">oi</a> <a href="/blog/tags/oj/" style="font-size: 10.5px;">oj</a> <a href="/blog/tags/openwrt/" style="font-size: 10px;">openwrt</a> <a href="/blog/tags/parallel/" style="font-size: 10px;">parallel</a> <a href="/blog/tags/parser-generator/" style="font-size: 10px;">parser generator</a> <a href="/blog/tags/performance/" style="font-size: 10.5px;">performance</a> <a href="/blog/tags/perl/" style="font-size: 10px;">perl</a> <a href="/blog/tags/powerpc/" style="font-size: 10px;">powerpc</a> <a href="/blog/tags/presentation/" style="font-size: 10.5px;">presentation</a> <a href="/blog/tags/puzzle/" style="font-size: 10.5px;">puzzle</a> <a href="/blog/tags/python/" style="font-size: 13px;">python</a> <a href="/blog/tags/qq/" style="font-size: 10.5px;">qq</a> <a href="/blog/tags/radare2/" style="font-size: 10px;">radare2</a> <a href="/blog/tags/regex/" style="font-size: 10.5px;">regex</a> <a href="/blog/tags/regular-expression/" style="font-size: 10px;">regular expression</a> <a href="/blog/tags/release/" style="font-size: 14px;">release</a> <a href="/blog/tags/reverse-engineering/" style="font-size: 11px;">reverse engineering</a> <a href="/blog/tags/review/" style="font-size: 10px;">review</a> <a href="/blog/tags/riscv/" style="font-size: 11px;">riscv</a> <a href="/blog/tags/router/" style="font-size: 10px;">router</a> <a href="/blog/tags/rtld/" style="font-size: 10px;">rtld</a> <a href="/blog/tags/ruby/" style="font-size: 11.5px;">ruby</a> <a href="/blog/tags/ructfe/" style="font-size: 10px;">ructfe</a> <a href="/blog/tags/s390x/" style="font-size: 10px;">s390x</a> <a href="/blog/tags/sanitizer/" style="font-size: 11.5px;">sanitizer</a> <a href="/blog/tags/scheme/" style="font-size: 10px;">scheme</a> <a href="/blog/tags/search/" style="font-size: 10px;">search</a> <a href="/blog/tags/security/" style="font-size: 17px;">security</a> <a href="/blog/tags/sframe/" style="font-size: 10.5px;">sframe</a> <a href="/blog/tags/shell/" style="font-size: 10.5px;">shell</a> <a href="/blog/tags/ssh/" style="font-size: 10px;">ssh</a> <a href="/blog/tags/stringology/" style="font-size: 11.5px;">stringology</a> <a href="/blog/tags/student-festival-puzzle/" style="font-size: 10px;">student festival puzzle</a> <a href="/blog/tags/suffix-array/" style="font-size: 10px;">suffix array</a> <a href="/blog/tags/suffix-automaton/" style="font-size: 10px;">suffix automaton</a> <a href="/blog/tags/summary/" style="font-size: 14.5px;">summary</a> <a href="/blog/tags/suricata/" style="font-size: 10px;">suricata</a> <a href="/blog/tags/telegram/" style="font-size: 10px;">telegram</a> <a href="/blog/tags/telegramircd/" style="font-size: 10px;">telegramircd</a> <a href="/blog/tags/terminal/" style="font-size: 10.5px;">terminal</a> <a href="/blog/tags/tls/" style="font-size: 10px;">tls</a> <a href="/blog/tags/travel/" style="font-size: 10px;">travel</a> <a href="/blog/tags/traversal/" style="font-size: 10.5px;">traversal</a> <a href="/blog/tags/tree/" style="font-size: 10.5px;">tree</a> <a href="/blog/tags/trendmicro/" style="font-size: 10px;">trendmicro</a> <a href="/blog/tags/udev/" style="font-size: 10px;">udev</a> <a href="/blog/tags/unicode/" style="font-size: 10px;">unicode</a> <a href="/blog/tags/unix/" style="font-size: 10px;">unix</a> <a href="/blog/tags/usb/" style="font-size: 10px;">usb</a> <a href="/blog/tags/vim/" style="font-size: 10px;">vim</a> <a href="/blog/tags/vpn/" style="font-size: 10px;">vpn</a> <a href="/blog/tags/vte/" style="font-size: 10.5px;">vte</a> <a href="/blog/tags/wargame/" style="font-size: 10.5px;">wargame</a> <a href="/blog/tags/web-analytics/" style="font-size: 10px;">web analytics</a> <a href="/blog/tags/webqqircd/" style="font-size: 10.5px;">webqqircd</a> <a href="/blog/tags/website/" style="font-size: 13.5px;">website</a> <a href="/blog/tags/wechat/" style="font-size: 11.5px;">wechat</a> <a href="/blog/tags/wechatircd/" style="font-size: 11px;">wechatircd</a> <a href="/blog/tags/window-manager/" style="font-size: 10px;">window manager</a> <a href="/blog/tags/windows/" style="font-size: 10px;">windows</a> <a href="/blog/tags/x86/" style="font-size: 10.5px;">x86</a> <a href="/blog/tags/xbindkeys/" style="font-size: 10px;">xbindkeys</a> <a href="/blog/tags/xmonad/" style="font-size: 10.5px;">xmonad</a> <a href="/blog/tags/xz/" style="font-size: 10px;">xz</a> <a href="/blog/tags/yanshi/" style="font-size: 10px;">yanshi</a>
+    </div>
+  </div>
+
+  
+    <div class="widget-wrap">
+  <h3 class="widget-title">Blogroll</h3>
+  <div class="widget">
+    <ul>
+      <li><a href='https://byvoid.com' rel='friend' target='_blank'>BYVoid</a></li>
+      <li><a href='https://fqj.me' rel='friend' target='_blank'>fqj1994</a></li>
+      <li><a href='http://ppwwyyxx.com' rel='friend' target='_blank'>ppwwyyxx</a></li>
+    </ul>
+  </div>
+</div>
+
+  
+</aside>
+        
+      </div>
+      <footer id="footer">
+  
+  <div class="outer">
+    <div id="footer-info" class="inner">
+      
+      &copy; 2026 MaskRay<br>
+      Powered by <a href="https://hexo.io/" target="_blank">Hexo</a>
+    </div>
+  </div>
+</footer>
+
+    </div>
+    <nav id="mobile-nav">
+  
+    <a href="/blog/" class="mobile-nav-link">Home</a>
+  
+    <a href="/blog/archives/" class="mobile-nav-link">Archives</a>
+  
+    <a href="/blog/../feeds/" class="mobile-nav-link">Feeds</a>
+  
+    <a href="/blog/../til/" class="mobile-nav-link">TIL</a>
+  
+    <a href="/blog/../presentations/" class="mobile-nav-link">Presentations</a>
+  
+</nav>
+    
+
+
+<script src="/blog/js/jquery-3.6.4.min.js"></script>
+
+
+
+  
+<script src="/blog/fancybox/jquery.fancybox.min.js"></script>
+
+
+
+
+<script src="/blog/js/script.js"></script>
+
+
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C3HG5LHWPX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C3HG5LHWPX');
+</script>
+<!-- End Google Analytics -->
+
+
+
+<script src="/js/popular.js"></script>
+
+  </div>
+</body>
+</html>

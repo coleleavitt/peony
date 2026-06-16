@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C3HG5LHWPX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C3HG5LHWPX');
+</script>
+<!-- End Google Analytics -->
+
+  
+  <title>LLD and GNU linker incompatibilities | MaskRay</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <meta name="description" content="Updated in 2024-06. Subtitle: Is ld.lld a drop-in replacement for GNU ld? The motivation for this article was someone challenging the &quot;drop-in replacement&quot; claim on LLD&#39;s website (the discussion was a">
+<meta property="og:type" content="article">
+<meta property="og:title" content="LLD and GNU linker incompatibilities">
+<meta property="og:url" content="https://maskray.me/blog/2020-12-19-lld-and-gnu-linker-incompatibilities">
+<meta property="og:site_name" content="MaskRay">
+<meta property="og:description" content="Updated in 2024-06. Subtitle: Is ld.lld a drop-in replacement for GNU ld? The motivation for this article was someone challenging the &quot;drop-in replacement&quot; claim on LLD&#39;s website (the discussion was a">
+<meta property="og:locale" content="en_US">
+<meta property="article:published_time" content="2020-12-19T08:00:00.000Z">
+<meta property="article:modified_time" content="2026-02-01T03:01:58.005Z">
+<meta property="article:author" content="MaskRay">
+<meta property="article:tag" content="llvm">
+<meta property="article:tag" content="linker">
+<meta property="article:tag" content="binutils">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:creator" content="@HaskRay">
+  
+    <link rel="alternate" href="/blog/atom.xml" title="MaskRay" type="application/atom+xml">
+  
+  
+    <link rel="shortcut icon" href="/blog/favicon.png">
+  
+  
+    
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/typeface-source-code-pro@0.0.71/index.min.css">
+
+  
+  
+<link rel="stylesheet" href="/blog/css/style.css">
+
+  
+    
+<link rel="stylesheet" href="/blog/fancybox/jquery.fancybox.min.css">
+
+  
+  
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fork-awesome@1.2.0/css/fork-awesome.min.css">
+
+<meta name="generator" content="Hexo 6.3.0"><style>mjx-container[jax="SVG"] {
+  direction: ltr;
+}
+
+mjx-container[jax="SVG"] > svg {
+  overflow: visible;
+}
+
+mjx-container[jax="SVG"] > svg a {
+  fill: blue;
+  stroke: blue;
+}
+
+mjx-container[jax="SVG"][display="true"] {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+}
+
+mjx-container[jax="SVG"][justify="left"] {
+  text-align: left;
+}
+
+mjx-container[jax="SVG"][justify="right"] {
+  text-align: right;
+}
+
+g[data-mml-node="merror"] > g {
+  fill: red;
+  stroke: red;
+}
+
+g[data-mml-node="merror"] > rect[data-background] {
+  fill: yellow;
+  stroke: none;
+}
+
+g[data-mml-node="mtable"] > line[data-line] {
+  stroke-width: 70px;
+  fill: none;
+}
+
+g[data-mml-node="mtable"] > rect[data-frame] {
+  stroke-width: 70px;
+  fill: none;
+}
+
+g[data-mml-node="mtable"] > .mjx-dashed {
+  stroke-dasharray: 140;
+}
+
+g[data-mml-node="mtable"] > .mjx-dotted {
+  stroke-linecap: round;
+  stroke-dasharray: 0,140;
+}
+
+g[data-mml-node="mtable"] > svg {
+  overflow: visible;
+}
+
+[jax="SVG"] mjx-tool {
+  display: inline-block;
+  position: relative;
+  width: 0;
+  height: 0;
+}
+
+[jax="SVG"] mjx-tool > mjx-tip {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+mjx-tool > mjx-tip {
+  display: inline-block;
+  padding: .2em;
+  border: 1px solid #888;
+  font-size: 70%;
+  background-color: #F8F8F8;
+  color: black;
+  box-shadow: 2px 2px 5px #AAAAAA;
+}
+
+g[data-mml-node="maction"][data-toggle] {
+  cursor: pointer;
+}
+
+mjx-status {
+  display: block;
+  position: fixed;
+  left: 1em;
+  bottom: 1em;
+  min-width: 25%;
+  padding: .2em .4em;
+  border: 1px solid #888;
+  font-size: 90%;
+  background-color: #F8F8F8;
+  color: black;
+}
+
+foreignObject[data-mjx-xml] {
+  font-family: initial;
+  line-height: normal;
+  overflow: visible;
+}
+
+.MathJax path {
+  stroke-width: 3;
+}
+
+mjx-container[display="true"] {
+  overflow: auto hidden;
+}
+
+mjx-container[display="true"] + br {
+  display: none;
+}
+</style></head>
+
+<body>
+  <div id="container">
+    <div id="wrap">
+      <header id="header">
+  <div id="banner"></div>
+  <div id="header-outer" class="outer">
+    <div id="header-title" class="inner">
+      <h1 id="logo-wrap">
+        <a href="/blog/" id="logo">MaskRay</a>
+      </h1>
+      
+    </div>
+    <div id="header-inner" class="inner">
+      <nav id="main-nav">
+        <a id="main-nav-toggle" class="nav-icon"><span class="fa fa-bars"></span></a>
+        
+          <a class="main-nav-link" href="/blog/">Home</a>
+        
+          <a class="main-nav-link" href="/blog/archives/">Archives</a>
+        
+          <a class="main-nav-link" href="/blog/../feeds/">Feeds</a>
+        
+          <a class="main-nav-link" href="/blog/../til/">TIL</a>
+        
+          <a class="main-nav-link" href="/blog/../presentations/">Presentations</a>
+        
+      </nav>
+      <nav id="sub-nav">
+        <a class="nav-icon" href="https://github.com/MaskRay" title="GitHub" target="_blank"><img src="/icon/github.svg"></a>
+        <a class="nav-icon" href="https://twitter.com/HaskRay" title="Twitter" target="_blank"><img src="/icon/twitter.svg"></a>
+        <!-- <a class="nav-icon" href="https://www.zhihu.com/people/maskray" title="知乎" target="_blank"><img src="/icon/zhihu.svg"></a> -->
+        <!-- <a class="nav-icon" href="http://weibo.com/MaskRay" title="微博" target="_blank"><img src="/icon/weibo.svg"></a> -->
+        
+        
+          <a class="nav-icon" href="/blog/atom.xml" title="RSS Feed"><span class="fa fa-rss"></span></a>
+        
+        <a class="nav-icon nav-search-btn" title="Search"><span class="fa fa-search"></span></a>
+      </nav>
+      <div id="search-form-wrap">
+        <form action="//google.com/search" method="get" accept-charset="UTF-8" class="search-form"><input type="search" name="q" class="search-form-input" placeholder="Search"><button type="submit" class="search-form-submit">&#xF002;</button><input type="hidden" name="sitesearch" value="https://maskray.me/blog"></form>
+      </div>
+    </div>
+  </div>
+</header>
+
+      <div class="outer">
+        <section id="main"><article id="post-lld-and-gnu-linker-incompatibilities" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  <div class="article-meta">
+    <a href="/blog/2020-12-19-lld-and-gnu-linker-incompatibilities" class="article-date">
+  <time class="dt-published" datetime="2020-12-19T08:00:00.000Z" itemprop="datePublished">2020-12-19</time>
+</a>
+    
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 class="p-name article-title" itemprop="headline name">
+      LLD and GNU linker incompatibilities
+    </h1>
+  
+
+      </header>
+    
+    <div class="e-content article-entry" itemprop="articleBody">
+      
+        <p>Updated in 2024-06.</p>
+<p>Subtitle: Is ld.lld a drop-in replacement for GNU ld?</p>
+<p>The motivation for this article was someone challenging the "drop-in
+replacement" claim on LLD's website (the discussion was about Linux-like
+ELF toolchain):</p>
+<blockquote>
+<p>LLD is a linker from the LLVM project that is a drop-in replacement
+for system linkers and runs much faster than them. It also provides
+features that are useful for toolchain developers.</p>
+</blockquote>
+<p>99.9% pieces of software work with ld.lld without a change. Some
+linker script applications may need an adaption (such adaption is
+oftentimes due to brittle assumptions: asking too much from GNU ld's
+behavior which should be fixed anyway). So I defended for this
+claim.</p>
+<span id="more"></span>
+<p>Piotr Kubaj said that this is a probably more of a marketing term
+than a technical term, the term tries to lure existing users into
+thinking "it's the same you know, but better!". I think that this is
+fair in some senses: for many applications ld.lld has achieved much
+faster speed and much lower memory usage than GNU ld. A more important
+thing is that ld.lld adds a third choice to the spectrum. It brings
+competitive pressure to both sides, gives incentive for improvement, and
+makes for more standardized future features/extensions. One reason that
+I am subscribed to the binutils mailing list is I want to participate in
+its design processes (I am proud to say that I have managed to find some
+early issues of various new things).</p>
+<p>Anyway, I thought documenting the compatibility problems between the
+ELF ports of ld.lld and GNU ld is useful, not only to others but also to
+my future self, hence this article. I will try to describe GNU gold
+behaviors as well.</p>
+<p>So here is the long list. Please keep in mind that many compatibility
+issues do not really matter and a user may never run into such an issue.
+Many of them just serve as educational purposes and my personal
+reference. There some some user perceivable differences but quite a lot
+are WONTFIX on both GNU ld and ld.lld. ld.lld, as a newer linker, has
+less legacy compatibility burden and can make good default choices in
+some cases and say no to some unneeded features/behaviors. A large
+number of features are duplicated in GNU ld's various ports. It is also
+common that one thing behaves this way in port A and another way in port
+B.</p>
+<ul>
+<li>GNU ld reports
+<code>gc-sections requires either an entry or an undefined symbol</code>
+in a <code>-r --gc-section</code> link. ld.lld doesn't error (<a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D84131#2162411"
+class="uri">https://reviews.llvm.org/D84131#2162411</a>). I am unsure
+whether such a diagnostic will be useful (an uncommon use case where the
+GC roots are more than the explict linker options).</li>
+<li>The default image base for <code>-no-pie</code> links is different.
+For example, on x86-64, GNU ld defaults to 0x400000 while ld.lld
+defaults to 0x200000.</li>
+<li>GNU ld synthesizes a <code>STT_FILE</code> symbol when copying
+non-<code>STT_SECTION</code> <code>STB_LOCAL</code> symbols. ld.lld
+doesn't.
+<ul>
+<li>The <code>STT_FILE</code> symbol name is the input filename. For
+compiler driver specified startup files like <code>crti.o</code> and
+<code>crtn.o</code>, their absolute paths will end up in the linked
+image. This breaks local determinism (toolchain paths are leaked) for
+some users.</li>
+<li>I filed <a target="_blank" rel="noopener" href="https://github.com/llvm/llvm-project/issues/47367"
+class="uri">https://github.com/llvm/llvm-project/issues/47367</a> and <a
+target="_blank" rel="noopener" href="https://sourceware.org/bugzilla/show_bug.cgi?id=26822"
+class="uri">https://sourceware.org/bugzilla/show_bug.cgi?id=26822</a>.
+From binutils 2.36 onwards, the base name will be used.</li>
+</ul></li>
+<li>Default library paths.
+<ul>
+<li>GNU ld has default library paths.</li>
+<li>ld.lld doesn't. This is intentional so <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D70048"
+class="uri">https://reviews.llvm.org/D70048</a> (NetBSD) cannot be
+accepted.</li>
+</ul></li>
+<li>GNU ld supports grouped short options. This can sometimes cause
+surprising behaviors with misspelled or unimplemented options, e.g.
+<code>-no-pie</code> means <code>-n -o -pie</code> because GNU ld as of
+2.35 has not implemented <code>-no-pie</code>. Nick Clifton committed
+<code>Update the BFD linker so that it deprecates grouped short options.</code>
+to deprecated the GNU ld feature. ld.lld never supports grouped short
+options.</li>
+<li>Mixed SHF_LINK_ORDER and non-SHF_LINK_ORDER input sections in an
+output section.
+<ul>
+<li>ld.lld performs sorting within an input section description and
+allows arbitrary mixes.</li>
+<li>GNU ld does not allow mixed sections <a
+target="_blank" rel="noopener" href="https://sourceware.org/bugzilla/show_bug.cgi?id=26256"
+class="uri">https://sourceware.org/bugzilla/show_bug.cgi?id=26256</a>
+(H.J. Lu has a patch)</li>
+</ul></li>
+<li>ld.lld defaults to <code>-z relro</code> by default. This is
+probably not a good default but it is difficult to change now. I have a
+comment <a target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=48549"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=48549</a>. GNU ld
+warns for <code>-z relro</code> and <code>-z norelro</code> for non
+Linux/FreeBSD BFD emulations (e.g. <code>-m aarch64elf</code>).</li>
+<li>Different archive member extraction semantics. See <a
+target="_blank" rel="noopener" href="http://lld.llvm.org/ELF/warn_backrefs.html"
+class="uri">http://lld.llvm.org/ELF/warn_backrefs.html</a> for
+details.</li>
+<li>ld.lld <code>--warn-backrefs</code> warns for
+<code>def.a ref.o def.so</code> if <code>def.a</code> cannot satisfy
+previous unresolved symbols. ld.lld resolves the definition to
+<code>def.a</code> while GNU linkers resolve the definition to
+<code>def.so</code>.</li>
+<li>GNU ld <code>-static</code> has traditionally been a synonym to
+<code>-Bstatic</code>. Recently on x86 it has been changed to behave a
+bit similar to <code>gold -static</code>, which disallows linking
+against shared objects. ld.lld <code>-static</code> is still a synonym
+to <code>-Bstatic</code>.</li>
+<li>GNU linkers have a default <code>--dynamic-linker</code>. ld.lld
+doesn't.</li>
+<li>GNU ld discards empty sections more aggressively. ld.lld does not
+discard an output section if it contains an empty input section.</li>
+<li>GNU ld has architecture-specific rules for relocations referencing
+undefined weak symbols. I don't think the GNU ld behaviors can be
+summarized (even by maintainers!). ld.lld's are consistent.</li>
+<li>The conditions to create <code>.interp</code> are different. I
+believe GNU ld's is quite difficult to describe.</li>
+<li><code>--no-allow-shlib-undefined</code> and
+<code>--rpath-link</code>
+<ul>
+<li>GNU ld traces all shared objects (transitive <code>DT_NEEDED</code>
+dependencies) and emulates the behavior of a dynamic loader to warn more
+cases.</li>
+<li>gold and ld.lld implement a simplified version. They warn for shared
+objects whose <code>DT_NEEDED</code> dependencies are all seen as input
+files.</li>
+<li>ld.lld accepts and ignores <code>--rpath-link</code></li>
+</ul></li>
+<li><code>--fatal-warnings</code>
+<ul>
+<li>GNU ld still reports <code>warning: ...</code>.</li>
+<li>ld.lld switches to <code>error: ...</code>.</li>
+</ul></li>
+<li><code>--no-relax</code>
+<ul>
+<li>GNU ld: disable <code>R_X86_64_[REX_]GOTPCRELX</code></li>
+<li>ld.lld: no-op before 14.0.0 (<a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D113615"
+class="uri">https://reviews.llvm.org/D113615</a>)</li>
+</ul></li>
+<li>GNU ld's internal linker scripts place <code>.ctors</code> into
+<code>.init_array</code>. gold enables
+<code>--ctors-in-init-array</code> by default which does the same thing.
+ld.lld doesn't implement the functionality.</li>
+<li>ld.lld places <code>.rodata</code> (among other
+<code>SHF_ALLOC</code> and
+non-<code>SHF_WRITE</code>-non-<code>SHF_EXECINSTR</code> sections)
+before <code>.text</code> (among other <code>SHF_ALLOC</code> and
+<code>SHF_EXECINSTR</code> sections).</li>
+<li><code>.symtab</code>/<code>.shstrtab</code>/<code>.strtab</code> in
+a linker script.
+<ul>
+<li>Ignored by GNU ld, therefore <code>--orphan-handling=</code> does
+not warn/error.</li>
+<li>Respected by ld.lld</li>
+</ul></li>
+<li>GNU ld recognizes some sections like <code>.text</code> and
+<code>.tbss</code> as special (<code>bfd_elf_special_section</code>).
+<code>.text</code>, if present as an output section, doesn't have the
+<code>SHF_WRITE</code> flag even if we add a <code>SHF_WRITE</code>
+input section into the output section.</li>
+<li>Whether <code>ADDR(.foo)</code> in a linker script can retain an
+empty output section.
+<ul>
+<li>GNU ld: no. Symbol assignments relative to such empty sections may
+have strange <code>st_shndx</code>.</li>
+<li>ld.lld: yes.</li>
+</ul></li>
+<li>GNU ld does not produce <code>.rela.eh_frame</code> in
+<code>-r</code> or <code>--emit-relocs</code> mode. gold and ld.lld
+produce <code>.rela.eh_frame</code>.</li>
+<li>GNU ld applies tail merging to <code>.dynstr</code> and
+<code>.strtab</code>, but ld.lld doesn't.</li>
+<li>GNU ld applies tail merging to other
+<code>SHF_MERGE|SHF_STRINGS</code> sections by default. ld.lld performs
+tail merging only with <code>-O2</code>.</li>
+<li>If an undefined symbol is referenced by both
+<code>R_X86_64_JUMP_SLOT</code> (lazy) and
+<code>R_X86_64_GLOB_DAT</code> (non-lazy)
+<ul>
+<li>GNU ld generates <code>.plt.got</code> with
+<code>R_X86_64_GLOB_DAT</code> relocations.
+<code>R_X86_64_JUMP_SLOT</code> can thus be omitted to decrease the
+number of dynamic relocations.</li>
+<li>ld.lld does not implement this saving. This naturally requires more
+than one pass scanning relocations which ld.lld doesn't do at present.
+<a target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=32938"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=32938</a></li>
+</ul></li>
+<li>GNU ld relaxes <code>R_X86_64_GOTPCREL</code> relocations with some
+forms (e.g.
+<code>movq foo@GOTPCREL(%rip), %reg -&gt; leaq foo(%rip), %reg</code>).
+ld.lld never relaxes<code>R_X86_64_GOTPCREL</code> relocations.</li>
+<li>GNU linkers give <code>.gnu.linkonce*</code> sections COMDAT section
+semantics. ld.lld simply ignores such sections. <a
+target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=31586"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=31586</a> tracks when
+the hack can be removed.</li>
+<li>GNU ld adds <code>PT_PHDR</code> and <code>PT_INTERP</code>
+together. A shared object usually does not have the two program headers.
+In ld.lld, <code>PT_PHDR</code> is always added unless the address
+assignment makes is unsuitable to place program headers at all.</li>
+<li>The conditions to create the dynamic symbol table
+<code>.dynsym</code>.
+<ul>
+<li>ld.lld: there is an input shared object,
+<code>-pie</code>/<code>-shared</code>, or
+<code>--export-dynamic</code>.</li>
+<li>GNU ld's is quite complex. <code>--export-dynamic</code> is not
+special, though.</li>
+</ul></li>
+<li><code>--export-dynamic-symbol</code>
+<ul>
+<li>gold's implies <code>-u</code>.</li>
+<li>GNU ld (from 2.35 onwards) and ld.lld's do not imply
+<code>-u</code>.</li>
+</ul></li>
+<li>In GNU ld, a defined <code>foo@v</code> can suppress the extraction
+of an archive member defining <code>foo@@v1</code>. ld.lld treats them
+two separate symbols and thus the archive member extraction still
+happens. This can hardly matter. See <a
+href="https://maskray.me/blog/2020-11-26-all-about-symbol-versioning">All
+about symbol versioning</a> for details.</li>
+<li>Default program headers.
+<ul>
+<li>With traditional <code>-z noseparate-code</code>, GNU ld defaults to
+a <code>RX/R/RW</code> program header layout. With
+<code>-z separate-code</code> (default on Linux/x86 from binutils 2.31
+onwards), GNU ld defaults to a <code>R/RX/R/RW</code> program header
+layout.</li>
+<li>ld.lld defaults to <code>R/RX/RW(RELRO)/RW(non-RELRO)</code>. With
+<code>--rosegment</code>, ld.lld uses
+<code>RX/RW(RELRO)/RW(non-RELRO)</code>.</li>
+<li>Placing all R before RX is preferable because it can save one
+program header and reduce alignment costs.</li>
+<li>ld.lld's split of RW saves one maxpagesize alignment and can make
+the linked image smaller.</li>
+<li>This breaks some assumptions that the (so-called) "text segment"
+precedes the (so-called) "data segment".</li>
+<li>For example, certain programs expect <code>.text</code> is the first
+section of the text segment and specify <code>-Ttext=0</code> to place
+the <code>PF_R|PF_X</code> program header at p_vaddr=0. This is a
+brittle assumption and should be avoided. If <code>PT_PHDR</code> is
+needed, <code>--image-base=0</code> is a replacement. If
+<code>PT_PHDR</code> is not needed,
+<code>.text 0 : &#123; *(.text .text.*) &#125;</code> is a replacement.</li>
+<li>If <code>-Ttext=</code> or <code>--section-start</code> specifies an
+output section address below this base, the result is likely unintended.
+ld.lld since 21 will report an error. <a
+target="_blank" rel="noopener" href="https://github.com/llvm/llvm-project/pull/140187/"
+class="uri">https://github.com/llvm/llvm-project/pull/140187/</a></li>
+</ul></li>
+<li>ld.lld places <code>.iplt</code> into the output section of the same
+name. GNU ld and gold just use <code>.plt</code>. ld.lld's approach has
+the benefit that the tricky feature stands out and symbolizers don't
+have to deal with mixed PLT entries.</li>
+<li>GNU ld and gold define <code>__rela_iplt_start</code> in
+<code>-no-pie</code> mode, but not in <code>-pie</code> mode. glibc
+<code>csu/libc-start.c</code> needs it when statically linked, but not
+in the static pie mode. ld.lld does not distinguish
+<code>-no-pie</code>, <code>-pie</code> and <code>-shared</code>. <a
+target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=48674"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=48674</a></li>
+<li>ld.lld uses <code>--no-apply-dynamic-relocs</code> by default. GNU
+ld and gold fill in the GOT entries with link-time values. GNU ld only
+supports <code>--no-apply-dynamic-relocs</code> for aarch64 <a
+target="_blank" rel="noopener" href="https://sourceware.org/bugzilla/show_bug.cgi?id=25891"
+class="uri">https://sourceware.org/bugzilla/show_bug.cgi?id=25891</a>.</li>
+<li>When relaxing <code>R_X86_64_REX_GOTPCRELX</code>, GNU ld suppresses
+the relaxation if it would cause relocation overflow. ld.lld does not
+perform the check.</li>
+<li>GNU ld and gold allow <code>--exclude-libs=b</code> to hide
+<code>b.a</code>. ld.lld requires <code>--exclude=libs=b.a</code>.</li>
+<li>ld.lld cannot GC non-group non-SHF_LINK_ORDER
+<code>.gcc_except_table*</code> sections. GNU ld can GC such sections.
+For Clang&gt;=13, <code>clang -fbinutils-version=2.36</code> can set
+<code>SHF_LINK_ORDER</code> on <code>.gcc_except_table*</code> to allow
+GC.</li>
+<li>In GNU ld, a definition referenced by an unneeded
+(<code>--as-needed</code>) shared object is not exported into
+<code>.dynsym</code> <a
+target="_blank" rel="noopener" href="https://sourceware.org/bugzilla/show_bug.cgi?id=26551">PR26551</a>.
+gold and ld.lld export such a definition.</li>
+<li>ppc64: GNU ld defines <code>.TOC.</code> to the output section of
+<code>.got</code> plus 0x8000. ld.lld chooses the input section
+<code>.got</code> plus 0x8000. All architectures I know define their GOT
+relocations relative to the input section <code>.got</code>.</li>
+<li>When a copy relocated symbol has aliases (e.g. <code>environ</code>,
+<code>_environ</code>, <code>__environ</code>), ld.lld copies all
+aliases, while GNU ld only copies some aliases.</li>
+<li>In GNU ld, symbols not in <code>--retain-symbols-file</code> are
+excluded from <code>.symtab</code> but <code>.dynsym</code> is
+unaffected, while ld.lld excludes symbols from both <code>.symtab</code>
+and <code>.dynsym</code>. <a
+target="_blank" rel="noopener" href="https://github.com/llvm/llvm-project/issues/91055"
+class="uri">https://github.com/llvm/llvm-project/issues/91055</a></li>
+</ul>
+<h3 id="as-needed"><code>--as-needed</code></h3>
+<p>In GNU ld and gold, a shared object gets a <code>DT_NEEDED</code>
+entry if:</p>
+<ul>
+<li>it is linked at least once in --no-as-needed mode (i.e.
+<code>--as-needed a.so --no-as-needed a.so</code> =&gt; needed)</li>
+<li>or it has a definition resolving a non-weak reference</li>
+</ul>
+<p>In GNU ld, an as-needed shared object is like an archive. It should
+come after the references.</p>
+<p>In ld.lld,</p>
+<ul>
+<li>it is linked at least once in <code>--no-as-needed</code> mode (i.e.
+<code>--as-needed a.so --no-as-needed a.so</code> =&gt; needed)</li>
+<li>or it has a definition resolving a non-weak reference from a live
+section (not discarded by <code>--gc-sections</code>)</li>
+</ul>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"># RUN: split-file %s %t</span><br><span class="line"># RUN: cc -c %t/a.s -o %t/a.o</span><br><span class="line"># RUN: cc -shared -Wl,--soname=b.so %t/b.s -o %t/b.so</span><br><span class="line">## DT_NEEDED entry.</span><br><span class="line"># RUN: ld.bfd --gc-sections %t/a.o --as-needed %t/b.so -o %t.out</span><br><span class="line">## No DT_NEEDED entry.</span><br><span class="line"># RUN: ld.lld --gc-sections %t/a.o --as-needed %t/b.so -o %t.out</span><br><span class="line"></span><br><span class="line">#--- a.s</span><br><span class="line">.globl _start</span><br><span class="line">_start:</span><br><span class="line"></span><br><span class="line">.section .text.a,&quot;ax&quot;</span><br><span class="line">call foo</span><br><span class="line"></span><br><span class="line">#--- b.s</span><br><span class="line">.weak foo</span><br><span class="line">foo:</span><br><span class="line"> ret</span><br></pre></td></tr></table></figure>
+<h3 id="semantics-of---wrap">Semantics of --wrap</h3>
+<p>GNU ld hand ld.lld have slightly different <code>--wrap</code>
+semantics. I use "slightly" because in most use cases users will not
+observe a difference.</p>
+<p>In GNU ld, <code>--wrap</code> only applies to undefined symbols. In
+ld.lld, <code>--wrap</code> happens after all other symbol resolution
+steps. The implementation is to mangle the symbol table of each object
+file (<code>foo -&gt; __wrap_foo; __real_foo -&gt; foo</code>) so that
+all relocations to <code>foo</code> or <code>__real_foo</code> will be
+redirected.</p>
+<p>The ld.lld semantics have the advantage that non-LTO, LTO and
+relocatable link behaviors are consistent. I filed <a
+target="_blank" rel="noopener" href="https://sourceware.org/bugzilla/show_bug.cgi?id=26358"
+class="uri">https://sourceware.org/bugzilla/show_bug.cgi?id=26358</a>
+for GNU ld.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"># GNU ld: call bar</span><br><span class="line"># ld.lld: call __wrap_bar</span><br><span class="line">  call bar</span><br><span class="line">.globl bar</span><br><span class="line">bar:</span><br></pre></td></tr></table></figure>
+<p>If there are <code>__real_foo</code> references but <code>foo</code>
+does not exist, GNU linkers can redirect <code>__real_foo</code>
+references to <code>foo</code>. ld.lld doesn't do anything. This
+difference doesn't matter in practice.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"># REQUIRES: x86</span><br><span class="line"># RUN: rm -rf %t &amp;&amp; split-file %s %t</span><br><span class="line"># RUN: llvm-mc -filetype=obj -triple=x86_64 %t/a.s -o %t/a.o</span><br><span class="line"># RUN: llvm-mc -filetype=obj -triple=x86_64 %t/b.s -o %t/b.o</span><br><span class="line"># RUN: rm -f %tb.a &amp;&amp; llvm-ar r %tb.a %t/b.o</span><br><span class="line"># RUN: ld.lld %t/a.o %tb.a -o %t/lld --wrap pthread_create -z undefs</span><br><span class="line"># RUN: ld.bfd %t/a.o %tb.a -o %t/bfd --wrap pthread_create -z undefs</span><br><span class="line"># RUN: gold %t/a.o %tb.a -o %t/bfd --wrap pthread_create --unresolved-symbols=ignore-in-object-files</span><br><span class="line"></span><br><span class="line">#--- a.s</span><br><span class="line">.globl _start</span><br><span class="line">_start:</span><br><span class="line">.cfi_startproc</span><br><span class="line">  call pthread_create</span><br><span class="line">.cfi_endproc</span><br><span class="line"></span><br><span class="line">#--- b.s</span><br><span class="line">.global pthread_create</span><br><span class="line">pthread_create:</span><br><span class="line">.cfi_startproc</span><br><span class="line">  ret</span><br><span class="line">.cfi_endproc</span><br></pre></td></tr></table></figure>
+<h3
+id="relocation-referencing-a-local-relative-to-a-discarded-input-section">Relocation
+referencing a local relative to a discarded input section</h3>
+<ul>
+<li>How to resolve a relocation referencing a <code>STT_SECTION</code>
+symbol associated to a discarded <code>.debug_*</code> input section.
+<ul>
+<li>GNU ld and gold have logic resolving the relocation to the
+prevailing section symbol.</li>
+<li>ld.lld does not have the logic. ld.lld 11 defines some tombstone
+values.</li>
+</ul></li>
+</ul>
+<blockquote>
+<p>A symbol table entry with STB_LOCAL binding that is defined relative
+to one of a group's sections, and that is contained in a symbol table
+section that is not part of the group, must be discarded if the group
+members are discarded. References to this symbol table entry from
+outside the group are not allowed.</p>
+</blockquote>
+<p>ld.bfd/gold/lld error if the section containing the relocation is
+SHF_ALLOC. .debug* do not have the SHF_ALLOC flag and those relocations
+are allowed.</p>
+<p>lld resolves such relocations to 0. ld.bfd and gold, however, have
+some CB_PRETEND/PRETEND logic to resolve relocations to the definitions
+in the prevailing comdat groups. The code is hacky and may not suit
+lld.</p>
+<p><a target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=42030"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=42030</a></p>
+<h3 id="canonical-plt-entry-for-ifunc">Canonical PLT entry for
+ifunc</h3>
+<p>How to handle a direct access relocation referencing a
+<code>STT_GNU_IFUNC</code>?</p>
+<p>c.f. <a href="2021-01-18-gnu-indirect-function">GNU indirect
+function</a>.</p>
+<h3 id="rela_iplt_start"><code>__rela_iplt_start</code></h3>
+<p>GNU ld and gold define <code>__rela_iplt_start</code> in
+<code>-no-pie</code> mode, but not in <code>-pie</code> mode. ld.lld
+defines <code>__rela_iplt_start</code> regardless of
+<code>-no-pie</code>, <code>-pie</code> or <code>-shared</code>.</p>
+<p>Static pie and static no-pie relocation processing is very different
+in glibc.</p>
+<ul>
+<li>Static no-pie uses special code to process a magic array delimitered
+by <code>__rela_iplt_start/__rela_iplt_end</code>.</li>
+<li>Static pie uses self-relocation to take care of
+<code>R_*_IRELATIVE</code>. The above magic array code is executed as
+well. If <code>__rela_iplt_start</code>/<code>__rela_iplt_end</code> are
+defined (like what ld.lld does), we will get
+<code>0 &lt; __rela_iplt_start &lt; __rela_iplt_end</code> in
+<code>csu/libc-start.c</code>. <code>ARCH_SETUP_IREL</code> will crash
+when resolving the first relocation which has been processed.</li>
+</ul>
+<p>nsz has a glibc patch that moves the self-relocation later so
+everything is set up for ifunc resolvers.</p>
+<h2 id="text-relocations">Text relocations</h2>
+<ul>
+<li>In GNU ld, <code>-z notext</code>/<code>-z text</code>/unspecified
+are a tri-state. For <code>-z notext</code>/unspecified, the dynamic
+tags <code>DT_TEXTREL</code> and <code>DF_TEXTREL</code> are added on
+demand. If unspecified and GNU ld is configured with
+<code>--enable-textrel-check=warning</code>, a warning will be
+issued.</li>
+<li>ld.lld has two states and adds <code>DT_TEXTREL</code> and
+<code>DF_TEXTREL</code> if <code>-z notext</code> is specified.</li>
+<li>GNU ld supports more relocation types as text relocations.</li>
+</ul>
+<p>LLD 16.0.0 has changed a behavior related to absolute relocations in
+<code>.eh_frame</code>. See <a href="#misc">Misc</a>.</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">echo <span class="string">&#x27;void bar(); int main() &#123; try &#123; bar(); &#125; catch (...) &#123;&#125; &#125;&#x27;</span> &gt; a.cc</span><br><span class="line">echo <span class="string">&#x27;void bar() &#123;&#125;&#x27;</span> &gt; b.cc</span><br><span class="line">clang++ -m32 -fno-pic -no-pie -fuse-ld=lld -z notext a.cc b.cc</span><br></pre></td></tr></table></figure>
+<h2 id="short-range-absolute-relocations">Short-range absolute
+relocations</h2>
+<figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">cat</span> &gt; a.s &lt;&lt;<span class="string">e</span></span><br><span class="line"><span class="string">.globl _start; _start:</span></span><br><span class="line"><span class="string">.data; .short _start</span></span><br><span class="line"><span class="string">e</span></span><br><span class="line">llvm-mc -filetype=obj -triple=i686 a.s -o x86_32.o</span><br><span class="line">llvm-mc -filetype=obj -triple=x86_64 a.s -o x86_64.o</span><br></pre></td></tr></table></figure>
+<p>For the short-range absolute relocations (e.g.
+<code>R_X86_64_16</code> and <code>R_X86_64_32</code>), GNU ld's x86_64
+port rejects them regardless of whether <code>-z text</code> or
+<code>-z notext</code> is used. Simiarly, ld.lld rejects them:
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">% ld.bfd -pie x86_64.o &amp;&amp; readelf -Wr a.out</span><br><span class="line">ld.bfd: x86_64.o: relocation R_X86_64_16 against symbol `_start&#x27; can not be used when making a PIE object; recompile with -fPIE</span><br><span class="line">ld.bfd: failed to set dynamic section sizes: bad value</span><br><span class="line">% ld.lld -pie x86_64.o</span><br><span class="line">ld.lld: error: relocation R_X86_64_16 cannot be used against symbol &#x27;_start&#x27;; recompile with -fPIC</span><br><span class="line">&gt;&gt;&gt; defined in x86_64.o</span><br><span class="line">&gt;&gt;&gt; referenced by x86_64.o:(.data+0x0)</span><br></pre></td></tr></table></figure></p>
+<p>The link-time address of <code>_start</code> may be representable
+with an <code>R_X86_64_16</code>. However, with <code>-pie</code>, the
+semantics require that the run-time address of <code>_start</code> is
+representable, which is not the case. Therefore linkers report an error.
+This behavior is implemented in many other ports of GNU ld.</p>
+<p>(To make the <code>R_X86_64_16</code> relocation accepted, the
+relocation should reference an absolute symbol (<code>SHN_ABS</code>)
+instead.)</p>
+<p>GNU ld's i386 port somehow accepts such a short-range relocation in
+PIC links. It is possibly an unimplemented check that gets abused.
+x86-32 is more or less considered legacy, so a linker change may be
+deemed unnecessary now. <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">% ld.bfd -m elf_i386 -pie x86_32.o &amp;&amp; readelf -Wr a.out</span><br><span class="line"></span><br><span class="line">There are no relocations in this file.</span><br></pre></td></tr></table></figure></p>
+<p>ld.lld's behavior with the default <code>-z text</code> is consistent
+with other ports, as it rejects the short-range relocations. However,
+when <code>-z notext</code> is specified for x86-32 links, ld.lld
+converts the short-range relocations to dynamic relocations,
+specifically text relocations. I believe that the conversion of
+<code>R_386_8</code> and <code>R_386_16</code> is unintended. Only
+<code>R_386_32</code>, <code>R_386_TLS_LE</code>, and
+<code>R_386_TLS_LE_32</code> should be supported as text relocations.
+ld.lld's behavior is because we generally support fewer relocation types
+as text relocations than GNU ld. x86-32 linkers traditionally have many
+hacks to work around legacy code. Some may be no longer relevant.
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">% ld.lld -pie x86_32.o</span><br><span class="line">ld.lld: error: relocation R_386_16 cannot be used against symbol &#x27;_start&#x27;; recompile with -fPIC</span><br><span class="line">&gt;&gt;&gt; defined in x86_32.o</span><br><span class="line">&gt;&gt;&gt; referenced by x86_32.o:(.rodata+0x0)</span><br><span class="line">% ld.lld -pie x86_32.o -z notext &amp;&amp; readelf -Wr a.out</span><br><span class="line"></span><br><span class="line">Relocation section &#x27;.rel.dyn&#x27; at offset 0x170 contains 2 entries:</span><br><span class="line"> Offset     Info    Type                Sym. Value  Symbol&#x27;s Name</span><br><span class="line">00000180  00000014 R_386_16</span><br><span class="line">000031f4  00000014 R_386_16</span><br></pre></td></tr></table></figure></p>
+<h2 id="linker-scripts">Linker scripts</h2>
+<ul>
+<li>GNU ld has an internal linker script if neither <code>-T</code>
+(<code>--script</code>) nor <code>-dT</code>
+(<code>--default-script</code>) is specified. gold and ld.lld do not
+have an internal linker script.
+<ul>
+<li>I closed <a target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=51309"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=51309</a> as reporting
+an internal linker script would significantly increase complexity
+without justifiable benefit.</li>
+<li>Some built-in processing cannot be serialized into a linker
+script.</li>
+</ul></li>
+<li>If neither <code>FILEHDR</code> nor <code>PHDRS</code> is not
+specified, and the minimum address of <code>SHF_ALLOC</code> sections is
+set so that adding headers will need to add an extra page, ld.lld will
+not place ELF header and program headers in a <code>PT_LOAD</code>
+program header.</li>
+<li>Some linker script commands are unimplemented in ld.lld, e.g.
+<code>BLOCK()</code> as a compatibility alias for <code>ALIGN()</code>.
+<code>BLOCK</code> is documented in GNU ld as a compatibility alias and
+it is not widely used, so there is no reason to keep the kludge in
+ld.lld.</li>
+<li>Some syntax is not recognized by ld.lld, e.g. ld.lld recognizes
+<code>*(EXCLUDE_FILE(a.o) .text)</code> but not
+<code>EXCLUDE_FILE(a.o) *(.text)</code> (<a
+target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=45764"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=45764</a>)
+<ul>
+<li>To me the unrecognized syntax is misleading.</li>
+<li>If we support one way doing something, and the thing has several
+alternative syntax, we may not consider the alternative syntax just for
+the sake of completeness.</li>
+</ul></li>
+<li>When an output section has no input section, GNU ld will eliminate
+it if it only contains symbol assignments (e.g.
+<code>.foo &#123; symbol = 42; &#125;</code>, <a
+target="_blank" rel="noopener" href="https://sourceware.org/binutils/docs/ld/Output-Section-Discarding.html">ref</a>).
+ld.lld will retain such sections unless all the symbol assignments are
+unreferenced PROVIDED.</li>
+<li><a href="/blog/2024-06-02-understanding-orphan-sections">Different
+orphan section placement</a>. GNU ld has very complex rules and certain
+section names have special semantics. ld.lld adopted some of its core
+ideas but made a lot of simplication:
+<ul>
+<li>output sections are given ranks</li>
+<li>output sections are placed after symbol assignments At some point we
+should document it. <a
+target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=42327"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=42327</a></li>
+</ul></li>
+<li>For an error detected when processing a linker script, ld.lld may
+report it multiple times (e.g. <code>ASSERT</code> failure). GNU ld has
+such issues, too, but probably much rarer.</li>
+<li><code>SORT</code> commands
+<ul>
+<li>GNU ld: <a
+target="_blank" rel="noopener" href="https://sourceware.org/binutils/docs/ld/Input-Section-Basics.html#Input-Section-Basics"
+class="uri">https://sourceware.org/binutils/docs/ld/Input-Section-Basics.html#Input-Section-Basics</a>
+mentions the feature but its behavior is strange/unintuitive. I created
+<a
+target="_blank" rel="noopener" href="https://sourceware.org/pipermail/binutils/2020-November/114083.html">SORT
+and multiple patterns in an input section description</a>.</li>
+<li>ld.lld performs sorting within an input section description. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D91127"
+class="uri">https://reviews.llvm.org/D91127</a></li>
+</ul></li>
+<li>In ld.lld, <code>AT(lma)</code> forces creation of a new
+<code>PT_LOAD</code> program header. GNU ld can reuse the previous
+<code>PT_LOAD</code> program header if LMA addresses are contiguous.
+<code>lma-offset.s</code></li>
+<li>In ld.lld, non-<code>SHF_ALLOC</code> sections always get 0
+<code>sh_addr</code>. In GNU ld you can have non-zero
+<code>sh_addr</code> but <code>STT_SECTION</code> relocations
+referencing such sections are not really meaningful.</li>
+<li>Dot assignment (e.g. <code>. = 4;</code>) in an output section
+description.
+<ul>
+<li>GNU ld: dot advances to 4 relative to the start. If you consider
+<code>.</code> on the right hand side and <code>ABSOLUTE(.)</code>, I
+don't think the behaviors are consistent.</li>
+<li>ld.lld: move dot to address 0x4, which will usually trigger an
+<code>unable to move location counter backward</code> error. <a
+target="_blank" rel="noopener" href="https://bugs.llvm.org/show_bug.cgi?id=41169"
+class="uri">https://bugs.llvm.org/show_bug.cgi?id=41169</a></li>
+</ul></li>
+</ul>
+<h3 id="symbol-assignments-within-an-output-section">Symbol assignments
+within an output section</h3>
+<p>See an example for GNU ld and lld's behaviors. <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line">// a.s</span><br><span class="line">nop</span><br><span class="line"></span><br><span class="line">// a.x</span><br><span class="line">SECTIONS &#123;</span><br><span class="line">  . = 0x1204;</span><br><span class="line">  .text : &#123;</span><br><span class="line">    *(.text)</span><br><span class="line">    /* dot is 0x1205 */</span><br><span class="line">    a1 = ALIGN(32); /* = ALIGN(ABSOLUTE(.), 32) */</span><br><span class="line">    a2 = 32;</span><br><span class="line">    a2_1 = a2;</span><br><span class="line">    a3 = ABSOLUTE(0x1225);</span><br><span class="line">    a3_1 = a3;</span><br><span class="line">    a4 = ABSOLUTE(0x1225) + 1;</span><br><span class="line">    a4_1 = a4;</span><br><span class="line">    a5 = ADDR(.text);</span><br><span class="line">  &#125;</span><br><span class="line">  /DISCARD/ : &#123; *(.dynsym) *(.gnu.hash) *(.hash) *(.dynstr) &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure></p>
+<p>For (<code>bar = 32;</code>) in an output section description, GNU ld
+defines <code>bar</code> at 32 relative to the start of the output
+section. Similarly, <code>. = 32</code> advances the location counter to
+4 relative to the start of the output section. The behaviors are
+different for symbol assignments outside of an output section and
+<code>ABSOLUTE</code> has special but unclear semantics. When you think
+of binary operators, the behaviors are more confusing.</p>
+<p>ld.lld simply doesn't implement the special but unclear semantics of
+relative offsets within an output section.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br></pre></td><td class="code"><pre><span class="line">% as a.s -o a.o</span><br><span class="line"></span><br><span class="line"># I choose -pie because st_shndx can be different in GNU ld&#x27;s -no-pie mode. I think both ld.lld -no-pie and ld.lld -pie should be consistent with ld.bfd -pie, instead of ld.bfd -no-pie.</span><br><span class="line">% ld.bfd -pie a.o -T a.x</span><br><span class="line">% readelf -W -s a.out</span><br><span class="line">...</span><br><span class="line">     2: 0000000000001220     0 NOTYPE  GLOBAL DEFAULT    1 a1</span><br><span class="line">     3: 0000000000001225     0 NOTYPE  GLOBAL DEFAULT  ABS a3</span><br><span class="line">     4: 0000000000002429     0 NOTYPE  GLOBAL DEFAULT    1 a3_1</span><br><span class="line">     5: 000000000000242a     0 NOTYPE  GLOBAL DEFAULT    1 a4_1</span><br><span class="line">     6: 0000000000001204     0 NOTYPE  GLOBAL DEFAULT    1 a5</span><br><span class="line">     7: 0000000000001224     0 NOTYPE  GLOBAL DEFAULT    1 a2</span><br><span class="line">     8: 0000000000001224     0 NOTYPE  GLOBAL DEFAULT    1 a2_1</span><br><span class="line">     9: 0000000000001226     0 NOTYPE  GLOBAL DEFAULT  ABS a4</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">% ld.lld -pie a.o -T a.x  # lld makes many symbols absolute</span><br><span class="line">% readelf -W -s a.out</span><br><span class="line">...</span><br><span class="line">     2: 0000000000000020     0 NOTYPE  GLOBAL DEFAULT  ABS a2</span><br><span class="line">     3: 0000000000001225     0 NOTYPE  GLOBAL DEFAULT  ABS a3</span><br><span class="line">     4: 0000000000001226     0 NOTYPE  GLOBAL DEFAULT  ABS a4</span><br><span class="line">     5: 0000000000001220     0 NOTYPE  GLOBAL DEFAULT  ABS a1</span><br><span class="line">     6: 0000000000000020     0 NOTYPE  GLOBAL DEFAULT  ABS a2_1</span><br><span class="line">     7: 0000000000001225     0 NOTYPE  GLOBAL DEFAULT  ABS a3_1</span><br><span class="line">     8: 0000000000001226     0 NOTYPE  GLOBAL DEFAULT  ABS a4_1</span><br><span class="line">     9: 0000000000001204     0 NOTYPE  GLOBAL DEFAULT    1 a5</span><br></pre></td></tr></table></figure>
+<p>For portability, I only recommend:</p>
+<ul>
+<li><code>sym = .;</code> define a symbol at the current location</li>
+<li><code>. += 4;</code> advance the location counter. This is preferred
+over <code>. = . + 4;</code></li>
+</ul>
+<h3 id="output-section-fill">Output section fill</h3>
+<p>When the <a
+target="_blank" rel="noopener" href="https://sourceware.org/binutils/docs/ld/Output-Section-Fill.html">fill
+pattern</a> is a hexadecimal literal, e.g. 0x90, the pattern is
+automatically replicated to a 32-bit pattern 0x90909090
+(<code>ld/ldexp.c:exp_get_fill</code>). However, this behavior does not
+apply to a decimal literal or an expression.</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">.text : &#123; *(.text) &#125; =0x90        # set the fill pattern to 0x90909090</span><br><span class="line">.text : &#123; *(.text) &#125; =0x90909090  # set the fill pattern to 0x90909090</span><br><span class="line">.text : &#123; *(.text) &#125; =144         # set the fill pattern to 0x00000090</span><br><span class="line">.text : &#123; *(.text) &#125; =0x90+0      # set the fill pattern to 0x00000090</span><br></pre></td></tr></table></figure>
+<p>This behavior makes me puzzled (<a
+target="_blank" rel="noopener" href="https://sourceware.org/bugzilla/show_bug.cgi?id=30865">PR30865</a>).
+ld.lld treats <code>=0x90</code> the same as <code>=144</code>.</p>
+<h3 id="provide"><code>PROVIDE</code></h3>
+<p>In GNU ld, the right hand side of a PROVIDE assignment is processed
+only when the symbol is referenced
+(<code>ld/ldexp.c:exp_fold_tree_1</code>). Therefore, if a symbol is
+only referenced by the right hand side of a PROVIDE assignment, it is
+not considered referenced and <code>PROVIDE</code> will not define
+it.</p>
+<p>For simplicity, <a
+target="_blank" rel="noopener" href="https://github.com/llvm/llvm-project/issues/74771">ld.lld does not
+implement this special rule</a>. <figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">as /dev/null -o a.o</span><br><span class="line"><span class="built_in">cat</span> &gt; a.t &lt;&lt;<span class="string">e</span></span><br><span class="line"><span class="string">SECTIONS &#123;</span></span><br><span class="line"><span class="string">  PROVIDE(f3 = 0x1000);</span></span><br><span class="line"><span class="string">  PROVIDE(f2 = f3);</span></span><br><span class="line"><span class="string">  PROVIDE(f1 = f2);</span></span><br><span class="line"><span class="string">  PROVIDE(foo = f1);</span></span><br><span class="line"><span class="string">&#125;</span></span><br><span class="line"><span class="string">e</span></span><br><span class="line">ld.bfd a.o -T a.t -o a.bfd</span><br><span class="line">ld.lld a.o -T a.t -o a.lld</span><br></pre></td></tr></table></figure> <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line">% readelf -s a.bfd</span><br><span class="line"></span><br><span class="line">Symbol table &#x27;.symtab&#x27; contains 1 entry:</span><br><span class="line">   Num:    Value          Size Type    Bind   Vis      Ndx Name</span><br><span class="line">     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND</span><br><span class="line">% readelf -s a.lld</span><br><span class="line"></span><br><span class="line">Symbol table &#x27;.symtab&#x27; contains 4 entries:</span><br><span class="line">   Num:    Value          Size Type    Bind   Vis      Ndx Name</span><br><span class="line">     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND</span><br><span class="line">     1: 0000000000001000     0 NOTYPE  GLOBAL DEFAULT  ABS f3</span><br><span class="line">     2: 0000000000001000     0 NOTYPE  GLOBAL DEFAULT  ABS f2</span><br><span class="line">     3: 0000000000001000     0 NOTYPE  GLOBAL DEFAULT  ABS f1</span><br></pre></td></tr></table></figure></p>
+<p>GNU ld performs many iterations, but some ports (e.g. x86) do not
+allow too many iterations. <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">% cat chain.t</span><br><span class="line">PROVIDE(f7 = 0x1000);</span><br><span class="line">PROVIDE(f6 = f7);</span><br><span class="line">PROVIDE(f5 = f6);</span><br><span class="line">PROVIDE(f4 = f5);</span><br><span class="line">PROVIDE(f3 = f4);</span><br><span class="line">PROVIDE(f2 = f3);</span><br><span class="line">PROVIDE(f1 = f2);</span><br><span class="line">PROVIDE(newsym = f1);</span><br><span class="line">% ld.bfd a.o -T chain.t</span><br><span class="line">ld.bfd:chain.t:2: undefined symbol `f7&#x27; referenced in expression</span><br></pre></td></tr></table></figure></p>
+<h2 id="note.gnu-stack"><code>.note.GNU-stack</code></h2>
+<p>Linkers create the <code>PT_GNU_STACK</code> program header to
+indicate whether the program stack should be executable.</p>
+<p>By default, GNU ld and gold set the <code>PF_X</code> bit of the
+<code>PT_GNU_STACK</code> program header if one relocatable object file
+does not contain <code>.note.GNU-stack</code>. This behavior can be
+disabled with the configure option
+<code>--enable-default-execstack=no</code>.</p>
+<p>ld.lld ignores <code>.note.GNU-stack</code> and defaults to
+<code>-z noexecstack</code>.</p>
+<ul>
+<li>Arch Linux feature request: <a
+target="_blank" rel="noopener" href="https://bugs.archlinux.org/task/75601">[binutils] Set
+--enable-default-execstack=no configure option</a></li>
+</ul>
+<h2 id="gnu.warning"><code>.gnu.warning</code></h2>
+<p>If an input section named <code>.gnu.warning</code> is included in
+the output, GNU linkers will issue a warning with the message extracted
+from the section's content. <figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">echo</span> <span class="string">&#x27;.globl _start; _start: .section .gnu.warning; .asciz &quot;hello&quot;&#x27;</span> &gt; a.s</span><br><span class="line">gcc -c a.s</span><br><span class="line">ld.bfd a.o  <span class="comment"># a.o: warning: hello</span></span><br></pre></td></tr></table></figure></p>
+<p>If a section from a relocatable object file or shared object is named
+<code>.gnu.warning.$symbol</code>, GNU linkers will record the symbol
+name. If the symbol is referenced by a relocatable object file, they
+will issue a warning. <figure class="highlight sh"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">echo</span> <span class="string">&#x27;.globl _start; _start: .section .gnu.warning._start; .asciz &quot;hello&quot;&#x27;</span> &gt; a.s</span><br><span class="line"><span class="built_in">echo</span> <span class="string">&#x27;call _start; call _start&#x27;</span> &gt; b.s</span><br><span class="line">gcc -c a.s b.s</span><br><span class="line">gcc -shared a.o -o a.so</span><br></pre></td></tr></table></figure> <figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">% ld.bfd a.o b.o</span><br><span class="line">ld.bfd: warning: hello</span><br><span class="line">% gold a.o b.o</span><br><span class="line">b.o(.text+0x1): warning: hello</span><br><span class="line">b.o(.text+0x6): warning: hello</span><br></pre></td></tr></table></figure></p>
+<p>GNU ld will likely scan the symbol table and report a warning for
+each referenced symbol with the warning bit set. gold moves the check to
+relocation scanning and reports a warning for each reference. However,
+this approach introduces some per-relocation overhead.</p>
+<p>ld.lld doesn't implement the feature. It is unclear whether the
+feature is useful. <a
+target="_blank" rel="noopener" href="https://github.com/llvm/llvm-project/issues/41353"
+class="uri">https://github.com/llvm/llvm-project/issues/41353</a></p>
+<p>For GCC and Clang, I think
+<code>__attribute__((deprecated(...)))</code>
+(<code>-Wdeprecated-declarations</code>) is a quite good
+alternative.</p>
+<h2 id="comment"><code>.comment</code></h2>
+<p>ld.lld records linker version information in the section
+<code>.comment</code> for non-relocatable links.</p>
+<p>GNU ld since 2023-03 records the information using the linker script
+directive <code>LINKER_VERSION</code>. External linker script users can
+specify <code>--enable-linker-version</code>.</p>
+<h2 id="misc">Misc</h2>
+<p>I'll also mention some ld.lld release notes which can demonstrate
+some GNU incompatibility in previous versions. (For example, if one
+thing is supported in version N, then the implication is that it is
+unsupported in previous versions. Well, it could be that it worked in
+older versions but regressed at some version. However, I don't know the
+existence of such things.)</p>
+<p>LLD 16.0.0</p>
+<ul>
+<li>Older versions may produce a dynamic relocation in
+<code>.eh_frame</code> when <code>-z notext</code> is specified. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D143136"
+class="uri">https://reviews.llvm.org/D143136</a> switched to a canonical
+PLT entry.</li>
+</ul>
+<p>LLD 12.0.0</p>
+<ul>
+<li><code>-r --gc-sections</code> is supported.</li>
+<li>The archive member extraction semantics of COMMON symbols is by
+default (<code>--fortran-common</code>) compatible with GNU ld. You may
+want to read <a
+target="_blank" rel="noopener" href="https://sourceware.org/pipermail/binutils/2020-August/112878.html">Semantics
+of a common definition in an archive</a> for details. This is
+unfortunate.</li>
+<li><code>.rel[a].plt</code> and <code>.rel[a].dyn</code> get the
+<code>SHF_INFO_LINK</code> flag. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D89828"
+class="uri">https://reviews.llvm.org/D89828</a></li>
+</ul>
+<p>LLD 11.0.0</p>
+<ul>
+<li>ld.lld can discard unused symbols with
+<code>--discard-all</code>/<code>--discard-locals</code> when
+<code>-r</code> or <code>--emit-relocs</code> is specified. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D77807"
+class="uri">https://reviews.llvm.org/D77807</a></li>
+<li><code>--emit-relocs --strip-debug</code> can be used. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D74375"
+class="uri">https://reviews.llvm.org/D74375</a></li>
+<li><code>SHT_GNU_verneed</code> in shared objects are parsed, and
+versioned undefined symbols in shared objects are respected. Previously
+non-default version symbols could cause spurious
+<code>--no-allow-shlib-undefined</code> errors. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D80059"
+class="uri">https://reviews.llvm.org/D80059</a></li>
+<li><code>DF_1_PIE</code> is set for position-independent executables.
+<a target="_blank" rel="noopener" href="https://reviews.llvm.org/D80872"
+class="uri">https://reviews.llvm.org/D80872</a></li>
+<li>Better compatibility related to output section alignments and LMA
+regions. <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D75286">D75286</a> <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D74297">D74297</a> <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D75725">D75724</a> <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D81986">D81986</a></li>
+<li><code>-r</code> allows <code>SHT_X86_64_UNWIND</code> to be merged
+into <code>SHT_PROGBITS</code>. This allows clang/GCC produced object
+files to be mixed together. <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D85785"
+class="uri">https://reviews.llvm.org/D85785</a></li>
+<li>In a input section description, the filename can be specified in
+double quotes. <code>archive:file</code> syntax is added. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D72517"
+class="uri">https://reviews.llvm.org/D72517</a> <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D75100"
+class="uri">https://reviews.llvm.org/D75100</a></li>
+<li>Linker script specified empty
+<code>(.init|.preinit|.fini)_array</code> are allowed with RELRO. <a
+target="_blank" rel="noopener" href="https://reviews.llvm.org/D76915"
+class="uri">https://reviews.llvm.org/D76915</a></li>
+</ul>
+<p>LLD 10.0.0</p>
+<ul>
+<li>ld.lld supports <code>\</code> (treating the next character like a
+non-meta character) and <code>[!...]</code> (negation) in glob patterns.
+<a target="_blank" rel="noopener" href="https://reviews.llvm.org/D66613"
+class="uri">https://reviews.llvm.org/D66613</a></li>
+</ul>
+<p>LLD 9.0.0</p>
+<ul>
+<li>The <code>DF_STATIC_TLS</code> flag is set for i386 and x86-64 when
+initial-exec TLS models are used.</li>
+<li>Many configurations of the Linux kernel's arm32_7, arm64,
+powerpc64le and x86_64 ports can be linked by ld.lld.</li>
+</ul>
+<p>LLD 8.0.0</p>
+<ul>
+<li><code>SHT_NOTE</code> sections get very high ranks (they usually
+precede other sections). <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D55800"
+class="uri">https://reviews.llvm.org/D55800</a></li>
+</ul>
+<p>In the LLD 7.0.0 era, <a target="_blank" rel="noopener" href="https://reviews.llvm.org/D44264"
+class="uri">https://reviews.llvm.org/D44264</a> was my first meaningful
+(albeit trivial) patch to ld.lld. Next I made contribution to
+<code>--warn-backrefs</code>. Then I started to fix tricky issues like
+copy relocations of a versioned symbol, duplicate <code>--wrap</code>,
+and section ranks. I have learned a lot from these code reviews. In the
+8.0.0, 9.0.0 and 10.0.0 era, I have fixed a number of tricky issues and
+improved a dozen of other things and am confident to say that other than
+MIPS ;-) and certain other ISA specific things I am familiar with every
+corner of the code base. These are still challenges such as integration
+of RISC-V style linker relaxation and post-link optimization,
+improvement to some aspects of the linker script, but otherwise ld.lld
+is a stable and finished part of the toolchain.</p>
+<p>A few random notes:</p>
+<ul>
+<li>Symbol resolution can take 10%~20% time. Parallelization can
+theoretically improve the process but it is hard to overstate the
+challenge (if you additionally take into account determinism).</li>
+<li>Be wary of feature creep. I have learned a lot from ELF design
+discussions on generic-abi and from Solaris "linker aliens" in
+particular. I am sorry to say so but some development on ld.lld indeed
+belongs to such categories. Sometimes it is difficult to draw a line
+between unsupported legacy and legacy we have to support.</li>
+<li>ld.lld's adoption is now so large that sometimes a decision (like a
+default value for an option) cannot make everyone happy.</li>
+</ul>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="https://maskray.me/blog/2020-12-19-lld-and-gnu-linker-incompatibilities" data-id="cmklyfnrf009yngin9zwrd7xj" data-title="LLD and GNU linker incompatibilities" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      
+      
+      
+  <ul class="article-tag-list" itemprop="keywords"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/binutils/" rel="tag">binutils</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/linker/" rel="tag">linker</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/blog/tags/llvm/" rel="tag">llvm</a></li></ul>
+
+    </footer>
+  </div>
+  
+    
+<nav id="article-nav">
+  
+    <a href="/blog/2020-12-31-summary" id="article-nav-newer" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">Newer</strong>
+      <div class="article-nav-title">
+        
+          2020年总结
+        
+      </div>
+    </a>
+  
+  
+    <a href="/blog/2020-12-12-c++-exception-handling-abi" id="article-nav-older" class="article-nav-link-wrap">
+      <strong class="article-nav-caption">Older</strong>
+      <div class="article-nav-title">C++ exception handling ABI</div>
+    </a>
+  
+</nav>
+
+  
+</article>
+
+
+<section class="giscus"></section>
+<script src="https://giscus.app/client.js"
+ data-repo="MaskRay/maskray.me"
+ data-repo-id="R_kgDON7L_CQ"
+ data-category="Blog Post Comments"
+ data-category-id="DIC_kwDON7L_Cc4CnDq4"
+ data-mapping="pathname"
+ data-strict="0"
+ data-reactions-enabled="1"
+ data-emit-metadata="0"
+ data-input-position="bottom"
+ data-theme="preferred_color_scheme"
+ data-lang="en"
+ data-loading="lazy"
+ crossorigin="anonymous"
+ async>
+</script>
+
+
+
+
+</section>
+        
+          <aside id="sidebar">
+  
+    
+  <div class="widget-wrap">
+    <h3 class="widget-title">Popular</h3>
+    <div class="widget">
+      <ul class="entry" id="js-popular">
+      </ul>
+    </div>
+  </div>
+
+
+  
+    
+  <div class="widget-wrap">
+    <h3 class="widget-title">Tag Cloud</h3>
+    <div class="widget tagcloud">
+      <a href="/blog/tags/adc/" style="font-size: 10.5px;">adc</a> <a href="/blog/tags/ai9/" style="font-size: 10px;">ai9</a> <a href="/blog/tags/algorithm/" style="font-size: 18.5px;">algorithm</a> <a href="/blog/tags/arm/" style="font-size: 10px;">arm</a> <a href="/blog/tags/asc/" style="font-size: 10px;">asc</a> <a href="/blog/tags/assembler/" style="font-size: 16px;">assembler</a> <a href="/blog/tags/automaton/" style="font-size: 10px;">automaton</a> <a href="/blog/tags/awesome/" style="font-size: 10px;">awesome</a> <a href="/blog/tags/bctf/" style="font-size: 11px;">bctf</a> <a href="/blog/tags/binary/" style="font-size: 11.5px;">binary</a> <a href="/blog/tags/binutils/" style="font-size: 19px;">binutils</a> <a href="/blog/tags/bmc/" style="font-size: 10px;">bmc</a> <a href="/blog/tags/build-system/" style="font-size: 10px;">build system</a> <a href="/blog/tags/c/" style="font-size: 11px;">c</a> <a href="/blog/tags/cpp/" style="font-size: 14.5px;">c++</a> <a href="/blog/tags/ccls/" style="font-size: 11.5px;">ccls</a> <a href="/blog/tags/cgc/" style="font-size: 10px;">cgc</a> <a href="/blog/tags/chroot/" style="font-size: 10px;">chroot</a> <a href="/blog/tags/clang/" style="font-size: 16.5px;">clang</a> <a href="/blog/tags/clang-format/" style="font-size: 10px;">clang-format</a> <a href="/blog/tags/codinsanity/" style="font-size: 10px;">codinsanity</a> <a href="/blog/tags/coffee-script/" style="font-size: 10px;">coffee script</a> <a href="/blog/tags/compiler/" style="font-size: 14px;">compiler</a> <a href="/blog/tags/compression/" style="font-size: 10.5px;">compression</a> <a href="/blog/tags/computer-security/" style="font-size: 10px;">computer security</a> <a href="/blog/tags/contest/" style="font-size: 16px;">contest</a> <a href="/blog/tags/csv/" style="font-size: 10px;">csv</a> <a href="/blog/tags/ctf/" style="font-size: 17.5px;">ctf</a> <a href="/blog/tags/data-structure/" style="font-size: 14px;">data structure</a> <a href="/blog/tags/data-structures/" style="font-size: 10px;">data-structures</a> <a href="/blog/tags/debug/" style="font-size: 12px;">debug</a> <a href="/blog/tags/defcon/" style="font-size: 14px;">defcon</a> <a href="/blog/tags/desktop/" style="font-size: 11px;">desktop</a> <a href="/blog/tags/docker/" style="font-size: 10.5px;">docker</a> <a href="/blog/tags/elf/" style="font-size: 13px;">elf</a> <a href="/blog/tags/emacs/" style="font-size: 15.5px;">emacs</a> <a href="/blog/tags/email/" style="font-size: 11.5px;">email</a> <a href="/blog/tags/emoji/" style="font-size: 10px;">emoji</a> <a href="/blog/tags/emscripten/" style="font-size: 10px;">emscripten</a> <a href="/blog/tags/event/" style="font-size: 10px;">event</a> <a href="/blog/tags/expect/" style="font-size: 11.5px;">expect</a> <a href="/blog/tags/ext4/" style="font-size: 10px;">ext4</a> <a href="/blog/tags/fdpic/" style="font-size: 10px;">fdpic</a> <a href="/blog/tags/feeds/" style="font-size: 10px;">feeds</a> <a href="/blog/tags/firmware/" style="font-size: 10px;">firmware</a> <a href="/blog/tags/floating-point/" style="font-size: 10px;">floating point</a> <a href="/blog/tags/forensics/" style="font-size: 11px;">forensics</a> <a href="/blog/tags/fp/" style="font-size: 10px;">fp</a> <a href="/blog/tags/freebsd/" style="font-size: 10px;">freebsd</a> <a href="/blog/tags/game/" style="font-size: 10.5px;">game</a> <a href="/blog/tags/gcc/" style="font-size: 18px;">gcc</a> <a href="/blog/tags/gdb/" style="font-size: 10px;">gdb</a> <a href="/blog/tags/gentoo/" style="font-size: 10.5px;">gentoo</a> <a href="/blog/tags/git/" style="font-size: 10px;">git</a> <a href="/blog/tags/github/" style="font-size: 10.5px;">github</a> <a href="/blog/tags/glibc/" style="font-size: 16px;">glibc</a> <a href="/blog/tags/graph/" style="font-size: 10px;">graph</a> <a href="/blog/tags/graph-drawing/" style="font-size: 10px;">graph drawing</a> <a href="/blog/tags/gtk/" style="font-size: 10.5px;">gtk</a> <a href="/blog/tags/hacker-culture/" style="font-size: 10px;">hacker culture</a> <a href="/blog/tags/hackerrank/" style="font-size: 10px;">hackerrank</a> <a href="/blog/tags/hanoi/" style="font-size: 10px;">hanoi</a> <a href="/blog/tags/haskell/" style="font-size: 15px;">haskell</a> <a href="/blog/tags/hpc/" style="font-size: 10.5px;">hpc</a> <a href="/blog/tags/image/" style="font-size: 10px;">image</a> <a href="/blog/tags/inotify/" style="font-size: 10px;">inotify</a> <a href="/blog/tags/ipsec/" style="font-size: 10px;">ipsec</a> <a href="/blog/tags/irc/" style="font-size: 12.5px;">irc</a> <a href="/blog/tags/isc/" style="font-size: 10.5px;">isc</a> <a href="/blog/tags/j/" style="font-size: 10px;">j</a> <a href="/blog/tags/javascript/" style="font-size: 12px;">javascript</a> <a href="/blog/tags/josephus-problem/" style="font-size: 10px;">josephus problem</a> <a href="/blog/tags/jq/" style="font-size: 10px;">jq</a> <a href="/blog/tags/kernel/" style="font-size: 11.5px;">kernel</a> <a href="/blog/tags/kythe/" style="font-size: 10px;">kythe</a> <a href="/blog/tags/ld/" style="font-size: 10px;">ld</a> <a href="/blog/tags/leetcode/" style="font-size: 11.5px;">leetcode</a> <a href="/blog/tags/libunwind/" style="font-size: 10px;">libunwind</a> <a href="/blog/tags/linker/" style="font-size: 19.5px;">linker</a> <a href="/blog/tags/linux/" style="font-size: 12.5px;">linux</a> <a href="/blog/tags/lld/" style="font-size: 10.5px;">lld</a> <a href="/blog/tags/lldb/" style="font-size: 10px;">lldb</a> <a href="/blog/tags/llvm/" style="font-size: 20px;">llvm</a> <a href="/blog/tags/lsp/" style="font-size: 13px;">lsp</a> <a href="/blog/tags/m68k/" style="font-size: 10px;">m68k</a> <a href="/blog/tags/makefile/" style="font-size: 12.5px;">makefile</a> <a href="/blog/tags/math/" style="font-size: 10px;">math</a> <a href="/blog/tags/maze/" style="font-size: 11px;">maze</a> <a href="/blog/tags/mirror/" style="font-size: 10px;">mirror</a> <a href="/blog/tags/ml/" style="font-size: 13px;">ml</a> <a href="/blog/tags/musl/" style="font-size: 10px;">musl</a> <a href="/blog/tags/mutt/" style="font-size: 10px;">mutt</a> <a href="/blog/tags/n-body/" style="font-size: 10px;">n-body</a> <a href="/blog/tags/neovim/" style="font-size: 10px;">neovim</a> <a href="/blog/tags/network/" style="font-size: 10.5px;">network</a> <a href="/blog/tags/nginx/" style="font-size: 10px;">nginx</a> <a href="/blog/tags/nim/" style="font-size: 10px;">nim</a> <a href="/blog/tags/nlp/" style="font-size: 10px;">nlp</a> <a href="/blog/tags/node-js/" style="font-size: 11px;">node.js</a> <a href="/blog/tags/noip/" style="font-size: 10px;">noip</a> <a href="/blog/tags/notmuch/" style="font-size: 10px;">notmuch</a> <a href="/blog/tags/npm/" style="font-size: 10px;">npm</a> <a href="/blog/tags/ocaml/" style="font-size: 14.5px;">ocaml</a> <a href="/blog/tags/offlineimap/" style="font-size: 10px;">offlineimap</a> <a href="/blog/tags/oi/" style="font-size: 13px;">oi</a> <a href="/blog/tags/oj/" style="font-size: 10.5px;">oj</a> <a href="/blog/tags/openwrt/" style="font-size: 10px;">openwrt</a> <a href="/blog/tags/parallel/" style="font-size: 10px;">parallel</a> <a href="/blog/tags/parser-generator/" style="font-size: 10px;">parser generator</a> <a href="/blog/tags/performance/" style="font-size: 10.5px;">performance</a> <a href="/blog/tags/perl/" style="font-size: 10px;">perl</a> <a href="/blog/tags/powerpc/" style="font-size: 10px;">powerpc</a> <a href="/blog/tags/presentation/" style="font-size: 10.5px;">presentation</a> <a href="/blog/tags/puzzle/" style="font-size: 10.5px;">puzzle</a> <a href="/blog/tags/python/" style="font-size: 13px;">python</a> <a href="/blog/tags/qq/" style="font-size: 10.5px;">qq</a> <a href="/blog/tags/radare2/" style="font-size: 10px;">radare2</a> <a href="/blog/tags/regex/" style="font-size: 10.5px;">regex</a> <a href="/blog/tags/regular-expression/" style="font-size: 10px;">regular expression</a> <a href="/blog/tags/release/" style="font-size: 14px;">release</a> <a href="/blog/tags/reverse-engineering/" style="font-size: 11px;">reverse engineering</a> <a href="/blog/tags/review/" style="font-size: 10px;">review</a> <a href="/blog/tags/riscv/" style="font-size: 11px;">riscv</a> <a href="/blog/tags/router/" style="font-size: 10px;">router</a> <a href="/blog/tags/rtld/" style="font-size: 10px;">rtld</a> <a href="/blog/tags/ruby/" style="font-size: 11.5px;">ruby</a> <a href="/blog/tags/ructfe/" style="font-size: 10px;">ructfe</a> <a href="/blog/tags/s390x/" style="font-size: 10px;">s390x</a> <a href="/blog/tags/sanitizer/" style="font-size: 11.5px;">sanitizer</a> <a href="/blog/tags/scheme/" style="font-size: 10px;">scheme</a> <a href="/blog/tags/search/" style="font-size: 10px;">search</a> <a href="/blog/tags/security/" style="font-size: 17px;">security</a> <a href="/blog/tags/sframe/" style="font-size: 10.5px;">sframe</a> <a href="/blog/tags/shell/" style="font-size: 10.5px;">shell</a> <a href="/blog/tags/ssh/" style="font-size: 10px;">ssh</a> <a href="/blog/tags/stringology/" style="font-size: 11.5px;">stringology</a> <a href="/blog/tags/student-festival-puzzle/" style="font-size: 10px;">student festival puzzle</a> <a href="/blog/tags/suffix-array/" style="font-size: 10px;">suffix array</a> <a href="/blog/tags/suffix-automaton/" style="font-size: 10px;">suffix automaton</a> <a href="/blog/tags/summary/" style="font-size: 14.5px;">summary</a> <a href="/blog/tags/suricata/" style="font-size: 10px;">suricata</a> <a href="/blog/tags/telegram/" style="font-size: 10px;">telegram</a> <a href="/blog/tags/telegramircd/" style="font-size: 10px;">telegramircd</a> <a href="/blog/tags/terminal/" style="font-size: 10.5px;">terminal</a> <a href="/blog/tags/tls/" style="font-size: 10px;">tls</a> <a href="/blog/tags/travel/" style="font-size: 10px;">travel</a> <a href="/blog/tags/traversal/" style="font-size: 10.5px;">traversal</a> <a href="/blog/tags/tree/" style="font-size: 10.5px;">tree</a> <a href="/blog/tags/trendmicro/" style="font-size: 10px;">trendmicro</a> <a href="/blog/tags/udev/" style="font-size: 10px;">udev</a> <a href="/blog/tags/unicode/" style="font-size: 10px;">unicode</a> <a href="/blog/tags/unix/" style="font-size: 10px;">unix</a> <a href="/blog/tags/usb/" style="font-size: 10px;">usb</a> <a href="/blog/tags/vim/" style="font-size: 10px;">vim</a> <a href="/blog/tags/vpn/" style="font-size: 10px;">vpn</a> <a href="/blog/tags/vte/" style="font-size: 10.5px;">vte</a> <a href="/blog/tags/wargame/" style="font-size: 10.5px;">wargame</a> <a href="/blog/tags/web-analytics/" style="font-size: 10px;">web analytics</a> <a href="/blog/tags/webqqircd/" style="font-size: 10.5px;">webqqircd</a> <a href="/blog/tags/website/" style="font-size: 13.5px;">website</a> <a href="/blog/tags/wechat/" style="font-size: 11.5px;">wechat</a> <a href="/blog/tags/wechatircd/" style="font-size: 11px;">wechatircd</a> <a href="/blog/tags/window-manager/" style="font-size: 10px;">window manager</a> <a href="/blog/tags/windows/" style="font-size: 10px;">windows</a> <a href="/blog/tags/x86/" style="font-size: 10.5px;">x86</a> <a href="/blog/tags/xbindkeys/" style="font-size: 10px;">xbindkeys</a> <a href="/blog/tags/xmonad/" style="font-size: 10.5px;">xmonad</a> <a href="/blog/tags/xz/" style="font-size: 10px;">xz</a> <a href="/blog/tags/yanshi/" style="font-size: 10px;">yanshi</a>
+    </div>
+  </div>
+
+  
+    <div class="widget-wrap">
+  <h3 class="widget-title">Blogroll</h3>
+  <div class="widget">
+    <ul>
+      <li><a href='https://byvoid.com' rel='friend' target='_blank'>BYVoid</a></li>
+      <li><a href='https://fqj.me' rel='friend' target='_blank'>fqj1994</a></li>
+      <li><a href='http://ppwwyyxx.com' rel='friend' target='_blank'>ppwwyyxx</a></li>
+    </ul>
+  </div>
+</div>
+
+  
+</aside>
+        
+      </div>
+      <footer id="footer">
+  
+  <div class="outer">
+    <div id="footer-info" class="inner">
+      
+      &copy; 2026 MaskRay<br>
+      Powered by <a href="https://hexo.io/" target="_blank">Hexo</a>
+    </div>
+  </div>
+</footer>
+
+    </div>
+    <nav id="mobile-nav">
+  
+    <a href="/blog/" class="mobile-nav-link">Home</a>
+  
+    <a href="/blog/archives/" class="mobile-nav-link">Archives</a>
+  
+    <a href="/blog/../feeds/" class="mobile-nav-link">Feeds</a>
+  
+    <a href="/blog/../til/" class="mobile-nav-link">TIL</a>
+  
+    <a href="/blog/../presentations/" class="mobile-nav-link">Presentations</a>
+  
+</nav>
+    
+
+
+<script src="/blog/js/jquery-3.6.4.min.js"></script>
+
+
+
+  
+<script src="/blog/fancybox/jquery.fancybox.min.js"></script>
+
+
+
+
+<script src="/blog/js/script.js"></script>
+
+
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-C3HG5LHWPX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-C3HG5LHWPX');
+</script>
+<!-- End Google Analytics -->
+
+
+
+<script src="/js/popular.js"></script>
+
+  </div>
+</body>
+</html>

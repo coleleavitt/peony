@@ -1,0 +1,13 @@
+[package]
+name = "peony-symbols"
+description = "Global symbol table: resolution, versioning, weak/strong rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peony-object      = { path = "../peony-object" }
+rustc-hash.workspace = true
+rayon.workspace      = true
+thiserror.workspace  = true
+tracing.workspace    = true

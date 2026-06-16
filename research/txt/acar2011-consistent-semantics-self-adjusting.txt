@@ -1,0 +1,3910 @@
+A Consistent Semantics of Self-Adjusting Computation
+Umut A. Acar∗
+
+Matthias Blume†
+
+Jacob Donham‡
+
+arXiv:1106.0478v1 [cs.PL] 2 Jun 2011
+
+June 2011
+
+Abstract
+This paper presents a semantics of self-adjusting computation and proves that the semantics are correct and consistent. The semantics integrate change propagation with the classic
+idea of memoization to enable reuse of computations under mutation to memory. During evaluation, reuse of a computation via memoization triggers a change propagation that adjusts the
+reused computation to reflect the mutated memory. Since the semantics integrate memoization
+and change-propagation, it involves both non-determinism (due to memoization) and mutation (due to change propagation). Our consistency theorem states that the non-determinism
+is not harmful: any two evaluations of the same program starting at the same state yield the
+same result. Our correctness theorem states that mutation is not harmful: self-adjusting programs are consistent with purely functional programming. We formalize the semantics and
+their meta-theory in the LF logical framework and machine check our proofs using Twelf.
+
+1
+
+Introduction
+
+Many applications operate on data that changes over time. Self-adjusting computation is a technique that enables program to respond to changes to their data (e.g., inputs/arguments, external
+state, or outcome of tests). Advances on self-adjusting computation show that it can speed up response times by orders of magnitude over recomputing from scratch, closely matching best-known
+(problem-specific) algorithms both in theory and in practice (e.g., [3]). More recent results show
+that the approach can even enable solving challenging open problems that have resisted traditional
+algorithmic approaches (e.g. [7, 6]).
+Key to effectiveness of self-adjusting computation is a technique that integrates change propagation [4], and the classic idea of memoization [17]. Due to an interesting duality between memoization and change propagation, combining them turns out to be crucial for efficiency. This
+technique was first developed in two previously published conference papers. One paper focused
+on algorithmic, implementation, and experimental aspects (journal version [3]). The other formal
+∗
+
+Max-Planck Institute for Software Systems
+Google Inc.
+‡
+Twitter Inc.
+†
+
+1
+
+on the formal aspects and the semantics [5]; this paper is a full version of that conference paper,
+which it extends by providing full, machine-checked proofs. After its publication, the approach
+proposed in this paper has essentially served as the foundation for many of the followup work
+on self-adjusting computation. It has been implemented as a Standard ML library [3] and generalized to support imperative references [2]. These results set the stage for the development of
+the CEAL [11] and Delta ML, which provide direct language support for self-adjusting computation [15].
+Integrating change propagation and memoization poses a major challenge because the techniques are far from being orthogonal: memoization traditionally requires purely functional programming, whereas change propagation is destructive and critically relies on mutation. Here, we
+overcome this challenge by presenting a general semantic framework that integrates them. We
+model memoization as a non-deterministic oracle; this ensures that the semantics apply to many
+different ways in which memoization can be realized. We prove two main theorems stating that
+the semantics are consistent and correct (Section 3). The consistency theorem states that the nondeterminism (due to memoization) is harmless by showing that any two evaluations of the same
+program in the same store yield the same result. The correctness theorem states that self-adjusting
+computation is consistent with purely functional programming by showing that evaluation returns
+the (observationally) same value as a purely functional evaluation. Our proofs do not make any
+assumptions about typing. Our results therefore apply in both typed and untyped settings.
+To study the semantics we extend the adaptive functional language AFL [4], which support
+change propagation, with a construct for memoization. We call this language AML (Section 2).
+The dynamic semantics of AML are store-based. Mutation to the store between successive evaluations models incremental changes to the input. The evaluation of an AML program also allocates
+store locations and updates existing locations. A memoized expression is evaluated by first consulting the memo-oracle, which non-deterministically returns either a miss or a hit. In evaluation,
+a hit returns a trace of the evaluation of the memoized expression, which is recursively adapted to
+mutations by performing a change propagation on the returned trace. Intuitively, the idea is to reuse computations (represented via traces) themselves and recursively perform change propagation
+on re-used computations to adapt them according to mutations. This contrasts with conventional
+memoization where results of computations are re-used in a purely functional (mutation free) setting.
+The proofs for the correctness and consistency theorems (Section 3) are made challenging because the semantics consist of a complex set of judgments (where change propagation and ordinary
+evaluation are mutually recursive), and because the semantics involve mutation and two kinds of
+non-determinism: non-determinism in memory allocation, and non-determinism due to memoization. Due to mutation, we are required to prove that evaluation preserves certain well-formedness
+properties (e.g., absence of cycles and dangling pointers). Due to non-deterministic memory allocation, we cannot compare the results from different evaluations directly. Instead, we compare values structurally by comparing the contents of locations. To address non-determinism due to memoization, we allow evaluation to recycle existing memory locations. Based on these techniques, we
+first prove that memoization is harmless: for any evaluation there exists a memoization-free counterpart that yields the same result without reusing any computations. Based on structural equality,
+
+2
+
+we then show that memoization-free evaluations and fully deterministic evaluations are equivalent.
+These proof techniques may be of independent interest.
+To increase confidence in our results, we encoded the syntax and semantics of AML and its
+meta-theory in the LF logical framework [12] and machine-checked the proofs using Twelf [18]
+(Section 5). The Twelf formalization consist of 7800 lines of code. The Twelf code is fully
+foundational: it encodes all background structures required by the proof and proves all lemmas
+from first principles. We include the full Twelf code in the appendix (Appendix A). We note that
+checking the proofs in Twelf was not a merely an encoding exercise. In fact, our initial attempts
+at producing a paper-and-pencil proof have failed. The process of creating and checking the proof
+mechanically in Twelf allowed us to come up with the proof, while also helping us simplify the
+rule systems and generalize the proof to untyped languages. We therefore feel that the use of Twelf
+was critical to this result.
+Since the semantics model memoization as a non-deterministic oracle, and since it does not
+specify how the memory should be allocated while allowing pre-existing locations to be recycled,
+the dynamic semantics of AML do not translate to an algorithm directly. In Section 6, we describe
+some implementation strategies for realizing the AML semantics.
+
+2
+
+The Language
+
+We describe a language, called AML, that combines the features of an adaptive functional language (AFL) [4] with memoization. The syntax of the language extends that of AFL with memo
+constructs for memoizing expressions. The dynamic semantics integrate change propagation and
+evaluation to ensure correct reuse of computations under mutations. As explained before, our results do not rely on typing properties of AML. We therefore omit a type system but identify a
+minimal set of conditions under which evaluation is consistent. In addition to the memoizing and
+change-propagating dynamic semantics, we give a pure interpretation of AML that provides no
+reuse of computations.
+
+2.1
+
+Abstract syntax
+
+The abstract syntax of AML is given in Figure 1. We use meta-variables x, y, and z (and variants)
+to range over an unspecified set of variables, and meta-variable l (and variants) to range over
+a separate, unspecified set of locations—the locations are modifiable references. The syntax of
+AML is restricted to “2/3-cps”, or “named form”, to streamline the presentation of the dynamic
+semantics.
+Expressions are classified into three categories: values, stable expressions, and changeable
+expressions. Values are constants, variables, locations, and the introduction forms for sums, products, and functions. The value of a stable expression is not sensitive to modifications to the inputs,
+whereas the value of a changeable expression may directly or indirectly be affected by them.
+The familiar mechanisms of functional programming are embedded in AML as stable expressions. Stable expressions include the let construct, the elimination forms for products and sums,
+stable-function applications, and the creation of new modifiables. A stable function is a function
+3
+
+Values
+
+v
+
+Prim. Op.
+
+o
+
+: : = () | n | x | l | (v1 , v2 ) | inl v | inr v |
+funs f (x) is es | func f (x) is ec
+: : = not | + | - | = | < | . . .
+
+Exp.
+
+e
+
+: : = es | ec
+
+St. Exp.
+
+es
+
+: : = v | o(v1 , . . . , vn ) | mod ec | memos es | applys (v1 , v2 ) |
+let x = es in e0s | let x1 ×x2 = v in es |
+case v of inl (x1 ) ⇒ es | inr (x2 ) ⇒ e0s end
+
+Ch. Exp.
+
+ec
+
+: : = write(v) | read v as x in ec | memoc ec | applyc (v1 , v2 ) |
+let x = es in ec | let x1 ×x2 = v in ec |
+case v of inl (x1 ) ⇒ ec | inr (x2 ) ⇒ e0c end
+
+Program
+
+p
+
+: : = es
+
+Figure 1: The abstract syntax of AML.
+whose body is a stable expression. The application of a stable function is a stable expression. The
+expression mod ec allocates a modifiable reference and initializes it by executing the changeable
+expression ec . Note that the modifiable itself is stable, even though its contents is subject to change.
+A memoized stable expression is written memos es .
+Changeable expressions always execute in the context of an enclosing mod-expression that
+provides the implicit target location that every changeable expression writes to. The changeable
+expression write(v) writes the value v into the target. The expression read v as x in ec
+binds the contents of the modifiable v to the variable x, then continues evaluation of ec . A read
+is considered changeable because the contents of the modifiable on which it depends is subject to
+change. A changeable function is a function whose body is a changeable expression. A changeable
+function is stable as a value. The application of a changeable function is a changeable expression.
+A memoized changeable expression is written memoc ec . The changeable expressions include the
+let expression for ordering evaluation and the elimination forms for sums and products. These
+differ from their stable counterparts because their bodies consists of changeable expressions.
+
+2.2
+
+Stores, well-formed expressions, and lifting
+
+Evaluation of an AML expression takes place in the context of a store, written σ (and variants),
+defined as a finite map from locations l to values v. We write dom(σ) for the domain of a store,
+and σ(l) for the value at location l, provided l ∈ dom(σ). We write σ[l ← v] to denote the
+extension of σ with a mapping of l to v. If l is already in the domain of σ, then the extension
+replaces the previous mapping.
+
+v
+if l = l0
+0
+σ[l ← v](l ) =
+σ(l0 ) if l 6= l0 and l0 ∈ dom(σ)
+dom(σ[l ← v]) = dom(σ) ∪ {l}
+We say that an expression e is well-formed in store σ if 1) all locations reachable from e in σ
+4
+
+v ∈ {(), n, x}
+wf
+v, σ −→ v, ∅
+
+wf
+wf
+wf
+l ∈ dom(σ) σ(l), σ −→ v, L v1 , σ −→ v10 , L1 v2 , σ −→ v20 , L2
+wf
+wf
+l, σ −→ v, {l} ∪ L
+(v1 , v2 ), σ −→ (v10 , v20 ), L1 ∪ L2
+
+wf
+wf
+wf
+ec , σ −→ e0c , L
+v, σ −→ v 0 , L
+v, σ −→ v 0 , L
+wf
+wf
+wf
+mod ec , σ −→ mod e0c , L in{l,r} v, σ −→ in{l,r} v 0 , L write(v), σ −→ write(v 0 ), L
+wf
+e, σ −→ e0 , L
+wf
+fun{s,c} f (x) is e, σ −→ fun{s,c} f (x) is e0 , L
+wf
+wf
+v1 , σ −→ v10 , L1 · · · vn , σ −→ vn0 , Ln
+wf
+o(v1 , . . . , vn ), σ −→ o(v10 , . . . , vn0 ), L1 ∪ · · · ∪ Ln
+wf
+wf
+v1 , σ −→ v10 , L1 v2 , σ −→ v20 , L2
+wf
+apply{s,c} (v1 , v2 ), σ −→ apply{s,c} (v10 , v20 ), L1 ∪ L2
+wf
+wf
+e1 , σ −→ e01 , L e2 , σ −→ e02 , L0
+wf
+let x = e1 in e2 , σ −→ let x = e01 in e02 , L ∪ L0
+wf
+wf
+v, σ −→ v 0 , L e, σ −→ e0 , L0
+wf
+let x1 ×x2 = v in e, σ −→ let x1 ×x2 = v 0 in e0 , L ∪ L0
+wf
+v, σ −→ v 0 , L
+
+wf
+e1 , σ −→ e01 , L1
+
+wf
+e2 , σ −→ e02 , L2
+wf
+(case v of inl (x1 ) ⇒ e1 | inr (x2 ) ⇒ e2 end), σ −→
+(case v 0 of inl (x1 ) ⇒ e01 | inr (x2 ) ⇒ e02 end), L ∪ L1 ∪ L2
+wf
+e, σ −→ e0 , L
+wf
+memo{s,c} e, σ −→ memo{s,c} e0 , L
+wf
+wf
+v, σ −→ v 0 , L ec , σ −→ e0c , L0
+wf
+read v as x in ec , σ −→ read v 0 as x in e0c , L ∪ L0
+
+Figure 2: Well-formed expressions and lifts.
+
+5
+
+are in dom(σ) (“no dangling pointers”), and 2) the portion of σ reachable from e is free of cycles.
+If e is well-formed in σ, then we can obtain a “lifted” expression e0 by recursively replacing every
+reachable location l with its stored value σ(l). The notion of lifting will be useful in the formal
+statement of our main theorems (Section 3).
+wf
+We use the judgment e, σ −→ e0 , L to say that e is well-formed in σ, that e0 is e lifted in σ,
+and that L is the set of locations reachable from e in σ. The rules for deriving such judgments are
+shown in Figure 2. Any finite derivation of such a judgment implies well-formedness of e in σ.
+We will use two notational shorthands for the rest of the paper: by writing e ↑ σ or reach (e, σ)
+we implicitly assert that there exist a location-free expression e0 and a set of locations L such that
+wf
+e, σ −→ e0 , L. The notation e ↑ σ itself stands for the lifted expression e0 , and reach (e, σ) stands
+for the set of reachable locations L. It is easy to see that e and σ uniquely determine e ↑ σ and
+reach (e, σ) (if they exist).
+
+2.3
+
+Dynamic semantics
+
+The evaluation judgments of AML (Figures 5 and 6) consist of separate judgments for stable and
+changeable expressions. The judgment σ, e ⇓s v, σ 0 , Ts states that evaluation of the stable expression e relative to the input store σ yields the value v, the trace Ts , and the updated store σ 0 .
+Similarly, the judgment σ, l ← e ⇓c σ 0 , Tc states that evaluation of the changeable expression e
+relative to the input store σ writes its value to the target l, and yields the trace Tc together with the
+updated store σ 0 .
+A trace records the adaptive aspects of evaluation. Like the expressions whose evaluations they
+describe, traces come in stable and changeable varieties. The abstract syntax of traces is given by
+the following grammar:
+Stable
+Ts : : =  | mod l ← Tc | let Ts Ts
+Changeable Tc : : = write v | let Ts Tc | readl→x=v.e Tc
+A stable trace records the sequence of allocations of modifiables that arise during the evaluation of
+a stable expression. The trace mod l ← Tc records the allocation of the modifiable l and the trace
+of the initialization code for l. The trace let Ts T0s results from evaluating a let expression in
+stable mode, the first trace resulting from the bound expression, the second from its body.
+A changeable trace has one of three forms. A write, write v, records the storage of the value
+v in the target. A sequence let Ts Tc records the evaluation of a let expression in changeable
+mode, with Ts corresponding to the bound stable expression, and Tc corresponding to its body. A
+read readl→x=v.e Tc specifies the location read (l), the value read (v), the context of use of its
+value (x.e) and the trace (Tc ) of the remainder of the evaluation within the scope of that read. This
+records the dependency of the target on the value of the location read.
+
+6
+
+σ, l ← ec ⇓c σ 0 , T
+alloc (T) ∩ reach (ec , σ) = ∅
+l 6∈ reach (ec , σ) ∪ alloc (T)
+(valid/c)
+σ, l ← e ⇓c σ 0 , T
+
+σ, es ⇓s v, σ 0 , T
+alloc (T) ∩ reach (es , σ) = ∅
+(valid/s)
+σ, e ⇓s v, σ 0 , T
+s
+
+c
+
+ok
+
+ok
+
+Figure 3: Valid evaluations.
+We define the set of allocated locations of a trace T, denoted alloc (T), as follows:
+alloc ()
+alloc (write v)
+alloc (mod l ← Tc )
+alloc (let T1 T2 )
+alloc (readl→x=v.e Tc )
+
+=
+=
+=
+=
+=
+
+∅
+∅
+{l} ∪ alloc (Tc )
+alloc (T1 ) ∪ alloc (T2 )
+alloc (Tc )
+
+For example, if Tsample = let (mod l1 ← write 2) (readl1 →x=2.e write 3), then alloc (Tsample ) =
+{l1 }.
+Well-formedness, lifts, and primitive operations. We require that primitive operations preserve well-formedness. In other words, when a primitive operation is applied to some arguments,
+it does not create dangling pointers or cycles in the store, nor does it extend the set of locations
+reachable from the argument. Formally, this property can be states as follows.
+wf
+If ∀i.vi , σ −→ vi0 , Li and v = o(v1 , . . . , vn ),
+S
+wf
+then v, σ −→ v 0 , L such that L ⊆ ni=1 Li .
+
+Moreover, no AML operation is permitted to be sensitive to the identity of locations. In the
+case of primitive operations we formalize this by postulating that they commute with lifts:
+wf
+If ∀i.vi , σ −→ vi0 , Li and v = o(v1 , . . . , vn ),
+wf
+then v, σ −→ v 0 , L such that v 0 = o(v10 , . . . , vn0 ).
+
+In short this can be stated as o(v1 ↑ σ, . . . , vn ↑ σ) = (o(v1 , . . . , vn )) ↑ σ.
+For example, all primitive operations that operate only on non-location values preserve well
+formedness and commute with lifts.
+Valid evaluations. We consider only evaluations of well-formed expressions e in stores σ,
+i.e., those e and σ where e ↑ σ and reach (e, σ) are defined. Well-formedness is critical for
+proving correctness: the requirement that the reachable portion of the store is acyclic ensures that
+the approach is consistent with purely functional programming, the requirement that all reachable
+locations are in the store ensures that evaluations do not cause disaster by allocating a “fresh”
+location that happens to be reachable. We note that it is possible to omit the well-formedness
+requirement by giving a type system and a type safety proof. This approach limits the applicability
+7
+
+σ, es ↑
+
+s (miss/s)
+
+(miss/c)
+σ, ec ↑c
+
+0
+σ0 , es ⇓s
+ok v, σ0 , T
+(hit/s)
+σ, e ↓s v, T
+s
+
+0
+σ0 , l ← ec ⇓c
+ok σ0 , T
+(hit/c)
+σ, e ↓c T
+c
+
+Figure 4: The oracle.
+of the theorem only to type-safe programs. Because of the imperative nature of the dynamic
+semantics, a type safety proof for AML is also complicated. We therefore choose to formalize
+well-formedness separately.
+Our approach requires showing that evaluation preserves well-formedness. To establish wellformedness inductively, we define valid evaluations. We say that an evaluation of an expression e
+in the context of a store σ is valid, if
+1. e is well-formed in σ,
+2. the locations allocated during evaluation are disjoint from locations that are initially reachable from e (i.e., those that are in reach (e, σ)), and
+3. the target location of a changeable evaluation is contained neither in reach (e, σ) nor the
+locations allocated during evaluation.
+s and ⇓c instead of ⇓c to indicate valid stable and changeable
+We use ⇓s
+ok
+ok instead of ⇓
+evaluations, respectively. The rules for deriving valid evaluation judgments are shown in Figure 3.
+The Oracle. The dynamic semantics for AML use an oracle to model memoization. Figure 4
+shows the evaluation rules for the oracle. For a stable or a changeable expression e, we write
+an oracle miss as σ, e ↑s or σ, l ← ec ↑c , respectively. The treatment of oracle hits depend on
+whether the expression is stable or changeable. For a stable expression, it returns the value and the
+trace of a valid evaluation of the expression in some store. For a changeable expression, the oracle
+returns a trace of a valid evaluation of the expression in some store with some destination.
+The key difference between the oracle and conventional approaches to memoization is that
+the oracle is free to return the trace (and the value, for stable expressions) of a computation that
+is consistent with any store—not necessarily with the current store. Since the evaluation whose
+results are being returned by the oracle can take place in a different store than the current store,
+the trace and the value (if any) returned by the oracle cannot be incorporated into the evaluation
+directly. Instead, the dynamic semantics perform a change propagation on the trace returned by
+the oracle before incorporating it into the current evaluation (this is described below).
+Stable Evaluation. Figure 5 shows the evaluation rules for stable expressions. Most rules are
+standard for a store-passing semantics except that they also return traces. The interesting rules are
+those for let, mod, and memo.
+
+8
+
+v = app(o, (v1 , . . . , vn ))
+(prim.’s)
+σ, o(v1 , . . . , vn ) ⇓s v, σ, ε
+l 6∈ alloc (T)
+σ, l ← e ⇓c σ 0 , T
+(mod)
+σ, mod e ⇓s l, σ 0 , mod l ← T
+σ, e ↓s v, T
+σ, e ↑s
+s
+σ, e ⇓s v, σ 0 , T
+σ, T y σ 0 , T0
+(memo/miss)
+(memo/hit)
+σ, memos e ⇓s v, σ 0 , T
+σ, memos e ⇓s v, σ 0 , T0
+v1 = funs f (x) is e
+σ, [v1 /f, v2 /x] e ⇓s v, σ 0 , T
+(apply)
+σ, applys (v1 , v2 ) ⇓s v, σ 0 , T
+σ, e1 ⇓s v1 , σ1 , T1 σ1 , [v1 /x] e2 ⇓s v2 , σ2 , T2 alloc (T1 ) ∩ alloc (T2 ) = ∅
+(let)
+σ, let x = e1 in e2 ⇓s v2 , σ2 , let T1 T2
+σ, [v1 /x1 , v2 /x2 ] e
+⇓s v, σ 0 , T
+(let×)
+σ, let x ×x = (v , v ) in e ⇓s v, σ 0 , T
+(value)
+σ, v ⇓s v, σ, ε
+
+1
+
+2
+
+1
+
+2
+
+σ, [v/x1 ] e1 ⇓s v 0 , σ 0 , T
+(case/inl)
+σ, case inl v of inl (x1 ) ⇒ e1 | inr (x2 ) ⇒ e2 end ⇓s v 0 , σ 0 , T
+σ, [v/x2 ] e2 ⇓s v 0 , σ 0 , T
+(case/inr)
+σ, case inr v of inl (x1 ) ⇒ e1 | inr (x2 ) ⇒ e2 end ⇓s v 0 , σ 0 , T
+
+Figure 5: Evaluation of stable expressions.
+
+9
+
+(write)
+σ, l ← write(v) ⇓c σ[l ← v], write v
+σ, l ← [σ(l0 )/x] e ⇓c σ 0 , T
+(read)
+σ, l ← read l0 as x in e ⇓c σ 0 , readl0 →x=σ(l0 ).e T
+σ, e ↓c T
+σ, e ↑c
+c
+σ, l ← T y σ 0 , T0
+σ, e ⇓c σ 0 , T
+(memo/miss)
+(memo/hit)
+σ, l ← memoc e ⇓c σ 0 , T
+σ, l ← memoc e ⇓c σ 0 , T0
+v1 = func f (x) is e
+σ, l ← [v1 /f, v2 /x] e ⇓c σ 0 , T
+(apply)
+σ, l ← applyc (v1 , v2 ) ⇓c σ 0 , T
+σ, e1 ⇓s v, σ1 , T1 σ1 , l ← [v/x] e2 ⇓c σ2 , T2 alloc (T1 ) ∩ alloc (T2 ) = ∅
+(let)
+σ, l ← let x = e1 in e2 ⇓c σ2 , let T1 T2
+σ, l ← [v1 /x1 , v2 /x2 ] e ⇓c σ 0 , T
+(let×)
+σ, l ← let x ×x = (v , v ) in e ⇓c σ 0 , T
+1
+
+2
+
+1
+
+2
+
+σ, l ← [v/x1 ] e1 ⇓c σ 0 , T
+(case/inl)
+σ, l ← case inl v of inl (x1 ) ⇒ e1 | inr (x2 ) ⇒ e2 end ⇓c σ 0 , T
+σ, l ← [v/x2 ] e2 ⇓c σ 0 , T
+(case/inr)
+σ, case inr v of inl (x1 ) ⇒ e1 | inr (x2 ) ⇒ e2 end ⇓c σ 0 , T
+
+Figure 6: Evaluation of changeable expressions.
+The let rule sequences evaluation of its two expressions, performs binding by substitution,
+and yields a trace consisting of the sequential composition of the traces of its sub-expressions. For
+the traces to be well-formed, the rule requires that they allocate disjoint sets of locations. The mod
+rule allocates a location l, adds it to the store, and evaluates its body (a changeable expression)
+with l as the target. To ensure that l is not allocated multiple times, the rule requires that l is not
+allocated in the trace of the body. Note that the allocated location does not need to be fresh—it can
+already be in the store, i.e., l ∈ dom(σ). Since every changeable expression ends with a write, it
+is guaranteed that an allocated location is written before it can be read.
+The memo rule consults an oracle to determine if its body should be evaluated or not. If the
+oracle returns a miss, then the body is evaluated as usual and the value, the store, and the trace
+obtained via evaluation is returned. If the oracle returns a hit, then it returns a value v and a trace
+T. To adapt the trace to the current store σ, the evaluation performs a change propagation on T in
+σ and returns the value v returned by the oracle, and the trace and the store returned by change
+propagation. Note that since change propagation can change the contents of the store, it can also
+indirectly change the (lifted) contents of v.
+Changeable Evaluation. Figure 6 shows the evaluation rules for changeable expressions.
+Evaluations in changeable mode perform destination passing. The let, memo, apply rules
+are similar to the corresponding rules in stable mode except that the body of each expression
+10
+
+alloc (T0 )
+
+(empty)
+s
+σ, ε y σ, ε
+
+6∈
+c
+σ, l ← T y σ 0 , T0
+(write)
+(mod)
+s
+c
+σ, mod l ← T y σ 0 , mod l ← T0
+σ, l ← write v y σ[l ← v], write v
+s
+c
+σ, T1
+y
+σ 0 , T01
+σ, T1
+y
+σ 0 , T01
+s
+c
+σ 0 , T2 y
+σ 00 , T02
+σ 0 , l ← T2 y
+σ 00 , T02
+alloc (T01 ) ∩ alloc (T02 ) = ∅
+alloc (T01 ) ∩ alloc (T02 ) = ∅
+(let/s)
+(let/c)
+s
+c
+σ, let T1 T2 y σ 00 , let T01 T02
+σ, l ← (let T1 T2 ) y σ 00 , (let T01 T02 )
+c
+σ(l0 ) = v
+σ, l ← T y σ 0 , T0
+(read/no ch.)
+c
+σ, l ← readl0 →v=x.e T y σ 0 , readl0 →v=x.e T0
+σ(l0 ) 6= v
+σ, l ← [σ(l0 )/x]e ⇓c σ 0 , T0
+(read/ch.)
+c
+σ, l ← readl0 →x=v.e T y σ 0 , readl0 →x=σ(l0 ).e T0
+l
+
+Figure 7: Change propagation judgments.
+is evaluated in changeable mode. The read expression substitutes the value stored in σ at the
+location being read l0 for the bound variable x in e and continues evaluation in changeable mode.
+A read is recorded in the trace, along with the value read, the variable bound, and the body of the
+read. A write simply assigns its argument to the target in the store. The evaluation of memoized
+changeable expressions is similar to that of stable expressions.
+Change propagation. Figure 7 shows the rules for change propagation. As with evaluation
+rules, change-propagation rules are partitioned into stable and changeable, depending on the kind
+s
+of the trace being processed. The stable change-propagation judgment σ, Ts y σ 0 , T0s states that
+change propagating into the stable trace Ts in the context of the store σ yields the store σ 0 and the
+c
+stable trace T0s . The changeable change-propagation judgment σ, l ← Tc y σ 0 , T0c states that
+change propagation into the changeable trace Tc with target l in the context of the store σ yields
+the changeable trace T0c and the store σ 0 . The change propagation rules mimic evaluation by either
+skipping over the parts of the trace that remain the same in the given store or by re-evaluating the
+reads that read locations whose values are different in the given store. The rules are labeled with
+the expression forms they mimic.
+If the trace is empty, change propagation returns an empty trace and the same store. The mod
+rule recursively propagates into the trace T for the body to obtain a new trace T0 and returns a
+trace where T is substituted by T0 under the condition that the target l is not allocated in T0 . This
+condition is necessary to ensure the allocation integrity of the returned trace. The stable let rule
+propagates into its two parts T1 and T2 recursively and returns a trace by combining the resulting
+traces T01 and T02 provided that the resulting trace ensures allocation integrity. The write rule
+performs the recorded write in the given store by extending the target with the value recorded
+
+11
+
+in the trace. This is necessary to ensure that the result of a re-used changeable computation is
+recorded in the new store. The read rule depends on whether the contents of the location l0 being
+read is the same in the store as the value v recorded in the trace. If the contents is the same as in
+the trace, then change propagation proceeds into the body T of the read and the resulting trace is
+substituted for T. Otherwise, the body of the read is evaluated with the specified target. Note
+that this makes evaluation and change-propagation mutually recursive—evaluation calls changepropagation in the case of an oracle hit. The changeable let rule is similar to the stable let.
+Most change-propagation judgments perform some consistency checks and otherwise propagate forward. Only when a read finds that the location in question has changed, it re-runs the
+changeable computation that is in its body and replaces the corresponding trace.
+Evaluation invariants. Valid evaluations of stable and changeable expressions satisfy the
+following invariants:
+0
+1. All locations allocated in the trace are also allocated in the result store, i.e., if σ, e ⇓s
+ok v, σ , T
+0
+0
+or σ, l ← e ⇓c
+ok σ , T, then dom(σ ) = dom(σ) ∪ alloc (T).
+
+2. For stable evaluations, any location whose content changes is allocated during that evalua0
+0
+tion, i.e., if σ, e ⇓s
+ok v, σ , T and σ (l) 6= σ(l), then l ∈ alloc (T).
+3. For changeable evaluations, a location whose content changes is either the target or gets
+0
+0
+allocated during evaluation, i.e, if σ, l0 ← e ⇓c
+ok σ , T and σ (l) 6= σ(l), then l ∈ alloc (T)∪
+{l0 }.
+Memo-free evaluations. The oracle rules introduce non-determinism into the dynamic semantics. Lemmas 5 and 6 in Section 3 express the fact that this non-determinism is harmless: change
+propagation will correctly update all answers returned by the oracle and make everything look as
+if the oracle never produced any answer at all (meaning that only memo/miss rules were used).
+0
+c 0
+s
+0
+We write σ, e ⇓s
+∅ v, σ , T or σ, l ← e ⇓∅ σ , T if there is a derivation for σ, e ⇓ v, σ , T or
+σ, l ← e ⇓c σ 0 , T, respectively, that does not use any memo/hit rule. We call such an evaluation
+c
+c
+s
+memo-free. We use ⇓s
+∅,ok in place of ⇓ok and ⇓∅,ok in place of ⇓ok to indicate that a valid
+evaluation is also memo-free.
+
+2.4
+
+Deterministic, purely functional semantics
+
+By ignoring memoization and change-propagation, we can give an alternative, purely functional,
+semantics for location-free AML programs, which we present in Figure 8. This semantics gives a
+store-free, pure, deterministic interpretation of AML that provides for no computation reuse. Under
+this semantics, both stable and changeable expressions evaluate to values, memo, mod and write
+are simply identities, and read acts as another binding construct. Our correctness result states
+that the pure interpretation of AML yields results that are the same (up to lifting) as those obtained
+by AML’s dynamic semantics (Section 3).
+
+12
+
+v 6= l
+(value)
+v ⇓s
+det v
+
+v = app(o, (v1 , . . . , vn ))
+(prim.)
+o(v1 , . . . , vn ) ⇓s
+det v
+
+e ⇓s
+det v
+(memo)
+memos e ⇓s
+det v
+e1
+[v1 /x] e2
+
+⇓s
+det
+⇓s
+
+e ⇓c
+det v
+(mod)
+mod e ⇓s v
+det
+
+(v1 = funs f (x) is e)
+[v1 /f, v2 /x] e ⇓s
+det v
+(apply)
+applys (v1 , v2 ) ⇓s
+det v
+
+v1
+[v1 /x1 , v2 /x2 ] e ⇓s
+det v
+
+v2
+(let)
+s
+let x = e1 in e2 ⇓det v2
+det
+
+(let×)
+let x1 ×x2 = (v1 , v2 ) in e ⇓s
+det v
+0
+[v/x1 ] e1 ⇓s
+det v
+(case/inl)
+
+
+case inl v of inl (x1 ) ⇒ e1
+s
+0
+⇓det v
+| inr (x2 ) ⇒ e2
+0
+[v/x2 ] e2 ⇓s
+det v
+(case/inr)
+
+
+case inr v of inl (x1 ) ⇒ e1
+0
+s
+⇓det v
+| inr (x2 ) ⇒ e2
+
+(write)
+write(v) ⇓c
+det v
+
+0
+[v/x] e ⇓c
+det v
+
+0 (read)
+read v as x in e ⇓c
+det v
+
+v1 = func f (x) is e
+c
+[v1 /f, v2 /x] e ⇓c
+e ⇓det v
+det v
+(apply)
+(memo)
+c
+memoc e ⇓det v
+applyc (v1 , v2 ) ⇓c
+det v
+v
+e
+⇓s
+1
+
+det
+
+1
+
+⇓c
+
+[v1 /x1 , v2 /x2 ] e ⇓c
+det v
+
+v2
+(let)
+c
+let x = e1 in e2 ⇓det v2
+[v1 /x] e2
+
+det
+
+(let×)
+let x1 ×x2 = (v1 , v2 ) in e ⇓c
+det v
+0
+[v/x1 ] e1 ⇓c
+det v
+(case/inl)
+
+
+case inl v of inl (x1 ) ⇒ e1
+c
+0
+⇓det v
+| inr (x2 ) ⇒ e2
+0
+[v/x2 ] e2 ⇓c
+det v
+(case/inr)
+
+
+case inr v of inl (x1 ) ⇒ e1
+c
+0
+⇓det v
+| inr (x2 ) ⇒ e2
+
+Figure 8: Purely functional semantics of (location-free) expressions
+
+13
+
+If σ, e ⇓s
+ok v1 , σ1 , T1
+then σ, e ⇓s
+∅,ok v1 , σ1 , T1
+Lemma 5
+?
+s
+If s, e ⇓∅,ok v1 , σ1 , T1
+then (e ↑ σ) ⇓s (v ↑ σ )
+det
+
+1
+
+If σ, e ⇓s
+ok v2 , σ2 , T2
+then σ, e ⇓s
+∅,ok v2 , σ2 , T2
+Lemma 5
+?
+If σ, e ⇓s
+∅,ok v2 , σ2 , T2
+then (e ↑ σ) ⇓s (v ↑ σ )
+
+1
+
+det
+
+Lemma 3
+
+2
+
+2
+
+Lemma 3
+
+Theorem 2
+
+Theorem 2
+
+@
+R
+@
+
+But since ⇓s
+det is deterministic,
+it follows that (v1 ↑ σ1 ) = (v2 ↑ σ2 )
+Theorem 1
+Figure 9: The structure of the proofs.
+
+3
+
+Consistency and Correctness
+
+We now state consistency and correctness theorems for AML and outline their proofs in terms
+of several main lemmas. As depicted in Figure 9, consistency (Theorem 1) is a consequence of
+correctness (Theorem 2).
+
+3.1
+
+Main theorems
+
+Consistency uses structural equality based on the notion of lifts (see Section 2.2) to compare the results of two potentially different evaluations of the same AML program under its non-deterministic
+semantics. Correctness, on the other hand, compares one such evaluation to a pure, functional
+evaluation. It justifies saying that even with stores, memoization and change propagation, AML is
+essentially a purely functional language.
+Theorem 1 (Consistency)
+s
+If σ, e ⇓s
+ok v1 , σ1 , T1 and σ, e ⇓ok v2 , σ2 , T2 , then v1 ↑ σ1 = v2 ↑ σ2 .
+Theorem 2 (Correctness)
+0
+s
+0
+If σ, e ⇓s
+ok v, σ , T, then (e ↑ σ) ⇓det (v ↑ σ ).
+Recall that by our convention the use of the notation v ↑ σ implies well-formedness of v in
+σ. Therefore, part of the statement of consistency is the preservation of well-formedness during
+evaluation, and the inability of AML programs to create cyclic memory graphs.
+
+3.2
+
+Proof outline
+
+The consistency theorem is proved in two steps. First, Lemmas 3 and 4 state that consistency is
+true in the restricted setting where all evaluations are memo-free.
+14
+
+Lemma 3 (purity/st.)
+0
+0
+s
+If σ, e ⇓s
+∅,ok v, σ , T, then (e ↑ σ) ⇓det (v ↑ σ ).
+Lemma 4 (purity/ch.)
+0
+c
+0
+If σ, l ← e ⇓c
+∅,ok σ , T, then (e ↑ σ) ⇓det (l ↑ σ ).
+Second, Lemmas 5 and 6 state that for any evaluation there is a memo-free counterpart that
+yields an identical result and has identical effects on the store. Notice that this is stronger than saying that the memo-free evaluation is “equivalent” in some sense (e.g., under lifts). The statements
+of these lemmas are actually even stronger since they include a “preservation of well-formedness”
+statement. Preservation of well-formedness is required in the inductive proof.
+Lemma 5 (memo-freedom/st.)
+0
+s
+0
+0
+If σ, e ⇓s
+ok v, σ , T, then σ, e ⇓∅ v, σ , T where reach (v, σ ) ⊆ reach (e, σ) ∪ alloc (T).
+Lemma 6 (memo-freedom/ch.)
+0
+0
+0
+c 0
+If σ, l ← e ⇓c
+ok σ , T, then σ, l ← e ⇓∅ σ , T where reach (σ (l), σ ) ⊆ reach (e, σ) ∪
+alloc (T).
+The proof for Lemmas 5 and 6 proceeds by simultaneous induction over the expression e.
+It is outlined in far more detail in Section 4. Both lemmas state that if there is a well-formed
+evaluation leading to a store, a trace, and a result (the value v in the stable lemma, or the target
+l in the changeable lemma), the same result (which will be well-formed itself) is obtainable by a
+memo-free run. Moreover, all locations reachable from the result were either reachable from the
+initial expression or were allocated during the evaluation. These conditions help to re-establish
+well-formedness in inductive steps.
+The lemmas are true thanks to a key property of the dynamic semantics: allocated locations
+need not be completely “fresh” in the sense that they may be in the current store as long as they
+are neither reachable from the initial expression nor get allocated multiple times. This means
+that a location that is already in the store can be chosen for reuse by the mod expression (Figure 5). To see why this is important, consider as an example the evaluating of the expression:
+memos (mod (write(3))) in σ. Suppose now that the oracle returns the value l and the trace T0 :
+σ0 , mod (write(3)) ⇓s l, σ00 , T0 . Even if l ∈ dom(σ), change propagation will simply update
+the store as σ[l ← 3] and return l. In a memo-free evaluation of the same expression the oracle
+misses, and mod must allocate a location. Thus, if the evaluation of mod were restricted to use
+fresh locations only, it would allocate some l0 6∈ dom(σ), and return that. But since l ∈ dom(σ),
+l 6= l0 .
+
+4
+
+The Proofs
+
+This sections presents a proof sketch for the four memo-elimination lemmas as well as the two
+lemmas comparing AML’s dynamic semantics to the pure semantics (Section 3). We give a detailed
+analysis for the most difficult cases. These proofs have all been formalized and machine-checked
+in Twelf (see Section 5).
+15
+
+4.1
+
+Proofs for memo-elimination
+
+Informally speaking, the proofs for Lemmas 5 and 6, as well as Lemmas 8 and 9 all proceed
+by simultaneous induction on the derivations of the respective result evaluation judgments. The
+imprecision in this statement stems from the fact that, as we will see, there are instances where we
+use the induction hypothesis on something that is not really a sub-derivation of the given derivation.
+For this reason, a full formalization of the proof defines a metric on derivations which demonstrably
+decreases on each inductive step. The discussion of the formalization in Twelf in Section 5 has
+more details on this.
+Substitution
+We will frequently appeal to the following substitution lemma. It states that well-formedness and
+lifts of expressions are preserved under substitution:
+Lemma 7 (Substitution)
+wf
+wf
+wf
+If e, σ −→ e0 , L and v, σ −→ v 0 , L0 , then [v/x] e, σ −→ [v 0 /x] e0 , L00 with L00 ⊆ L ∪ L0 .
+The proof for this proceeds by induction on the structure of e.
+Hit-elimination lemmas
+Since the cases for the memo/hit rules involve many sub-cases, it is instructive to separate these
+out into separate lemmas:
+Lemma 8 (hit-elimination/stable)
+s 0
+0
+If σ0 , e ⇓s
+ok v, σ0 , T0 and σ, T0 y σ , T where reach (e, σ) ∩ alloc (T) = ∅,
+0
+0
+then σ, e ⇓s
+∅ v, σ , T with reach (v, σ ) ⊆ reach (e, σ) ∪ alloc (T).
+Lemma 9 (hit-elimination/changeable)
+c
+0
+0
+If σ0 , l0 ← e ⇓c
+ok σ0 , T0 and σ, l ← T0 y σ , T where reach (e, σ) ∩ alloc (T) = ∅ and
+l 6∈ reach (e, σ) ∪ alloc (T),
+0
+0
+0
+then σ, l ← e ⇓c
+∅ σ , T with reach (σ (l), σ ) ⊆ reach (e, σ) ∪ alloc (T).
+Proof sketch for Lemma 5 (stable memo-freedom)
+For the remainder of the current section we will ignore the added complexity caused by the need
+for a decreasing metric on derivations. Here is a sketch of the cases that need to be considered in
+the part of the proof that deals with Lemma 5:
+• value: Since the expression itself is the value, with the trace being empty, this case is trivial.
+• primitives: The case for primitive operations goes through straightforwardly using preservation of well-formedness.
+
+16
+
+0
+• mod: Given σ, mod e ⇓s
+ok l, σ , mod l ← T we have
+
+reach (mod e, σ) ∩ alloc (mod l ← T) = ∅.
+This implies that l 6∈ reach (mod e, σ). By the evaluation rule mod it is also true that
+σ, e ⇓c σ 0 , T and l 6∈ alloc (T). By definition of reach and alloc we also know that
+0
+reach (e, σ) ∩ alloc (T) = ∅, implying σ, e ⇓c
+ok σ , T.
+By induction (using Lemma 6) we get σ, l ← e ⇓c σ 0 , T with reach (σ 0 (l), σ 0 ) ⊆ reach (e, σ)∪
+∅
+
+alloc (T). Since l is the final result, we find that
+reach (l, σ 0 ) = reach (σ 0 (l), σ 0 ) ∪ {l}
+⊆ reach (e, σ) ∪ alloc (T) ∪ {l}
+= reach (e, σ) ∪ alloc (mod l ← T) .
+• memo/hit: Since the result evaluation is supposed to be memo-free, there really is no use of
+the memo/hit rule there. However, a memo/miss in the memo-free trace can be the result
+of eliminating a memo/hit in the original run. We refer to this situation here, which really
+is the heart of the matter: a use of the memo/hit rule for which we have to show that we
+can eliminate it in favor of some memo-free evaluation. This case has been factored out as a
+separate lemma (Lemma 8), which we can use here inductively.
+• memo/miss The case of a retained memo/miss is completely straightforward, using the induction hypothesis (Lemma 5) on the subexpression e in mod e.
+• let The difficulty here is to establish that the second part of the evaluation is valid. Given
+σ, let x = e in e ⇓s v , σ 00 , let T T
+1
+
+2
+
+ok
+
+2
+
+1
+
+2
+
+we have L ∩ alloc (let T1 T2 ) = ∅
+where L = reach (let x = e1 in e2 , σ) .
+By the evaluation rule let it is the case that σ, e1 ⇓s v1 , σ 0 , T1 where alloc (T1 ) ⊆ alloc (T) .
+Well-formedness of the whole expression implies well-formedness of each of its parts, so
+reach (e1 , σ) ⊆ L and reach (e2 , σ) ⊆ L. This means that reach (e1 , σ)∩alloc (T1 ) =
+0
+∅, so σ, e1 ⇓s
+ok v1 , σ , T1 . Using the induction hypothesis (Lemma 5) this implies
+σ, e ⇓s v , σ 0 , T
+1
+
+∅
+
+1
+
+1
+
+and reach (v1 , σ 0 ) ⊆ reach (e1 , σ) ∪ alloc (T1 ) .
+Since reach (e2 , σ) ⊆ L we have reach (e2 , σ) ∩ alloc (T1 ) = ∅. Store σ 0 is equal
+to σ up to alloc (T1 ), so reach (e2 , σ) = reach (e2 , σ 0 ). Therefore, by substitution
+(Lemma 7) we get
+reach ([v1 /x] e2 , σ 0 ) ⊆ reach (e2 , σ 0 ) ∪ reach (v1 , σ 0 )
+⊆ reach (e2 , σ) ∪ reach (v1 , σ 0 )
+⊆ reach (e2 , σ) ∪ reach (e1 , σ)
+∪alloc (T1 )
+= L ∪ alloc (T1 )
+17
+
+00
+Since alloc (T2 ) is disjoint from both L and alloc (T1 ), this means that σ 0 , [v1 /x] e2 ⇓s
+ok v2 , σ , T2 .
+Using the induction hypothesis (Lemma 5) a second time we get
+00
+σ 0 , [v1 /x] e2 ⇓s
+∅ v2 , σ , T2 ,
+
+so by definition
+
+00
+σ, let x = e1 in e2 ⇓s
+∅ v2 , σ , let T1 T2 .
+
+It is then also true that
+reach (v2 , σ 00 ) ⊆ reach ([v1 /x] e2 , σ 0 ) ∪ alloc (T2 )
+⊆ L ∪ alloc (T1 ) ∪ alloc (T2 )
+= L ∪ alloc (let T1 T2 ) ,
+which concludes the argument.
+The remaining cases all follow by a straightforward application of Lemma 7 (substitution),
+followed by the use of the induction hypothesis (Lemma 5).
+Proof sketch for Lemma 6 (Changeable memo-freedom)
+• write: Given σ, l ← write(v) ⇓c
+ok σ[l ← v], write v we clearly also have σ, l ←
+c
+write(v) ⇓∅ σ[l ← v], write v. First we need to show that σ 0 (l) is well-formed in
+s0 = σ[l ← v]. This is true because σ 0 (l) = v and l is not reachable from v in σ, so the update
+to l cannot create a cycle. Moreover, this means that the locations reachable from v in σ 0
+are the same as the ones reachable in σ, i.e., reach (v, σ) = reach (v, σ 0 ). Since nothing
+is allocated, alloc (write v) = ∅, so obviously reach (σ 0 (l), σ 0 ) ⊆ reach (v, σ) ∪
+alloc (write v).
+0
+• read: For the case of σ, l ← read l0 as x in e ⇓c
+ok σ , T we observe that by definition of
+0
+well-formedness σ(l ) is also well-formed in σ. From here the proof proceeds by an application of the substitution lemma, followed by a use of the induction hypothesis (Lemma 6).
+
+• memo/hit: Again, this is the case of a memo/miss which is the result of eliminating the
+presence of a memo/hit in the original evaluation. Like in the stable setting, we have factored
+this out as a separate lemma (Lemma 9).
+• memo/miss: As before, the case of a retained use of memo/miss is handled by straightforward use of the induction hypothesis (Lemma 6).
+• let: The proof for the let case in the changeable setting is tedious but straightforward and
+proceeds along the lines of the proof for the let case in the stable setting. Lemma 5 is used
+inductively for the first sub-expression, Lemma 6 for the second (after establishing validity
+using the substitution lemma).
+The remaining cases follow by application of the substitution lemma and the use of the induction hypothesis (Lemma 6).
+18
+
+Proof of Lemma 8 (stable hit-elimination)
+• value: Immediate.
+• primitives: Immediate.
+• mod: The case of mod requires some attention, since the location being allocated may
+already be present in σ, a situation which, however, is tolerated by our relaxed evaluation rule
+for mod e. We show the proof in detail, using the following calculations which establishes
+the conclusions (lines (16, 19)) from the preconditions (lines (1, 2, 3)):
+(1)
+(2)
+(3)
+(4)
+(5)
+(6)
+(7)
+(8)
+
+by (1)
+by (1)
+by (5)
+by (5)
+by (1), mod
+
+(9) by (4, 6, 7, 8)
+(10) by (2), mod
+(11) by (3)
+(12) by (3)
+(13) by (3)
+(14) by (9 − 13), IH
+(15) by (9 − 13), IH
+(16) by (8, 14), mod
+(17) by (7, 8, 15)
+(18) by (17)
+(19) by (15, 18)
+
+0
+σ0 , mod e ⇓s
+ok l, σ0 , mod l ← T0
+s
+σ, mod l ← T0 y σ 0 , mod l ← T
+reach (e, σ) ∩ alloc (T) = ∅
+l 6∈ alloc (T) ∪ reach (e, σ)
+σ , l ← e ⇓c σ 0 , T
+0
+
+0
+
+0
+
+alloc (mod l ← T0 ) ∩ reach (e, σ0 ) = ∅
+alloc (T0 ) ∩ reach (e, σ0 ) = ∅
+l 6∈ reach (e, σ0 )
+l 6∈ alloc (T0 )
+0
+σ0 , l ← e ⇓c
+ok σ0 , T0
+c
+σ, l ← T0 y σ 0 , T
+reach (e, σ) ∩ alloc (T) = ∅
+l 6∈ reach (e, σ)
+l 6∈ alloc (T)
+σ, l ← e ⇓c σ 0 , T
+∅
+
+reach (σ 0 (l), σ 0 ) ⊆ reach (e, σ) ∪ alloc (T)
+σ, mod e ⇓s l, σ 0 , mod l ← T
+∅
+
+l 6∈ reach (σ 0 (l), σ 0 )
+reach (l, σ 0 ) = reach (σ 0 (l), σ 0 ) ∪ {l}
+reach (l, σ 0 ) ⊆ reach (e, σ) ∪ alloc (T) ∪ {l}
+= reach (e, σ) ∪ alloc (mod l ← T)
+
+• memo/hit: This case is proved by two consecutive applications of the induction hypothesis,
+0
+one time to obtain a memo-free version of the original evaluation σ0 , e ⇓s
+∅ v, σ0 , T0 , and
+then starting from that the memo-free final result.
+It is here where straightforward induction on the derivation breaks down, since the derivation
+of the memo-free version of the original evaluation is not a sub-derivation of the overall
+derivation. In the formalized and proof-checked version (Section 5) this is handled using an
+auxiliary metric on derivations.
+• memo/miss: The case where the original evaluation of memos e did not use the oracle and
+evaluated e directly, we prove the result by applying the induction hypothesis (Lemma 8).
+
+19
+
+• let: We consider the evaluation of let x = e1 in e2 . Again, the main challenge here is
+to establish that the evaluation of [v1 /x] e, where v1 is the result of e1 , is well-formed. The
+argument is tedious but straightforward and proceeds much like that in the proof of Lemma 5.
+All remaining cases are handled simply by applying the substitution lemma (Lemma 7) and
+then using the induction hypothesis (Lemma 8).
+Proof of Lemma 9 (changeable hit-elimination)
+• write: We have e = write(v) and T0 = T = write v. Therefore, trivially, σ, l ←
+0
+0
+e ⇓c
+∅ σ , T with σ = σ[l ← v]. Also, reach (write(v), σ) = reach (v, σ) = L.
+Therefore, reach (σ 0 (l), σ 0 ) = L because l 6∈ L. Of course, L ⊆ L ∪ alloc (T).
+• read/no ch.: We handle read in two parts. The first part deals with the situation where there
+is no change to the location that has been read. In this case we apply the substitution lemma
+to establish the preconditions for the induction hypothesis and conclude using Lemma 9.
+• read/ch.: If change propagation detects that the location being read contains a new value,
+it re-executes the body of read l0 as x in e. Using substitution we establish the preconditions of Lemma 6 and conclude by using the induction hypothesis.
+• memo/hit: Like in the proof for Lemma 8, the memo/hit case is handled by two cascading
+applications of the induction hypothesis (Lemma 9).
+• memo/miss: Again, the case where the original evaluation did not get an answer from the
+oracle is handled easily by using the induction hypothesis (Lemma 9).
+• let: We consider the evaluation of let x = e1 in e2 . As before, the challenge is to establish
+that the evaluation of [v1 /x] e, where v1 is the (stable) result of e1 , is well-formed. The
+argument is tedious but straightforward and proceeds much like that in the proof of Lemma 6.
+All remaining cases are handled by the induction hypothesis (Lemma 9) which becomes applicable after establishing validity using the substitution lemma.
+
+4.2
+
+Proofs for equivalence to pure semantics
+
+The proofs for Lemmas 3 and 4 proceed by simultaneous induction on the derivation of the memofree evaluation. The following two subsections outline the two major parts of the case analysis.
+Proof sketch for Lemma 3 (stable evaluation)
+We proceed by considering each possible stable evaluation rule:
+• value: Immediate.
+
+20
+
+• primitives: Using the condition on primitive operations that they commute with lifts, this is
+immediate.
+• mod: Consider mod ec . The induction hypothesis (Lemma 4) on the evaluation of ec directly
+gives the required result.
+• memo: Since we consider memo-free evaluations, we only need to consider the use of
+the memo/miss rule. The result follows by direct application of the induction hypothesis
+(Lemma 3).
+00
+• let: We have σ, let x = e1 in e2 ⇓s
+∅ v2 , σ , let T1 T2 . Because of validity of the original
+wf
+evaluation, we also have let x = e1 in e2 , σ −→ L with L ∩ alloc (let T1 T2 ) = ∅.
+wf
+0
+Therefore, σ, e1 ⇓s
+∅ v1 , σ , T1 where e1 , σ −→ L1 and L1 ∩ alloc (T) = ∅ because L1 ⊆ L
+and alloc (T1 ) ⊆ alloc (let T1 T2 ). By induction hypothesis (Lemma 3) we get (e1 ↑
+0
+σ) ⇓s
+det (v1 ↑ σ ).
+We can establish validity for σ 0 , [v /x] e ⇓s v , σ 00 , T the same way we did in the proof
+1
+
+2
+
+∅
+
+2
+
+2
+
+of Lemma 5, so by a second application of the induction hypothesis we get ([v1 /x] e2 ↑
+00
+0
+σ 0 ) ⇓s
+det (v2 ↑ σ ). But by substitution (Lemma 7) we have ([v1 /x] e2 ) ↑ σ = [(v1 ↑
+0
+0
+σ )/x] (e2 ↑ σ ). Using the evaluation rule let/p this gives the desired result.
+The remaining cases follow straightforwardly by applying the induction hypothesis (Lemma 3)
+after establishing validity using the substitution lemma.
+Proof sketch for Lemma 4 (changeable evaluation)
+here we consider each possible changeable evaluation rule:
+• write: Immediate by the definition of lift.
+• read: Using the definition of lift and the substitution lemma, this follows by an application
+of the induction hypothesis (Lemma 4).
+• memo: Like in the stable setting, this case is handled by straightforward application of the
+induction hypothesis because no memo hit needs to be considered.
+• let: The let case is again somewhat tedious. It proceeds by first using the induction hypothesis (Lemma 3) on the stable sub-expression, then re-establishing validity using the
+substitution lemma, and finally applying the induction hypothesis a second time (this time in
+form of Lemma 4).
+All other cases are handled by an application of the induction hypothesis (Lemma 4) after
+establishing validity using the substitution lemma.
+
+21
+
+5
+
+Mechanization in Twelf
+
+To increase our confidence in the proofs for the correctness and the consistency theorems, we have
+encoded the AML language and the proofs in Twelf [18] and machine-checked the proofs. We
+follow the standard judgments as types methodology [12], and check our theorems using the Twelf
+metatheorem checker. For full details on using Twelf in this way for proofs about programming
+languages, see Harper and Licata’s paper [?].
+The LF encoding of the syntax and semantics of AML corresponds very closely to the paper
+judgments (in an informal sense; we have not proved formally that the LF encoding is adequate,
+and take adequacy to be evident). However, in a few cases we have altered the judgments, driven
+by the needs of the mechanized proof. For example, on paper we write memo-free and general
+evaluations as different judgments, and silently coerce memo-free to general evaluations in the
+proof. We could represent the two judgments by separate LF type families, but the proof would
+then require a lemma to convert one judgment to the other. Instead, we define a type family to
+represent general evaluations, and a separate type family, indexed by evaluation derivations, to
+represent the judgment that an evaluation derivation is memo-free.
+The proof of consistency (a metatheorem in Twelf) corresponds closely to the paper proof in
+overall structure. The proof of memo-freedom consists of four mutually-inductive lemmas: memofreedom for stable and changeable expressions (Lemma 5 and Lemma 6), and versions of these
+with an additional change propagation following the evaluation (needed for the hit cases). In the
+hit cases for these latter lemmas, we must eliminate two change propagations: we call the lemma
+once to eliminate the first, then a second time on the output of the first call to eliminate the second.
+Since the evaluation in the second call is not a subderivation of the input, we must give a separate
+termination metric. The metric is defined on evaluation derivations and simply counts the number
+of evaluations in the derivations, including those inside of change propagations. In an evaluation
+which contains change propagations, there are “garbage” evaluations which are removed during
+hit-elimination. Therefore, hit-elimination reduces this metric (or keeps it the same, if there were
+no change propagations to remove). We add arguments to the lemmas to account for the metric,
+and simultaneously prove that the metric is smaller in each inductive call, in order for Twelf to
+check termination.
+Aside from this structural difference due to termination checking, the main difference from the
+paper proof is that the Twelf proof must of course spell out all the details which the paper proof
+leaves to the reader to verify. In particular, we must encode “background” structures such as finite
+sets of locations, and prove relevant properties of such structures. While we are not the first to use
+these structures in Twelf, Twelf has poor support for reusable libraries at present. Moreover, our
+needs are somewhat specialized: because we need to prove properties about stores which differ
+only on a set of locations, it is convenient to encode stores and location sets in a slightly unusual
+way: location sets are represented as lists of bits, and stores are represented as lists of value options;
+in both representations the nth list element corresponds to the nth location. This makes it easy to
+prove the necessary lemmas by parallel induction over the lists.
+The complete Twelf code can be found in Appendix A
+
+22
+
+6
+
+Implementation Strategies
+
+The dynamic semantics of AML (Section 2) does not translate directly to an algorithm, not to
+mention an efficient one.1 In particular, an algorithm consistent with the semantics must specify
+an oracle and a way to allocate locations to ensure that all locations allocated in a trace are unique.
+Strategies for implementing the semantics beyond the scope of this paper but we briefly describe a
+conservative strategy for implementation. The strategy ensures that
+1. each allocated location is fresh (i.e., is not contained in the memory)
+2. the oracle returns only traces currently residing in the memory,
+3. the oracle never returns a trace more than once, and
+4. the oracle performs function comparisons by using tag equality.
+The first two conditions together guarantee uniqueness of allocated locations. The third condition guarantees that no location can appear in the execution trace more than once by limiting the
+oracle from ever returning the same trace multiple times. This condition is conservative, because it
+is possible that the parts of a trace returned by the oracle are thrown away (become unused) during
+change propagation. This strategy can be relaxed by allowing the change-propagation algorithm
+to return unused traces to the oracle. The last condition enables implementing oracle queries by
+comparing functions and their arguments by using tag equality. Since in the semantics, the oracle is
+non-deterministic, this implementation strategy is consistent with the semantics. The conservative
+strategy can be implemented in such a way that the total space consumption is no more than that of
+a from-scratch run. Such an implementation has been described and evaluated elsewhere [3] and
+has formed the basis for subsequent larger-scale implementations [11, 15].
+
+7
+
+Related Work
+
+The related work that this paper directly builds on have been discussed in the rest of the paper. Here
+we briefly discuss other related on incremental computation and the impact of the result presented
+in this paper on follow-up work on self-adjusting computation.
+The term “incremental computation” broadly refers to techniques for allowing computations
+to respond automatically to changes to their data. Motivated by the copious applications where
+such dynamically changing data arise, researchers have proposed numerous approaches to incremental computation. The most effective techniques are based on static dependence graphs [9],
+memoization [19], and partial evaluation [10, 20]
+Dependence graphs record the dependencies between data in a computation and rely on a
+change-propagation algorithm to update the computation when the input is modified (e.g., [9, 14]).
+Dependence graphs are effective in some applications, e.g., syntax-directed computations but are
+1
+
+Since our theorems and lemmas concern given derivations (not the problem finding them, this does not constitute
+a problem for our results.
+
+23
+
+not general-purpose because change propagation does not update the dependence structure. Memoization (also called function caching) (e.g., [19, 1, 13]) applies to any purely functional program
+and therefore is more broadly applicable than static dependence graphs. This classic idea dating
+back to the late 1950’s [8, 16, 17] yields efficient incremental computations when executions of
+a program with similar inputs perform similar function calls. It turns out, however, that even a
+small input modifications can prevent reuse via memoization, e.g., when they affect computations
+deep in the call tree [3]. Partial evaluation based approaches [20, 10] require the user to fix a partition of the input and specialize the program to speedup modifications to unfixed part faster. The
+main limitation of this approach is that it allows input modifications only within a predetermined
+partition.
+The semantics proposed here achieve efficient incremental computation by integrating a previous generalization of dependence graphs that allow change propagation to modify the dependence
+structure [4] with memoization. Specifically it permits change propagation algorithm to re-use
+computations, even after the computation state is modified via mutations to memory. In contrast,
+conventional memoization permits re-use of the (unchanged) results of computations.
+The presented semantics forms the foundation for nearly all the followup work on self-adjusting
+computation. After its publication as a conference paper, the semantics have been realized as a
+Standard ML library [3] and generalized to support imperative references [2]. These results have
+then led to the development of the CEAL [11] and Delta ML languages, which provide direct
+language support for self-adjusting computation [15]. A relatively broad set of applications of the
+proposed techniques have also been investigated, including simpler computational benchmarks,
+more sophisticated applications in computational geometry and machine learning (e.g., [7, 6]).
+These applications show that the proposed approach can provide asymptotically optimal updates
+in theory while also delivering massive speedups in practice. In some cases, the techniques have
+enabled us to solve open problems that resisted traditional approaches.
+
+8
+
+Conclusion
+
+We present general semantics for integrating memoization and change propagation where memoization is modeled as a non-deterministic oracle, and computation re-use is possible in the presence
+of mutation. Mutations arise for two reasons. First the semantics permit the store to be modified
+between two runs while allowing computations to be re-used between two such runs—this models dynamic data changes. Second, the techniques for change propagation mutate the store by
+selectively re-executing pieces of the first run to derive the second run. The key idea behind the
+semantics is to enable re-using of computations themselves by adapting re-used computations to
+mutations via recursive applications of change propagation. Our main theorem shows that the semantics are consistent with deterministic, purely functional programming. By giving a general,
+oracle-based semantics for combining memoization and change propagation, we cover a variety
+of possible techniques for implementing self-adjusting-computation. By proving the semantics
+correct with minimal assumptions, we identify the properties that correct implementations must
+satisfy. The results reported in this work laid out the formal foundation on which other work on
+self-adjusting computation has built on. Indeed, the semantics have been subsequently generalized
+24
+
+to imperative programming constructs and been adapted and realized in strongly typed functional
+language as well as procedural, weakly typed languages.
+
+References
+[1] Martı́n Abadi, Butler W. Lampson, and Jean-Jacques Lévy. Analysis and caching of dependencies. In International Conference on Functional Programming, pages 83–91, 1996.
+[2] Umut A. Acar, Amal Ahmed, and Matthias Blume. Imperative self-adjusting computation. In
+Proceedings of the 25th Annual ACM Symposium on Principles of Programming Languages,
+2008.
+[3] Umut A. Acar, Guy E. Blelloch, Matthias Blume, Robert Harper, and Kanat Tangwongsan.
+An experimental analysis of self-adjusting computation. ACM Trans. Prog. Lang. Sys.,
+32(1):3:1–3:53, 2009.
+[4] Umut A. Acar, Guy E. Blelloch, and Robert Harper. Adaptive functional programming. ACM
+Transactions on Programming Languages and Systems, 28(6):990–1034, 2006.
+[5] Umut A. Acar, Matthias Blume, and Jacob Donham. A consistent semantics of self-adjusting
+computation. In European Symposium on Programming, 2007.
+[6] Umut A. Acar, Andrew Cotter, Benoı̂t Hudson, and Duru Türkoğlu. Dynamic well-spaced
+point sets. In SCG ’10: Proceedings of the 26th Annual Symposium on Computational Geometry, 2010.
+[7] Umut A. Acar, Alexander Ihler, Ramgopal Mettu, and Özgür Sümer. Adaptive Bayesian
+inference. In Neural Information Processing Systems (NIPS), 2007.
+[8] Richard Bellman. Dynamic Programming. Princeton Univ. Press, 1957.
+[9] Alan Demers, Thomas Reps, and Tim Teitelbaum. Incremental evaluation of attribute grammars with application to syntax-directed editors. In Principles of Programming Languages,
+pages 105–116, 1981.
+[10] J. Field and T. Teitelbaum. Incremental reduction in the lambda calculus. In ACM Conf. LISP
+and Functional Programming, pages 307–322, 1990.
+[11] Matthew A. Hammer, Umut A. Acar, and Yan Chen. CEAL: a C-based language for selfadjusting computation. In Proceedings of the 2009 ACM SIGPLAN Conference on Programming Language Design and Implementation, June 2009.
+[12] Robert Harper, Furio Honsell, and Gordon Plotkin. A framework for defining logics. Journal
+of the Association for Computing Machinery, 40(1):143–184, January 1993.
+
+25
+
+[13] Allan Heydon, Roy Levin, and Yuan Yu. Caching function calls using precise dependencies.
+In Proceedings of the 2000 ACM SIGPLAN Conference on Programming Language Design
+and Implementation, pages 311–320, 2000.
+[14] Roger Hoover. Incremental Graph Evaluation. PhD thesis, Department of Computer Science,
+Cornell University, May 1987.
+[15] Ruy Ley-Wild, Matthew Fluet, and Umut A. Acar. Compiling self-adjusting programs with
+continuations. In Proceedings of the International Conference on Functional Programming,
+2008.
+[16] John McCarthy. A basis for a mathematical theory of computation. In P. Braffort and
+D. Hirschberg, editors, Computer Programming and Formal Systems, pages 33–70. NorthHolland, Amsterdam, 1963.
+[17] D. Michie. “Memo” functions and machine learning. Nature, 218:19–22, 1968.
+[18] Frank Pfenning and Carsten Schürmann. System description: Twelf — a meta-logical framework for deductive systems. In H. Ganzinger, editor, Proceedings of the 16th International
+Conference on Automated Deduction (CADE-16), pages 202–206, Trento, Italy, July 1999.
+Springer-Verlag LNAI 1632.
+[19] William Pugh and Tim Teitelbaum. Incremental computation via function caching. In Principles of Programming Languages, pages 315–328, 1989.
+[20] R. S. Sundaresh and Paul Hudak. Incremental compilation via partial evaluation. In Conference Record of the 18th Annual ACM Symposium on Principles of Programming Languages,
+pages 1–13, 1991.
+
+26
+
+A
+
+The Complete Twelf Proof
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% proof.twelf
+%%
+%% This file contains the complete Twelf code for the consistency
+%% and correctness proofs for the AML semantics described in
+%% "A Consistent Semantics of Self-Adjusting Computation"
+%% by U. A. Acar, M. Blume, J. Donham.
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% false.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% The uninhabited type, indicating a contradiction.
+false : type.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% nat.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Natural numbers.
+nat : type. %name nat _N.
+z : nat.
+s : nat -> nat.
+nat-eq : nat -> nat -> type.
+nat-eq_ : nat-eq N N.
+leq : nat -> nat -> type.
+leq-z : leq z _.
+leq-s : leq (s N1) (s N2)
+<- leq N1 N2.
+sum : nat -> nat -> nat ->
+%mode sum +X +Y -Z.
+
+type.
+
+sum-z : sum z N N.
+sum-s : sum (s N1) N2 (s N3)
+<- sum N1 N2 N3.
+
+27
+
+%worlds () (sum _ _ _).
+%total X (sum X _ _).
+%reduces Y <= Z (sum _ Y Z).
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% syntax.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Locations are just indices into a store.
+loc : type. %name loc _L.
+loc-z : loc.
+loc-s : loc -> loc.
+loc-neq : loc -> loc -> type.
+loc-neq-nil1 : loc-neq loc-z (loc-s L).
+loc-neq-nil2 : loc-neq (loc-s L) loc-z.
+loc-neq-cons : loc-neq (loc-s L1) (loc-s L2)
+<- loc-neq L1 L2.
+%% Syntax of AML.
+val : type. %name val _V.
+es : type. %name es _Es.
+ec : type. %name ec _Ec.
+val-emp : val.
+val-nat : nat -> val.
+val-loc : loc -> val.
+val-pr : val -> val -> val.
+val-inl : val -> val.
+val-inr : val -> val.
+val-fns : (val -> val -> es) -> val.
+val-fnc : (val -> val -> ec) -> val.
+es-val : val -> es.
+es-plus : val -> val -> es.
+es-mod : ec -> es.
+es-memo : es -> es.
+es-app : val -> val -> es.
+es-let : es -> (val -> es) -> es.
+es-letp : val -> (val -> val -> es) -> es.
+es-case : val -> (val -> es) -> (val -> es) -> es.
+
+28
+
+ec-wr : val -> ec.
+ec-read : val -> (val -> ec) -> ec.
+ec-memo : ec -> ec.
+ec-app : val -> val -> ec.
+ec-let : es -> (val -> ec) -> ec.
+ec-letp : val -> (val -> val -> ec) -> ec.
+ec-case : val -> (val -> ec) -> (val -> ec) -> ec.
+val-eq : val -> val -> type.
+val-eq_ : val-eq V V.
+val-neq : val -> val -> type.
+es-eq : es -> es -> type.
+es-eq_ : es-eq Es Es.
+ec-eq : ec -> ec -> type.
+ec-eq_ : ec-eq Ec Ec.
+var : val -> type.
+%block val-block : block {v : val}.
+%block var-block : block {v : val} {d : var v}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% locset.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Sets of locations. We represent them as lists of bits; lists which
+%% differ only by trailing false bits are equivalent.
+loc-state : type.
+loc-present : loc-state.
+loc-absent : loc-state.
+loc-or : loc-state -> loc-state -> loc-state -> type.
+loc-or-aa : loc-or loc-absent loc-absent loc-absent.
+loc-or-px : loc-or loc-present _ loc-present.
+loc-or-xp : loc-or _ loc-present loc-present.
+ls : type. %name ls _X.
+
+29
+
+ls-nil
+ls-cons
+
+: ls.
+: loc-state -> ls -> ls.
+
+%% check for empty set
+ls-empty : ls -> type.
+ls-empty-n : ls-empty ls-nil.
+ls-empty-a : ls-empty (ls-cons loc-absent X)
+<- ls-empty X.
+%% set equality
+ls-eq : ls -> ls -> type.
+ls-eq-nx : ls-eq ls-nil X
+<- ls-empty X.
+ls-eq-xn : ls-eq X ls-nil
+<- ls-empty X.
+ls-eq-cc : ls-eq (ls-cons P X1) (ls-cons P X2)
+<- ls-eq X1 X2.
+%% representation identity
+ls-id : ls -> ls -> type.
+ls-id_ : ls-id X X.
+%% X_1 \subseteq X_2
+ls-subeq : ls -> ls -> type.
+ls-subeq-nx : ls-subeq ls-nil _.
+ls-subeq-xn : ls-subeq X ls-nil
+<- ls-empty X.
+ls-subeq-ax : ls-subeq (ls-cons loc-absent X1) (ls-cons _ X2)
+<- ls-subeq X1 X2.
+ls-subeq-pp : ls-subeq (ls-cons loc-present X1) (ls-cons loc-present X2)
+<- ls-subeq X1 X2.
+%% X_1 \cup X_2
+ls-union : ls -> ls -> ls -> type.
+ls-un-nx : ls-union ls-nil X X.
+ls-un-xn : ls-union X ls-nil X.
+ls-un-cc : ls-union (ls-cons P1 X1) (ls-cons P2 X2) (ls-cons P X)
+<- loc-or P1 P2 P
+<- ls-union X1 X2 X.
+%% X_1 \cap X_2 = 0
+ls-disjoint : ls -> ls -> type.
+ls-dj-nx : ls-disjoint ls-nil _.
+ls-dj-xn : ls-disjoint _ ls-nil.
+
+30
+
+ls-dj-ac : ls-disjoint (ls-cons loc-absent X) (ls-cons _ X’)
+<- ls-disjoint X X’.
+ls-dj-ca : ls-disjoint (ls-cons _ X) (ls-cons loc-absent X’)
+<- ls-disjoint X X’.
+%% Set of a single location
+ls-sing : loc -> ls -> type.
+ls-sing-z : ls-sing loc-z (ls-cons loc-present ls-nil).
+ls-sing-s : ls-sing (loc-s L) (ls-cons loc-absent S)
+<- ls-sing L S.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% store.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Stores mapping locations to values. We represent them as lists of
+%% value options, where the i’th element of the list is the value of
+%% location i in the store (or sv-free if the location is
+%% undefined). As with location sets, stores differing only by trailing
+%% sv-free’s are equivalent.
+%% We choose the bitwise representations because it makes the lemmas
+%% of interest easier to prove; they are generally just an induction
+%% over the bits.
+st : type. %name st _S.
+sv : type. %name sv _SV.
+
+%% store value: either free or a value
+
+sv-free : sv.
+sv-val : val -> sv.
+sv-eq : sv -> sv -> type.
+sv-eq_ : sv-eq SV SV.
+st-nil : st.
+st-cons: sv -> st -> st.
+%% Are all locations empty?
+st-empty : st -> type.
+st-empty-n : st-empty st-nil.
+st-empty-e : st-empty (st-cons sv-free S)
+<- st-empty S.
+%% Store equality.
+
+(Could we get away with syntactic equality? Probably.)
+
+31
+
+st-eq : st -> st -> type.
+st-eq-nx : st-eq st-nil S
+<- st-empty S.
+st-eq-xn : st-eq S st-nil
+<- st-empty S.
+st-eq-cc : st-eq (st-cons SV1 S1) (st-cons SV2 S2)
+<- sv-eq SV1 SV2
+<- st-eq S1 S2.
+%% \sigma [l \leftarrow v]
+st-update : st -> loc -> val -> st -> type.
+st-up-nz : st-update st-nil loc-z V (st-cons (sv-val V) st-nil).
+st-up-cz : st-update (st-cons _ S) loc-z V (st-cons (sv-val V) S).
+st-up-ns : st-update st-nil (loc-s L) V (st-cons sv-free S)
+<- st-update st-nil L V S.
+st-up-cs : st-update (st-cons SV S) (loc-s L) V (st-cons SV S’)
+<- st-update S L V S’.
+%% \sigma(l)
+st-lookup : st -> loc -> val -> type.
+st-lo-z : st-lookup (st-cons (sv-val V) _) loc-z V.
+st-lo-s : st-lookup (st-cons _ S) (loc-s L) V
+<- st-lookup S L V.
+%% st-sqsubeq-ex S1 X S2 holds if for any location L allocated in S1 with
+%%
+value V, either L is in X or S2 has value V at location L.
+%%
+%% This is rather painful because of the treatment of ls-nil and st-nil
+%% in the 2nd and 3rd arguments, respectively.
+st-sqsubeq-ex : st -> ls -> st -> type.
+st-ssee-nxx : st-sqsubeq-ex st-nil _ _.
+st-ssee-fnn : st-sqsubeq-ex (st-cons sv-free S1’) ls-nil st-nil
+<- st-sqsubeq-ex S1’ ls-nil st-nil.
+st-ssee-fcn : st-sqsubeq-ex (st-cons sv-free S1’) (ls-cons _ X’) st-nil
+<- st-sqsubeq-ex S1’ X’ st-nil.
+st-ssee-fnc : st-sqsubeq-ex (st-cons sv-free S1’) ls-nil (st-cons _ S2’)
+<- st-sqsubeq-ex S1’ ls-nil S2’.
+st-ssee-fcc : st-sqsubeq-ex (st-cons sv-free S1’) (ls-cons _ X’) (st-cons _ S2’)
+<- st-sqsubeq-ex S1’ X’ S2’.
+st-ssee-vnv : st-sqsubeq-ex
+(st-cons (sv-val V1) S1’) ls-nil (st-cons (sv-val V2) S2’)
+<- val-eq V1 V2
+<- st-sqsubeq-ex S1’ ls-nil S2’.
+st-ssee-vav : st-sqsubeq-ex
+
+32
+
+(st-cons (sv-val V1) S1’) (ls-cons loc-absent X’)
+(st-cons (sv-val V2) S2’)
+<- val-eq V1 V2
+<- st-sqsubeq-ex S1’ X’ S2’.
+st-ssee-cpn : st-sqsubeq-ex (st-cons _ S1’) (ls-cons loc-present X’) st-nil
+<- st-sqsubeq-ex S1’ X’ st-nil.
+st-ssee-cpc : st-sqsubeq-ex
+(st-cons _ S1’) (ls-cons loc-present X’)
+(st-cons _ S2’)
+<- st-sqsubeq-ex S1’ X’ S2’.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% trace.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Evaluation traces, and their allocated locations.
+trs : type. %name trs _Ts.
+trc : type. %name trc _Tc.
+trs-nil : trs.
+trs-mod : loc -> trc -> trs.
+trs-let : trs -> trs -> trs.
+trc-wr : val -> trc.
+trc-let : trs -> trc -> trc.
+trc-rd : loc -> val -> (val -> ec) -> trc -> trc.
+trs-gen : trs -> ls -> type.
+trc-gen : trc -> ls -> type.
+trs-gen-nil : trs-gen trs-nil ls-nil.
+trs-gen-mod : trs-gen (trs-mod L Tc) X1+X2
+<- trc-gen Tc X1
+<- ls-sing L X2
+<- ls-union X1 X2 X1+X2.
+trs-gen-let : trs-gen (trs-let Ts1 Ts2) X
+<- trs-gen Ts1 X1
+<- trs-gen Ts2 X2
+<- ls-union X1 X2 X.
+trc-gen-wr : trc-gen (trc-wr V) ls-nil.
+trc-gen-let : trc-gen (trc-let Ts1 Tc2) X
+<- trs-gen Ts1 X1
+<- trc-gen Tc2 X2
+
+33
+
+<- ls-union X1 X2 X.
+trc-gen-rd : trc-gen (trc-rd L V Ec Tc) X
+<- trc-gen Tc X.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% wf-ex.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Well-formed expressions (with lifts and reachable locations)
+wf-val : val -> st -> val -> ls -> type.
+wf-es : es -> st -> es -> ls -> type.
+wf-ec : ec -> st -> ec -> ls -> type.
+wf-val-var : wf-val V S V ls-nil
+<- var V.
+wf-val-emp : wf-val val-emp S val-emp ls-nil.
+wf-val-nat : wf-val (val-nat N) S (val-nat N) ls-nil.
+wf-val-loc : wf-val (val-loc L) S V’ X1+X2
+<- st-lookup S L V
+<- wf-val V S V’ X1
+<- ls-sing L X2
+<- ls-union X1 X2 X1+X2.
+wf-val-pr : wf-val (val-pr V1 V2) S (val-pr V1’ V2’) X1+X2
+<- wf-val V1 S V1’ X1
+<- wf-val V2 S V2’ X2
+<- ls-union X1 X2 X1+X2.
+wf-val-inl : wf-val (val-inl V) S (val-inl V’) X
+<- wf-val V S V’ X.
+wf-val-inr : wf-val (val-inr V) S (val-inr V’) X
+<- wf-val V S V’ X.
+wf-val-fns : wf-val (val-fns Es) S (val-fns Es’) X
+<- ({v1}{d1 : var v1}
+{v2}{d2 : var v2}
+wf-es (Es v1 v2) S (Es’ v1 v2) X).
+wf-val-fnc : wf-val (val-fnc Ec) S (val-fnc Ec’) X
+<- ({v1}{d1 : var v1}
+{v2}{d2 : var v2}
+wf-ec (Ec v1 v2) S (Ec’ v1 v2) X).
+wf-es-val : wf-es (es-val V) S (es-val V’) X
+<- wf-val V S V’ X.
+wf-es-plus : wf-es (es-plus V1 V2) S (es-plus V1’ V2’) X
+<- wf-val V1 S V1’ X1
+<- wf-val V2 S V2’ X2
+
+34
+
+<- ls-union X1 X2 X.
+wf-es-mod : wf-es (es-mod Ec) S (es-mod Ec’) X
+<- wf-ec Ec S Ec’ X.
+wf-es-app : wf-es (es-app V1 V2) S (es-app V1’ V2’) X
+<- wf-val V1 S V1’ X1
+<- wf-val V2 S V2’ X2
+<- ls-union X1 X2 X.
+wf-es-let : wf-es (es-let Es1 Es2) S (es-let Es1’ Es2’) X
+<- wf-es Es1 S Es1’ X1
+<- ({v}{d : var v}
+wf-es (Es2 v) S (Es2’ v) X2)
+<- ls-union X1 X2 X.
+wf-es-letp : wf-es (es-letp V Es) S (es-letp V’ Es’) X
+<- wf-val V S V’ X1
+<- ({v1}{d1 : var v1}
+{v2}{d2 : var v2}
+wf-es (Es v1 v2) S (Es’ v1 v2) X2)
+<- ls-union X1 X2 X.
+wf-es-case : wf-es (es-case V Es1 Es2) S (es-case V’ Es1’ Es2’) X
+<- wf-val V S V’ X0
+<- ({v}{d : var v}
+wf-es (Es1 v) S (Es1’ v) X1)
+<- ({v}{d : var v}
+wf-es (Es2 v) S (Es2’ v) X2)
+<- ls-union X1 X2 X12
+<- ls-union X12 X0 X.
+wf-es-memo : wf-es (es-memo Es) S (es-memo Es’) X
+<- wf-es Es S Es’ X.
+wf-ec-wr : wf-ec (ec-wr V) S (ec-wr V’) X
+<- wf-val V S V’ X.
+wf-ec-read : wf-ec (ec-read V Ec) S (ec-read V’ Ec’) X
+<- wf-val V S V’ X1
+<- ({v}{d : var v}
+wf-ec (Ec v) S (Ec’ v) X2)
+<- ls-union X1 X2 X.
+wf-ec-app : wf-ec (ec-app V1 V2) S (ec-app V1’ V2’) X
+<- wf-val V1 S V1’ X1
+<- wf-val V2 S V2’ X2
+<- ls-union X1 X2 X.
+wf-ec-let : wf-ec (ec-let Es1 Ec2) S (ec-let Es1’ Ec2’) X
+<- wf-es Es1 S Es1’ X1
+<- ({v}{d : var v}
+wf-ec (Ec2 v) S (Ec2’ v) X2)
+<- ls-union X1 X2 X.
+
+35
+
+wf-ec-letp : wf-ec (ec-letp V Ec) S (ec-letp V’ Ec’) X
+<- wf-val V S V’ X1
+<- ({v1}{d1 : var v1}
+{v2}{d2 : var v2}
+wf-ec (Ec v1 v2) S (Ec’ v1 v2) X2)
+<- ls-union X1 X2 X.
+wf-ec-case : wf-ec (ec-case V Ec1 Ec2) S (ec-case V’ Ec1’ Ec2’) X
+<- wf-val V S V’ X0
+<- ({v}{d : var v}
+wf-ec (Ec1 v) S (Ec1’ v) X1)
+<- ({v}{d : var v}
+wf-ec (Ec2 v) S (Ec2’ v) X2)
+<- ls-union X1 X2 X12
+<- ls-union X12 X0 X.
+wf-ec-memo : wf-ec (ec-memo Ec) S (ec-memo Ec’) X
+<- wf-ec Ec S Ec’ X.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% eval.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% General, well-formed, and clean evaluations.
+evals : st -> es -> val -> st -> trs -> type.
+evalc : st -> loc -> ec -> st -> trc -> type.
+wf-evals : es -> ls -> ls -> evals _ _ _ _ _ -> type.
+wf-evalc : ec -> ls -> ls -> ls -> evalc _ _ _ _ _ -> type.
+wf-evals_ : wf-evals Es’ R G (Devals : evals S Es V S’ Ts)
+<- wf-es Es S Es’ R
+<- trs-gen Ts G
+<- ls-disjoint R G.
+wf-evalc_ : wf-evalc Ec’ R G X (Devalc : evalc S L Ec S’ Tc)
+<- wf-ec Ec S Ec’ R
+<- trc-gen Tc G
+<- ls-disjoint R G
+<- ls-sing L X
+<- ls-disjoint X R
+<- ls-disjoint X G.
+cps : st -> trs -> st -> trs -> type.
+cpc : st -> loc -> trc -> st -> trc -> type.
+
+36
+
+evals-val : evals S (es-val V) V S trs-nil.
+evals-plus : evals S (es-plus (val-nat N1) (val-nat N2)) (val-nat N3) S trs-nil
+<- sum N1 N2 N3.
+evals-mod : evals S (es-mod Ec) (val-loc L) S’ (trs-mod L Tc)
+<- evalc S L Ec S’ Tc
+<- trc-gen Tc G
+<- ls-sing L X
+<- ls-disjoint X G.
+evals-memo-miss : evals S (es-memo Es) V S’ Ts
+<- evals S Es V S’ Ts.
+%% can we mix backward arrows with Pi’s?
+evals-memo-hit :
+cps S Ts1 S’ Ts
+-> {Devals : evals S1 Es V S1’ Ts1}
+wf-evals Es’ R G Devals
+-> evals S (es-memo Es) V S’ Ts.
+evals-app : evals S (es-app (val-fns Es) V2) V S’ Ts
+<- evals S (Es (val-fns Es) V2) V S’ Ts.
+evals-let : evals S (es-let Es1 Es2) V2 S2 (trs-let Ts1 Ts2)
+<- evals S Es1 V1 S1 Ts1
+<- evals S1 (Es2 V1) V2 S2 Ts2
+<- trs-gen Ts1 G1
+<- trs-gen Ts2 G2
+<- ls-disjoint G1 G2.
+evals-letp : evals S (es-letp (val-pr V1 V2) Es) V S’ Ts
+<- evals S (Es V1 V2) V S’ Ts.
+evals-case-inl : evals S (es-case (val-inl V) Es1 Es2) V’ S’ Ts
+<- evals S (Es1 V) V’ S’ Ts.
+evals-case-inr : evals S (es-case (val-inr V) Es1 Es2) V’ S’ Ts
+<- evals S (Es2 V) V’ S’ Ts.
+evalc-write : evalc S L (ec-wr V) S’ (trc-wr V)
+<- st-update S L V S’.
+evalc-read : evalc S L’ (ec-read (val-loc L) Ec) S’ (trc-rd L V Ec Tc)
+<- st-lookup S L V
+<- evalc S L’ (Ec V) S’ Tc.
+evalc-memo-miss : evalc S L (ec-memo Ec) S’ Tc
+<- evalc S L Ec S’ Tc.
+%% can we mix backward arrows with Pi’s?
+evalc-memo-hit :
+cpc S L Tc1 S’ Tc
+-> {Devalc : evalc S1 L Ec S1’ Tc1}
+wf-evalc Ec’ R G X Devalc
+-> evalc S L (ec-memo Ec) S’ Tc.
+
+37
+
+evalc-app : evalc S L (ec-app (val-fnc Ec) V2) S’ Tc
+<- evalc S L (Ec (val-fnc Ec) V2) S’ Tc.
+evalc-let : evalc S L (ec-let Es1 Ec2) S2 (trc-let Ts1 Tc2)
+<- evals S Es1 V S1 Ts1
+<- evalc S1 L (Ec2 V) S2 Tc2
+<- trs-gen Ts1 G1
+<- trc-gen Tc2 G2
+<- ls-disjoint G1 G2.
+evalc-letp : evalc S L (ec-letp (val-pr V1 V2) Ec) S’ Tc
+<- evalc S L (Ec V1 V2) S’ Tc.
+evalc-case-inl : evalc S L (ec-case (val-inl V) Ec1 Ec2) S’ Tc
+<- evalc S L (Ec1 V) S’ Tc.
+evalc-case-inr : evalc S L (ec-case (val-inr V) Ec1 Ec2) S’ Tc
+<- evalc S L (Ec2 V) S’ Tc.
+cps-nil : cps S trs-nil S trs-nil.
+cps-mod : cps S (trs-mod L Tc) S’ (trs-mod L Tc’)
+<- cpc S L Tc S’ Tc’
+<- trc-gen Tc’ G
+<- ls-sing L X
+<- ls-disjoint X G.
+cps-let : cps S (trs-let Ts1 Ts2) S’’ (trs-let Ts1’ Ts2’)
+<- cps S Ts1 S’ Ts1’
+<- cps S’ Ts2 S’’ Ts2’
+<- trs-gen Ts1’ G1
+<- trs-gen Ts2’ G2
+<- ls-disjoint G1 G2.
+cpc-write : cpc S L (trc-wr V) S’ (trc-wr V)
+<- st-update S L V S’.
+cpc-let : cpc S L’ (trc-let Ts1 Tc2) S’’ (trc-let Ts1’ Tc2’)
+<- cps S Ts1 S’ Ts1’
+<- cpc S’ L’ Tc2 S’’ Tc2’
+<- trs-gen Ts1’ G1
+<- trc-gen Tc2’ G2
+<- ls-disjoint G1 G2.
+cpc-read/noch : cpc S L (trc-rd L’ V Ec Tc) S’ (trc-rd L’ V Ec Tc’)
+<- st-lookup S L’ V
+<- cpc S L Tc S’ Tc’.
+cpc-read/ch : cpc S L (trc-rd L’ V Ec Tc) S’ (trc-rd L’ V’ Ec Tc’)
+<- st-lookup S L’ V’
+<- val-neq V V’
+<- evalc S L (Ec V’) S’ Tc’.
+
+38
+
+%%
+cln-evals : evals _ _ _ _ _ -> type.
+cln-evalc : evalc _ _ _ _ _ -> type.
+cln-evals-val : cln-evals evals-val.
+cln-evals-plus : cln-evals (evals-plus _).
+cln-evals-mod : cln-evals (evals-mod _ _ _ D)
+<- cln-evalc D.
+cln-evals-miss : cln-evals (evals-memo-miss D)
+<- cln-evals D.
+cln-evals-app : cln-evals (evals-app D)
+<- cln-evals D.
+cln-evals-let : cln-evals (evals-let _ _ _ D2 D1)
+<- cln-evals D1
+<- cln-evals D2.
+cln-evals-letp : cln-evals (evals-letp D)
+<- cln-evals D.
+cln-evals-inl : cln-evals (evals-case-inl D)
+<- cln-evals D.
+cln-evals-inr : cln-evals (evals-case-inr D)
+<- cln-evals D.
+cln-evalc-write : cln-evalc (evalc-write _).
+cln-evalc-read : cln-evalc (evalc-read D _)
+<- cln-evalc D.
+cln-evalc-miss : cln-evalc (evalc-memo-miss D)
+<- cln-evalc D.
+cln-evalc-app : cln-evalc (evalc-app D)
+<- cln-evalc D.
+cln-evalc-let : cln-evalc (evalc-let _ _ _ D2 D1)
+<- cln-evals D1
+<- cln-evalc D2.
+cln-evalc-letp : cln-evalc (evalc-letp D)
+<- cln-evalc D.
+cln-evalc-inl : cln-evalc (evalc-case-inl D)
+<- cln-evalc D.
+cln-evalc-inr : cln-evalc (evalc-case-inr D)
+<- cln-evalc D.
+
+39
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% pure.elf
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+%% pure.elf
+%% The "pure" semantics
+%%
+%% pure evaluation for stable and changeable expressions
+evals-pure : es -> val -> type.
+evalc-pure : ec -> val -> type.
+%% stable expressions.
+evals-pure-val : evals-pure (es-val V) V.
+evals-pure-plus : evals-pure (es-plus (val-nat N1) (val-nat N2)) (val-nat N3)
+<- sum N1 N2 N3.
+evals-pure-mod : evals-pure (es-mod E) V
+<- evalc-pure E V.
+evals-pure-memo : evals-pure (es-memo E) V
+<- evals-pure E V.
+evals-pure-app : evals-pure (es-app (val-fns Es) V1) V2
+<- evals-pure (Es (val-fns Es) V1) V2.
+
+evals-pure-let : evals-pure (es-let Es1 Es2) V2
+<- evals-pure Es1 V1
+<- evals-pure (Es2 V1) V2.
+evals-pure-letp : evals-pure (es-letp (val-pr V1 V2) Es) V
+<- evals-pure (Es V1 V2) V.
+evals-pure-case-inl : evals-pure (es-case (val-inl V1) Es1 Es2) V2
+<- evals-pure (Es1 V1) V2.
+evals-pure-case-inr : evals-pure (es-case (val-inr V1) Es1 Es2) V2
+<- evals-pure (Es2 V1) V2.
+%% changeable expressions.
+evalc-pure-write : evalc-pure (ec-wr V) V.
+evalc-pure-read : evalc-pure (ec-read V1 Ec) V2
+
+40
+
+<- evalc-pure (Ec V1) V2.
+evalc-pure-memo : evalc-pure (ec-memo Ec) V
+<- evalc-pure Ec V.
+
+evalc-pure-app : evalc-pure (ec-app (val-fnc Ec) V1) V2
+<- evalc-pure (Ec (val-fnc Ec) V1) V2.
+evalc-pure-let : evalc-pure (ec-let Es Ec) V2
+<- evals-pure Es V1
+<- evalc-pure (Ec V1) V2.
+evalc-pure-letp : evalc-pure (ec-letp (val-pr V1 V2) Ec) V
+<- evalc-pure (Ec V1 V2) V.
+evalc-pure-case-inl : evalc-pure (ec-case (val-inl V1) Ec1 Ec2) V2
+<- evalc-pure (Ec1 V1) V2.
+evalc-pure-case-inr : evalc-pure (ec-case (val-inr V1) Ec1 Ec2) V2
+<- evalc-pure (Ec2 V1) V2.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% nat-lemmas.thm
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+leq-refl : {N} leq N N -> type.
+%mode leq-refl +X1 -X2.
+- : leq-refl z leq-z.
+- : leq-refl (s N) (leq-s Dleq)
+<- leq-refl N Dleq.
+%worlds () (leq-refl _ _).
+%total D (leq-refl D _).
+
+leq-refl-s : {N} leq N (s N) -> type.
+%mode leq-refl-s +X1 -X2.
+- : leq-refl-s z leq-z.
+- : leq-refl-s (s N) (leq-s Dleq)
+<- leq-refl-s N Dleq.
+
+41
+
+%worlds () (leq-refl-s _ _).
+%total D (leq-refl-s D _).
+%%
+sum-id : {N} sum N z N -> type.
+%mode sum-id +N -S.
+- : sum-id z sum-z.
+- : sum-id (s N) (sum-s S) <- sum-id N S.
+%worlds () (sum-id _ _).
+%total N (sum-id N _).
+%%
+sum-inc : sum X Y Z -> sum X (s Y) (s Z) -> type.
+%mode sum-inc +S1 -S2.
+- : sum-inc sum-z sum-z.
+- : sum-inc (sum-s S1) (sum-s S2) <- sum-inc S1 S2.
+%worlds () (sum-inc _ _).
+%total S (sum-inc S _).
+%%
+sum-commutes : sum X Y Z -> sum Y X Z -> type.
+%mode sum-commutes +S1 -S2.
+sum-commutes-z : sum-commutes sum-z S’
+<- sum-id _ S’.
+sum-commutes-s : sum-commutes (sum-s S) S’’
+<- sum-commutes S S’
+<- sum-inc S’ S’’.
+%worlds () (sum-commutes _ _).
+%total S (sum-commutes S _).
+%%
+sum-reduces : {X} {Y} {Z} sum X Y Z -> type.
+%mode sum-reduces +X +Y +Z +S.
+
+42
+
+sum-reduces-z : sum-reduces z Y Y sum-z.
+sum-reduces-s : sum-reduces (s X) Y (s Z) (sum-s S)
+<- sum-reduces X Y Z S.
+%worlds () (sum-reduces _ _ _ _).
+%total S (sum-reduces _ _ _ S).
+%reduces Y <= Z (sum-reduces _ Y Z _).
+%%
+leq-trans : leq N1 N2 -> leq N2 N3 -> leq N1 N3 -> type.
+%mode leq-trans +X1 +X2 -X3.
+- : leq-trans leq-z _ leq-z.
+- : leq-trans (leq-s Dleq1) (leq-s Dleq2) (leq-s Dleq3)
+<- leq-trans Dleq1 Dleq2 Dleq3.
+%worlds () (leq-trans _ _ _).
+%total D (leq-trans D _ _).
+%%
+leq-imp-sum : sum N1 N2 N3 -> leq N1 N3 -> type.
+%mode leq-imp-sum -X1 +X2.
+leq-imp-sum-z : leq-imp-sum sum-z leq-z.
+leq-imp-sum-s : leq-imp-sum (sum-s D) (leq-s D’)
+<- leq-imp-sum D D’.
+%worlds () (leq-imp-sum _ _).
+%total D (leq-imp-sum _ D).
+%%
+leq-reduces : {X} {Y} leq X Y -> type.
+%mode leq-reduces +X +Y +L.
+- : leq-reduces X Y LE
+<- leq-imp-sum S LE
+<- sum-commutes S S’
+<- sum-reduces _ _ _ S’.
+%worlds () (leq-reduces _ _ _).
+%total {} (leq-reduces _ _ _).
+%reduces X <= Y (leq-reduces X Y _).
+
+43
+
+%%
+can-sum : {N1} {N2} sum N1 N2 N3 -> type.
+%mode can-sum +X1 +X2 -X3.
+- : can-sum z N sum-z.
+- : can-sum (s N1) N2 (sum-s Dsum)
+<- can-sum N1 N2 Dsum.
+%worlds () (can-sum _ _ _).
+%total D (can-sum D _ _).
+
+sum-imp-leq : sum N1 N2 N3 -> leq N1 N3 -> leq N2 N3 -> type.
+%mode sum-imp-leq +X1 -X2 -X3.
+- : sum-imp-leq sum-z leq-z Dleq
+<- leq-refl _ Dleq.
+- : sum-imp-leq (sum-s Dsum) (leq-s Dleq1) Dleq2
+<- sum-imp-leq Dsum Dleq1 Dleq3
+<- leq-refl-s _ Dleq4
+<- leq-trans Dleq3 Dleq4 Dleq2.
+%worlds () (sum-imp-leq _ _ _).
+%total D (sum-imp-leq D _ _).
+
+sum-monotone : leq N1 N1’ -> leq N2 N2’ -> sum N1 N2 N3 -> sum N1’ N2’ N3’ -> leq N
+%mode sum-monotone +X1 +X2 +X3 +X4 -X5.
+- : sum-monotone leq-z Dl2 sum-z Ds’ Dl3
+<- sum-imp-leq Ds’ _ Dl
+<- leq-trans Dl2 Dl Dl3.
+- : sum-monotone (leq-s Dl1) Dl2 (sum-s Ds) (sum-s Ds’) (leq-s Dl3)
+<- sum-monotone Dl1 Dl2 Ds Ds’ Dl3.
+%worlds () (sum-monotone _ _ _ _ _).
+%total D (sum-monotone D _ _ _ _).
+sum-s-rh-r : sum A B S -> sum A (s B) (s S) -> type.
+%mode sum-s-rh-r +D1 -D2.
+
+44
+
+- : sum-s-rh-r sum-z sum-z.
+- : sum-s-rh-r (sum-s D) (sum-s D’)
+<- sum-s-rh-r D D’.
+%worlds () (sum-s-rh-r _ _).
+%total D (sum-s-rh-r D _).
+sum-s-rh-l : sum A B S -> sum A (s B) (s S) -> type.
+%mode sum-s-rh-l -D1 +D2.
+- : sum-s-rh-l sum-z sum-z.
+- : sum-s-rh-l (sum-s D) (sum-s D’)
+<- sum-s-rh-l D D’.
+%worlds () (sum-s-rh-l _ _).
+%total D (sum-s-rh-l _ D).
+sum-subsums :
+sum N1 N2 N1+N2
+-> sum N3 N4 N3+N4
+-> sum N1+N2 N3+N4 N1+N2+N3+N4
+-> sum N1 N3 N1+N3
+-> sum N2 N4 N2+N4
+%%
+-> sum N1+N3 N2+N4 N1+N2+N3+N4
+-> type.
+%mode sum-subsums +X1 +X2 +X3 +X4 +X5 -X6.
+- : sum-subsums sum-z Ds34 sum-z sum-z sum-z Ds34.
+- : sum-subsums (sum-s Ds12) Ds34 (sum-s Ds12+34) (sum-s Ds13) Ds24
+(sum-s Ds13+24)
+<- sum-subsums Ds12 Ds34 Ds12+34 Ds13 Ds24 Ds13+24.
+- : sum-subsums Ds12’ Ds34 (sum-s Ds12+34) Ds13 (sum-s Ds24)
+Ds13+2’4
+<- sum-s-rh-l Ds12 Ds12’
+<- sum-subsums Ds12 Ds34 Ds12+34 Ds13 Ds24 Ds13+24
+<- sum-s-rh-r Ds13+24 Ds13+2’4.
+%worlds () (sum-subsums _ _ _ _ _ _).
+%total {D5 D1} (sum-subsums D1 _ _ _ D5 _).
+
+45
+
+nat-eq-s : nat-eq N1 N2 -> nat-eq (s N1) (s N2) -> type.
+%mode nat-eq-s +X1 -X2.
+- : nat-eq-s nat-eq_ nat-eq_.
+%worlds () (nat-eq-s _ _).
+%total {} (nat-eq-s _ _).
+
+sum-fun :
+sum N1 N2 N3 ->
+sum N1 N2 N3’ ->
+%%
+nat-eq N3 N3’ ->
+type.
+%mode sum-fun +X1 +X2 -X3.
+- : sum-fun sum-z sum-z nat-eq_.
+- : sum-fun (sum-s Dsum) (sum-s Dsum’) Deq’
+<- sum-fun Dsum Dsum’ Deq’’
+<- nat-eq-s Deq’’ Deq’.
+%worlds () (sum-fun _ _ _).
+%total D (sum-fun D _ _).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% locset-lemmas.thm
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+can-loc-or : {P1} {P2} loc-or P1 P2 P -> type.
+%mode can-loc-or +P1 +P2 -P.
+- : can-loc-or _ _ loc-or-aa.
+- : can-loc-or _ _ loc-or-px.
+- : can-loc-or _ _ loc-or-xp.
+%worlds () (can-loc-or _ _ _).
+%total P (can-loc-or P _ _).
+%%
+can-ls-union :
+{X1} {X2}
+%%
+ls-union X1 X2 X3 ->
+type.
+
+46
+
+%mode can-ls-union +X1 +X2 -X3.
+- : can-ls-union ls-nil _ ls-un-nx.
+- : can-ls-union _ ls-nil ls-un-xn.
+- : can-ls-union (ls-cons P1 X1) (ls-cons P2 X2) (ls-un-cc U O)
+<- can-ls-union X1 X2 U
+<- can-loc-or P1 P2 O.
+%worlds () (can-ls-union _ _ _).
+%total D (can-ls-union D _ _).
+%%
+can-ls-sing :
+{L}
+%%
+ls-sing L X ->
+type.
+%mode can-ls-sing +X1 -X2.
+- : can-ls-sing loc-z ls-sing-z.
+- : can-ls-sing (loc-s L) (ls-sing-s Sg) <- can-ls-sing L Sg.
+%worlds () (can-ls-sing _ _).
+%total L (can-ls-sing L _).
+%%
+loc-or-commutes :
+loc-or A B C ->
+%%
+loc-or B A C ->
+type.
+%mode loc-or-commutes +X -Y.
+- : loc-or-commutes loc-or-aa loc-or-aa.
+- : loc-or-commutes loc-or-xp loc-or-px.
+- : loc-or-commutes loc-or-px loc-or-xp.
+%worlds () (loc-or-commutes _ _).
+%total {} (loc-or-commutes _ _).
+%%
+ls-union-commutes :
+
+47
+
+ls-union X Y Z ->
+ls-union Y X Z ->
+type.
+%mode ls-union-commutes +X1 -X2.
+- : ls-union-commutes ls-un-nx ls-un-xn.
+- : ls-union-commutes ls-un-xn ls-un-nx.
+- : ls-union-commutes (ls-un-cc U O) (ls-un-cc U’ O’)
+<- loc-or-commutes O O’
+<- ls-union-commutes U U’.
+%worlds () (ls-union-commutes _ _).
+%total D (ls-union-commutes D _).
+%%
+ls-subeq-refl :
+{X}
+%%
+ls-subeq X X ->
+type.
+%mode ls-subeq-refl +X1 -X2.
+- : ls-subeq-refl ls-nil ls-subeq-nx.
+- : ls-subeq-refl (ls-cons loc-absent X) (ls-subeq-ax D)
+<- ls-subeq-refl X D.
+- : ls-subeq-refl (ls-cons loc-present X) (ls-subeq-pp D)
+<- ls-subeq-refl X D.
+%worlds () (ls-subeq-refl _ _).
+%total D (ls-subeq-refl D _).
+%%
+ls-union-imp-subeq :
+ls-union S1 S2 S3 ->
+%%
+ls-subeq S1 S3 ->
+ls-subeq S2 S3 ->
+type.
+%mode ls-union-imp-subeq +X1 -X2 -X3.
+- : ls-union-imp-subeq ls-un-nx ls-subeq-nx SE2
+<- ls-subeq-refl _ SE2.
+- : ls-union-imp-subeq ls-un-xn SE1 ls-subeq-nx
+
+48
+
+<- ls-subeq-refl _ SE1.
+- : ls-union-imp-subeq
+(ls-un-cc Un loc-or-aa)
+(ls-subeq-ax SE1)
+(ls-subeq-ax SE2)
+<- ls-union-imp-subeq Un SE1 SE2.
+- : ls-union-imp-subeq
+(ls-un-cc Un loc-or-px)
+(ls-subeq-pp SE1)
+(ls-subeq-ax SE2)
+<- ls-union-imp-subeq Un SE1 SE2.
+- : ls-union-imp-subeq
+(ls-un-cc Un loc-or-px)
+(ls-subeq-pp SE1)
+(ls-subeq-pp SE2)
+<- ls-union-imp-subeq Un SE1 SE2.
+- : ls-union-imp-subeq
+(ls-un-cc Un loc-or-xp)
+(ls-subeq-ax SE1)
+(ls-subeq-pp SE2)
+<- ls-union-imp-subeq Un SE1 SE2.
+- : ls-union-imp-subeq
+(ls-un-cc Un loc-or-xp)
+(ls-subeq-pp SE1)
+(ls-subeq-pp SE2)
+<- ls-union-imp-subeq Un SE1 SE2.
+%worlds () (ls-union-imp-subeq _ _ _).
+%total D (ls-union-imp-subeq D _ _).
+%%
+ls-emp-impl-subeq-any : {Y} ls-empty X -> ls-subeq X Y -> type.
+%mode ls-emp-impl-subeq-any +Y +E -SE.
+- : ls-emp-impl-subeq-any ls-nil E (ls-subeq-xn E).
+- : ls-emp-impl-subeq-any _ ls-empty-n ls-subeq-nx.
+- : ls-emp-impl-subeq-any (ls-cons _ X) (ls-empty-a E) (ls-subeq-ax SE)
+<- ls-emp-impl-subeq-any X E SE.
+%worlds () (ls-emp-impl-subeq-any _ _ _).
+%total D (ls-emp-impl-subeq-any _ D _).
+%%
+ls-subeq-emp-impl-emp : ls-subeq X Y -> ls-empty Y -> ls-empty X -> type.
+
+49
+
+%mode ls-subeq-emp-impl-emp +X1 +X2 -X3.
+- : ls-subeq-emp-impl-emp ls-subeq-nx _ ls-empty-n.
+- : ls-subeq-emp-impl-emp (ls-subeq-xn E) ls-empty-n E.
+- : ls-subeq-emp-impl-emp (ls-subeq-ax SE) (ls-empty-a E) (ls-empty-a E’)
+<- ls-subeq-emp-impl-emp SE E E’.
+%worlds () (ls-subeq-emp-impl-emp _ _ _).
+%total D (ls-subeq-emp-impl-emp _ D _).
+%%
+ls-subeq-trans :
+ls-subeq X1 X2 ->
+ls-subeq X2 X3 ->
+%%
+ls-subeq X1 X3 ->
+type.
+%mode ls-subeq-trans +X1 +X2 -X3.
+- : ls-subeq-trans ls-subeq-nx _ ls-subeq-nx.
+- : ls-subeq-trans D ls-subeq-nx D’
+<- ls-subeq-emp-impl-emp D ls-empty-n E’
+<- ls-emp-impl-subeq-any _ E’ D’.
+- : ls-subeq-trans D (ls-subeq-xn E) D’
+<- ls-subeq-emp-impl-emp D E E’
+<- ls-emp-impl-subeq-any _ E’ D’.
+- : ls-subeq-trans (ls-subeq-ax D12) (ls-subeq-ax D23) (ls-subeq-ax D13)
+<- ls-subeq-trans D12 D23 D13.
+- : ls-subeq-trans (ls-subeq-ax D12) (ls-subeq-pp D23) (ls-subeq-ax D13)
+<- ls-subeq-trans D12 D23 D13.
+- : ls-subeq-trans (ls-subeq-pp D12) (ls-subeq-pp D23) (ls-subeq-pp D13)
+<- ls-subeq-trans D12 D23 D13.
+%worlds () (ls-subeq-trans _ _ _).
+%total D (ls-subeq-trans D _ _).
+%%
+ls-union-monotone-l :
+ls-union X Y Z ->
+ls-subeq X X’ ->
+ls-union X’ Y Z’ ->
+%%
+ls-subeq Z Z’ ->
+
+50
+
+type.
+%mode ls-union-monotone-l +X1 +X2 +X3 -X4.
+%% if Y = ls-nil, then X = Z and X’ = Z’
+- : ls-union-monotone-l
+(_ : ls-union _ ls-nil _)
+SE
+_
+SE.
+%% now Y = (ls-cons _ _)
+%% consider X = ls-nil, so Y = Z
+- : ls-union-monotone-l
+ls-un-nx
+_
+Un
+SE
+<- ls-union-imp-subeq Un _ SE.
+%% now Y = (ls-cons _ _) and X = (ls-cons _ _)
+%% now if X’ = ls-nil, X must be empty...
+- : ls-union-monotone-l
+(ls-un-cc Un loc-or-aa)
+(ls-subeq-xn (ls-empty-a E))
+ls-un-nx
+(ls-subeq-ax SE)
+<- ls-union-monotone-l Un (ls-subeq-xn E) ls-un-nx SE.
+- : ls-union-monotone-l
+(ls-un-cc Un loc-or-xp)
+(ls-subeq-xn (ls-empty-a E))
+ls-un-nx
+(ls-subeq-pp SE)
+<- ls-union-monotone-l Un (ls-subeq-xn E) ls-un-nx SE.
+%% finally, if X’ = (ls-cons _ _)...
+- : ls-union-monotone-l
+(ls-un-cc Un _)
+(ls-subeq-ax SE)
+
+51
+
+(ls-un-cc Un’ loc-or-aa)
+(ls-subeq-ax SE’)
+<- ls-union-monotone-l Un SE Un’ SE’.
+- : ls-union-monotone-l
+(ls-un-cc Un _)
+(ls-subeq-ax SE)
+(ls-un-cc Un’ loc-or-xp)
+(ls-subeq-pp SE’)
+<- ls-union-monotone-l Un SE Un’ SE’.
+- : ls-union-monotone-l
+(ls-un-cc Un _)
+(ls-subeq-ax SE)
+(ls-un-cc Un’ loc-or-px)
+(ls-subeq-pp SE’)
+<- ls-union-monotone-l Un SE Un’ SE’.
+- : ls-union-monotone-l
+(ls-un-cc Un _)
+(ls-subeq-ax SE)
+(ls-un-cc Un’ loc-or-px)
+(ls-subeq-ax SE’)
+<- ls-union-monotone-l Un SE Un’ SE’.
+- : ls-union-monotone-l
+(ls-un-cc Un _)
+(ls-subeq-pp SE)
+(ls-un-cc Un’ _)
+(ls-subeq-pp SE’)
+<- ls-union-monotone-l Un SE Un’ SE’.
+- : ls-union-monotone-l
+(ls-un-cc Un _)
+(ls-subeq-pp SE)
+(ls-un-cc Un’ _)
+(ls-subeq-pp SE’)
+<- ls-union-monotone-l Un SE Un’ SE’.
+%worlds () (ls-union-monotone-l _ _ _ _).
+%total D (ls-union-monotone-l D _ _ _).
+%%
+ls-union-monotone-r :
+
+52
+
+ls-union X Y Z ->
+ls-subeq Y Y’ ->
+ls-union X Y’ Z’ ->
+%%
+ls-subeq Z Z’ ->
+type.
+%mode ls-union-monotone-r +X1 +X2 +X3 -X4.
+- : ls-union-monotone-r Un SE Un’ SE’
+<- ls-union-commutes Un Unc
+<- ls-union-commutes Un’ Unc’
+<- ls-union-monotone-l Unc SE Unc’ SE’.
+%worlds () (ls-union-monotone-r _ _ _ _).
+%total {} (ls-union-monotone-r _ _ _ _).
+%%
+ls-union-monotone :
+ls-union X1 X2 X3 ->
+ls-subeq X1 X1’ ->
+ls-subeq X2 X2’ ->
+ls-union X1’ X2’ X3’ ->
+%%
+ls-subeq X3 X3’ ->
+type.
+%mode ls-union-monotone +X1 +X2 +X3 +X4 -X5.
+- : ls-union-monotone Un SE1 SE2 Un’ SE3
+<- can-ls-union _ _ Un1’2
+<- ls-union-monotone-l Un SE1 Un1’2 SEl
+<- ls-union-monotone-r Un1’2 SE2 Un’ SEr
+<- ls-subeq-trans SEl SEr SE3.
+%worlds () (ls-union-monotone _ _ _ _ _).
+%total {} (ls-union-monotone _ _ _ _ _).
+%%
+ls-disjoint-commutes :
+ls-disjoint X1 X2 ->
+%%
+ls-disjoint X2 X1 ->
+type.
+%mode ls-disjoint-commutes +X1 -X2.
+
+53
+
+- : ls-disjoint-commutes ls-dj-nx ls-dj-xn.
+- : ls-disjoint-commutes ls-dj-xn ls-dj-nx.
+- : ls-disjoint-commutes (ls-dj-ac D) (ls-dj-ca D’)
+<- ls-disjoint-commutes D D’.
+- : ls-disjoint-commutes (ls-dj-ca D) (ls-dj-ac D’)
+<- ls-disjoint-commutes D D’.
+%worlds () (ls-disjoint-commutes _ _).
+%total D (ls-disjoint-commutes D _).
+%%
+ls-emp-implies-dj :
+{Y} ls-empty X -> ls-disjoint X Y -> ls-disjoint Y X -> type.
+%mode ls-emp-implies-dj +Y +E -D1 -D2.
+- : ls-emp-implies-dj _ ls-empty-n ls-dj-nx ls-dj-xn.
+- : ls-emp-implies-dj ls-nil _ ls-dj-xn ls-dj-nx.
+- : ls-emp-implies-dj
+(ls-cons _ Y) (ls-empty-a E) (ls-dj-ac Dj1) (ls-dj-ca Dj2)
+<- ls-emp-implies-dj Y E Dj1 Dj2.
+%worlds () (ls-emp-implies-dj _ _ _ _).
+%total Y (ls-emp-implies-dj Y _ _ _).
+%%
+ls-disjoint-resp-subeq :
+ls-disjoint X1 X2 ->
+ls-subeq X1’ X1 ->
+ls-subeq X2’ X2 ->
+%%
+ls-disjoint X1’ X2’ ->
+type.
+%mode ls-disjoint-resp-subeq +X1 +X2 +X3 -X4.
+- : ls-disjoint-resp-subeq _ ls-subeq-nx _ ls-dj-nx.
+- : ls-disjoint-resp-subeq _ _ ls-subeq-nx ls-dj-xn.
+- : ls-disjoint-resp-subeq _ (ls-subeq-xn E1) _ Dj
+<- ls-emp-implies-dj _ E1 Dj _.
+- : ls-disjoint-resp-subeq _ _ (ls-subeq-xn E2) Dj
+
+54
+
+<- ls-emp-implies-dj _ E2 _ Dj.
+- : ls-disjoint-resp-subeq
+(ls-dj-ac Dj)
+(ls-subeq-ax SE1)
+(ls-subeq-ax SE2)
+(ls-dj-ac Dj’)
+<- ls-disjoint-resp-subeq Dj SE1 SE2 Dj’.
+- : ls-disjoint-resp-subeq
+(ls-dj-ac Dj)
+(ls-subeq-ax SE1)
+(ls-subeq-pp SE2)
+(ls-dj-ac Dj’)
+<- ls-disjoint-resp-subeq Dj SE1 SE2 Dj’.
+- : ls-disjoint-resp-subeq
+(ls-dj-ca Dj)
+(ls-subeq-ax SE1)
+(ls-subeq-ax SE2)
+(ls-dj-ac Dj’)
+<- ls-disjoint-resp-subeq Dj SE1 SE2 Dj’.
+- : ls-disjoint-resp-subeq
+(ls-dj-ca Dj)
+(ls-subeq-pp SE1)
+(ls-subeq-ax SE2)
+(ls-dj-ca Dj’)
+<- ls-disjoint-resp-subeq Dj SE1 SE2 Dj’.
+%worlds () (ls-disjoint-resp-subeq _ _ _ _).
+%total D (ls-disjoint-resp-subeq D _ _ _).
+%%
+ls-union-emp-emp-emp :
+ls-union X Y Z -> ls-empty X -> ls-empty Y -> ls-empty Z -> type.
+%mode ls-union-emp-emp-emp +U +EX +EY -EZ.
+- : ls-union-emp-emp-emp _ ls-empty-n E E.
+- : ls-union-emp-emp-emp _ E ls-empty-n E.
+- : ls-union-emp-emp-emp
+(ls-un-cc Un _) (ls-empty-a X) (ls-empty-a Y) (ls-empty-a Z)
+<- ls-union-emp-emp-emp Un X Y Z.
+
+55
+
+%worlds () (ls-union-emp-emp-emp _ _ _ _).
+%total D (ls-union-emp-emp-emp D _ _ _).
+%%
+ls-emp-emp-eq : ls-empty X -> ls-empty Y -> ls-eq X Y -> type.
+%mode ls-emp-emp-eq +E1 +E2 -Eq.
+- : ls-emp-emp-eq ls-empty-n E2 (ls-eq-nx E2).
+- : ls-emp-emp-eq E1 ls-empty-n (ls-eq-xn E1).
+- : ls-emp-emp-eq (ls-empty-a E1) (ls-empty-a E2) (ls-eq-cc Eq)
+<- ls-emp-emp-eq E1 E2 Eq.
+%worlds () (ls-emp-emp-eq _ _ _).
+%total D (ls-emp-emp-eq D _ _).
+%%
+ls-eq-refl : {X} ls-eq X X -> type.
+%mode ls-eq-refl +X -Eq.
+- : ls-eq-refl ls-nil (ls-eq-nx ls-empty-n).
+- : ls-eq-refl (ls-cons _ X) (ls-eq-cc Eq) <- ls-eq-refl X Eq.
+%worlds () (ls-eq-refl _ _).
+%total X (ls-eq-refl X _).
+%%
+ls-union-emp-eq : ls-union X Y Z -> ls-empty X -> ls-eq Y Z -> type.
+%mode ls-union-emp-eq +U +E -Eq.
+- : ls-union-emp-eq ls-un-nx _ Eq
+<- ls-eq-refl _ Eq.
+- : ls-union-emp-eq ls-un-xn EZ (ls-eq-nx EZ).
+- : ls-union-emp-eq (ls-un-cc Un Or) (ls-empty-a EX) (ls-eq-cc Eq)
+<- ls-union-emp-eq Un EX Eq.
+%worlds () (ls-union-emp-eq _ _ _).
+%total D (ls-union-emp-eq D _ _).
+%%
+ls-subeq-union :
+ls-subeq X1 X2 ->
+ls-subeq X3 X2 ->
+ls-union X1 X3 X4 ->
+
+56
+
+%%
+ls-subeq X4 X2 ->
+type.
+%mode ls-subeq-union +X1 +X2 +X3 -X4.
+- : ls-subeq-union ls-subeq-nx SE _ SE.
+- : ls-subeq-union SE ls-subeq-nx _ SE.
+- : ls-subeq-union
+(ls-subeq-xn E1)
+(ls-subeq-xn E3)
+Un
+(ls-subeq-xn E4)
+<- ls-union-emp-emp-emp Un E1 E3 E4.
+- : ls-subeq-union
+(ls-subeq-ax SE12)
+(ls-subeq-ax SE32)
+(ls-un-cc Un _)
+(ls-subeq-ax SE42)
+<- ls-subeq-union SE12 SE32 Un SE42.
+- : ls-subeq-union
+(ls-subeq-pp SE12)
+(ls-subeq-ax SE32)
+(ls-un-cc Un _)
+(ls-subeq-pp SE42)
+<- ls-subeq-union SE12 SE32 Un SE42.
+- : ls-subeq-union
+(ls-subeq-ax SE12)
+(ls-subeq-pp SE32)
+(ls-un-cc Un _)
+(ls-subeq-pp SE42)
+<- ls-subeq-union SE12 SE32 Un SE42.
+- : ls-subeq-union
+(ls-subeq-pp SE12)
+(ls-subeq-pp SE32)
+(ls-un-cc Un _)
+(ls-subeq-pp SE42)
+<- ls-subeq-union SE12 SE32 Un SE42.
+%worlds () (ls-subeq-union _ _ _ _).
+
+57
+
+%total D (ls-subeq-union D _ _ _).
+%%
+ls-disjoint-union :
+ls-disjoint X Z ->
+ls-disjoint Y Z ->
+ls-union X Y XY ->
+%%
+ls-disjoint XY Z ->
+type.
+%mode ls-disjoint-union +X1 +X2 +X3 -X4.
+- : ls-disjoint-union ls-dj-nx Dj ls-un-nx Dj.
+- : ls-disjoint-union Dj ls-dj-nx ls-un-xn Dj.
+- : ls-disjoint-union _ ls-dj-xn _ ls-dj-xn.
+- : ls-disjoint-union ls-dj-xn _ _ ls-dj-xn.
+- : ls-disjoint-union
+(ls-dj-ac DjXZ) (ls-dj-ac DjYZ) (ls-un-cc Un _) (ls-dj-ac DjXYZ)
+<- ls-disjoint-union DjXZ DjYZ Un DjXYZ.
+- : ls-disjoint-union
+(ls-dj-ca DjXZ) (ls-dj-ac DjYZ) (ls-un-cc Un _) (ls-dj-ca DjXYZ)
+<- ls-disjoint-union DjXZ DjYZ Un DjXYZ.
+- : ls-disjoint-union
+(ls-dj-ac DjXZ) (ls-dj-ca DjYZ) (ls-un-cc Un _) (ls-dj-ca DjXYZ)
+<- ls-disjoint-union DjXZ DjYZ Un DjXYZ.
+- : ls-disjoint-union
+(ls-dj-ca DjXZ) (ls-dj-ca DjYZ) (ls-un-cc Un _) (ls-dj-ca DjXYZ)
+<- ls-disjoint-union DjXZ DjYZ Un DjXYZ.
+%worlds () (ls-disjoint-union _ _ _ _).
+%total D (ls-disjoint-union D _ _ _).
+%%
+ls-emp-impl-disj :
+{Y} ls-empty X -> ls-disjoint X Y -> ls-disjoint Y X -> type.
+%mode ls-emp-impl-disj +Y +E -D1 -D2.
+- : ls-emp-impl-disj ls-nil _ ls-dj-xn ls-dj-nx.
+- : ls-emp-impl-disj _ ls-empty-n ls-dj-nx ls-dj-xn.
+
+58
+
+- : ls-emp-impl-disj (ls-cons _ Y) (ls-empty-a E) (ls-dj-ac D) (ls-dj-ca D’)
+<- ls-emp-impl-disj Y E D D’.
+%worlds () (ls-emp-impl-disj _ _ _ _).
+%total D (ls-emp-impl-disj D _ _ _).
+%%
+ls-disjoint-resp-eq :
+ls-disjoint X1 X2 ->
+ls-eq X1 X1’ ->
+ls-eq X2 X2’ ->
+%%
+ls-disjoint X1’ X2’ ->
+type.
+%mode ls-disjoint-resp-eq +X1 +X2 +X3 -X4.
+- : ls-disjoint-resp-eq ls-dj-nx (ls-eq-nx E1’) _ Dj
+<- ls-emp-impl-disj _ E1’ Dj _.
+- : ls-disjoint-resp-eq _ (ls-eq-xn _) _ ls-dj-nx.
+- : ls-disjoint-resp-eq ls-dj-xn _ (ls-eq-nx E2’) Dj
+<- ls-emp-impl-disj _ E2’ _ Dj.
+- : ls-disjoint-resp-eq _ _ (ls-eq-xn _) ls-dj-xn.
+- : ls-disjoint-resp-eq
+(ls-dj-ac Dj) (ls-eq-cc E1) (ls-eq-cc E2) (ls-dj-ac Dj’)
+<- ls-disjoint-resp-eq Dj E1 E2 Dj’.
+- : ls-disjoint-resp-eq
+(ls-dj-ac Dj) (ls-eq-cc E1) (ls-eq-cc E2) (ls-dj-ca Dj’)
+<- ls-disjoint-resp-eq Dj E1 E2 Dj’.
+- : ls-disjoint-resp-eq
+(ls-dj-ca Dj) (ls-eq-cc E1) (ls-eq-cc E2) (ls-dj-ac Dj’)
+<- ls-disjoint-resp-eq Dj E1 E2 Dj’.
+- : ls-disjoint-resp-eq
+(ls-dj-ca Dj) (ls-eq-cc E1) (ls-eq-cc E2) (ls-dj-ca Dj’)
+<- ls-disjoint-resp-eq Dj E1 E2 Dj’.
+%worlds () (ls-disjoint-resp-eq _ _ _ _).
+%total D (ls-disjoint-resp-eq D _ _ _).
+%%
+ls-eq-commutes : ls-eq X Y -> ls-eq Y X -> type.
+%mode ls-eq-commutes +X1 -X2.
+
+59
+
+- : ls-eq-commutes (ls-eq-nx E) (ls-eq-xn E).
+- : ls-eq-commutes (ls-eq-xn E) (ls-eq-nx E).
+- : ls-eq-commutes (ls-eq-cc Eq) (ls-eq-cc Eq’)
+<- ls-eq-commutes Eq Eq’.
+%worlds () (ls-eq-commutes _ _).
+%total D (ls-eq-commutes D _).
+%%
+ls-eq-emp-impl-emp : ls-eq X Y -> ls-empty Y -> ls-empty X -> type.
+%mode ls-eq-emp-impl-emp +EqXY +EY -EX.
+- : ls-eq-emp-impl-emp (ls-eq-nx _) _ ls-empty-n.
+- : ls-eq-emp-impl-emp (ls-eq-xn EX) _ EX.
+- : ls-eq-emp-impl-emp (ls-eq-cc Eq) (ls-empty-a EY) (ls-empty-a EX)
+<- ls-eq-emp-impl-emp Eq EY EX.
+%worlds () (ls-eq-emp-impl-emp _ _ _).
+%total D (ls-eq-emp-impl-emp D _ _).
+%%
+ls-eq-trans : ls-eq X Y -> ls-eq Y Z -> ls-eq X Z -> type.
+%mode ls-eq-trans +XY +YZ -XZ.
+- : ls-eq-trans (ls-eq-nx EY) EqYZ (ls-eq-nx EZ)
+<- ls-eq-commutes EqYZ EqZY
+<- ls-eq-emp-impl-emp EqZY EY EZ.
+- : ls-eq-trans EqXY (ls-eq-xn EY) (ls-eq-xn EX)
+<- ls-eq-emp-impl-emp EqXY EY EX.
+- : ls-eq-trans (ls-eq-xn EX) (ls-eq-nx EZ) Eq
+<- ls-emp-emp-eq EX EZ Eq.
+- : ls-eq-trans (ls-eq-xn EX) (ls-eq-xn _) (ls-eq-xn EX).
+- : ls-eq-trans (ls-eq-cc EqXY) (ls-eq-cc EqYZ) (ls-eq-cc EqXZ)
+<- ls-eq-trans EqXY EqYZ EqXZ.
+%worlds () (ls-eq-trans _ _ _).
+%total D (ls-eq-trans D _ _).
+%%
+ls-union-fun-l :
+ls-eq X1 X1’ ->
+ls-union X1 X2 X ->
+
+60
+
+ls-union X1’ X2 X’ ->
+%%
+ls-eq X X’ ->
+type.
+%mode ls-union-fun-l +E +U1 +U2 -E’.
+- : ls-union-fun-l (ls-eq-nx EX1’) _ Un’ Eq
+<- ls-union-emp-eq Un’ EX1’ Eq.
+- : ls-union-fun-l (ls-eq-xn EX1) Un _ Eq
+<- ls-union-emp-eq Un EX1 Eqc
+<- ls-eq-commutes Eqc Eq.
+- : ls-union-fun-l Eq ls-un-xn ls-un-xn Eq.
+- : ls-union-fun-l
+(ls-eq-cc Eq) (ls-un-cc Un _) (ls-un-cc Un’ _) (ls-eq-cc Eq’)
+<- ls-union-fun-l Eq Un Un’ Eq’.
+%worlds () (ls-union-fun-l _ _ _ _).
+%total D (ls-union-fun-l D _ _ _).
+%%
+ls-union-fun-r :
+ls-eq X2 X2’ ->
+ls-union X1 X2 X ->
+ls-union X1 X2’ X’ ->
+%%
+ls-eq X X’ ->
+type.
+%mode ls-union-fun-r +E +U1 +U2 -E’.
+- : ls-union-fun-r E U U’ Eres
+<- ls-union-commutes U Uc
+<- ls-union-commutes U’ Uc’
+<- ls-union-fun-l E Uc Uc’ Eres.
+%worlds () (ls-union-fun-r _ _ _ _).
+%total {} (ls-union-fun-r _ _ _ _).
+%%
+
+ls-union-fun :
+
+61
+
+ls-eq X1 X1’ ->
+ls-eq X2 X2’ ->
+ls-union X1 X2 X ->
+ls-union X1’ X2’ X’ ->
+%%
+ls-eq X X’ ->
+type.
+%mode ls-union-fun +X1 +X2 +X3 +X4 -X5.
+- : ls-union-fun E1 E2 U12 U1’2’ Eres
+<- can-ls-union _ _ U1’2
+<- ls-union-fun-l E1 U12 U1’2 El
+<- ls-union-fun-r E2 U1’2 U1’2’ Er
+<- ls-eq-trans El Er Eres.
+%worlds () (ls-union-fun _ _ _ _ _).
+%total {} (ls-union-fun _ _ _ _ _).
+%%
+ls-sing-fun : ls-sing L X -> ls-sing L X’ -> ls-eq X X’ -> type.
+%mode ls-sing-fun +X1 +X2 -X3.
+- : ls-sing-fun ls-sing-z ls-sing-z (ls-eq-cc (ls-eq-nx ls-empty-n)).
+- : ls-sing-fun (ls-sing-s Sg1) (ls-sing-s Sg2) (ls-eq-cc Eq)
+<- ls-sing-fun Sg1 Sg2 Eq.
+%worlds () (ls-sing-fun _ _ _).
+%total D (ls-sing-fun D _ _).
+%%
+loc-or-assoc :
+loc-or P2 P3 P23 ->
+loc-or P1 P23 P123 ->
+loc-or P1 P2 P12 ->
+%%
+loc-or P12 P3 P123 ->
+type.
+%mode loc-or-assoc +X1 +X2 +X3 -X4.
+- : loc-or-assoc _ _ _ loc-or-aa.
+- : loc-or-assoc _ _ _ loc-or-px.
+- : loc-or-assoc _ _ _ loc-or-xp.
+
+62
+
+%worlds () (loc-or-assoc _ _ _ _).
+%total {} (loc-or-assoc _ _ _ _).
+%%
+ls-id-c : {P} ls-id X Y -> ls-id (ls-cons P X) (ls-cons P Y) -> type.
+%mode ls-id-c +P +I1 -I2.
+- : ls-id-c _ ls-id_ ls-id_.
+%worlds () (ls-id-c _ _ _).
+%total {} (ls-id-c _ _ _).
+%%
+ls-su-id : ls-union X Y Z -> ls-union X Y Z’ -> ls-id Z Z’ -> type.
+%mode ls-su-id +U1 +U2 -I.
+- : ls-su-id _ _ ls-id_.
+- : ls-su-id (ls-un-cc U _) (ls-un-cc U’ _) Id
+<- ls-su-id U U’ Id’
+<- ls-id-c _ Id’ Id.
+%worlds () (ls-su-id _ _ _).
+%total D (ls-su-id _ D _).
+%%
+ls-id-unil : ls-id X Y -> ls-union Y ls-nil X -> type.
+%mode ls-id-unil +I -U.
+- : ls-id-unil ls-id_ ls-un-xn.
+%worlds () (ls-id-unil _ _).
+%total {} (ls-id-unil _ _).
+%%
+ls-union-assoc :
+ls-union X2 X3 X23 ->
+ls-union X1 X23 X123 ->
+ls-union X1 X2 X12 ->
+%%
+ls-union X12 X3 X123 ->
+type.
+%mode ls-union-assoc +X1 +X2 +X3 -X4.
+- : ls-union-assoc ls-un-nx ls-un-nx Un Un.
+- : ls-union-assoc ls-un-nx ls-un-xn Un Un.
+
+63
+
+- : ls-union-assoc ls-un-nx Un ls-un-xn Un.
+- : ls-union-assoc Un ls-un-nx ls-un-nx Un.
+- : ls-union-assoc ls-un-xn U1’23 U12 U12’3
+<- ls-su-id U1’23 U12 Id
+<- ls-id-unil Id U12’3.
+- : ls-union-assoc
+(ls-un-cc U23 Or23) (ls-un-cc U1’23 Or1’23) (ls-un-cc U12 Or12)
+(ls-un-cc U12’3 Or12’3)
+<- ls-union-assoc U23 U1’23 U12 U12’3
+<- loc-or-assoc Or23 Or1’23 Or12 Or12’3.
+%worlds () (ls-union-assoc _ _ _ _).
+%total D (ls-union-assoc D _ _ _).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% store-lemmas.thm
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+st-update-imp-lookup :
+st-update _ L V S ->
+%%
+st-lookup S L V ->
+type.
+%mode st-update-imp-lookup +X1 -X2.
+- : st-update-imp-lookup st-up-nz st-lo-z.
+- : st-update-imp-lookup st-up-cz st-lo-z.
+- : st-update-imp-lookup (st-up-ns Dup) (st-lo-s Dlo)
+<- st-update-imp-lookup Dup Dlo.
+- : st-update-imp-lookup (st-up-cs Dup) (st-lo-s Dlo)
+<- st-update-imp-lookup Dup Dlo.
+%worlds () (st-update-imp-lookup _ _).
+%total D (st-update-imp-lookup D _).
+contradiction-implies-val-eq : {V}{V’} false -> val-eq V V’ -> type.
+%mode contradiction-implies-val-eq +V1 +V2 +X1 -X2.
+%worlds () (contradiction-implies-val-eq _ _ _ _).
+%total {} (contradiction-implies-val-eq _ _ _ _).
+st-lookup-fun :
+st-lookup S L V ->
+st-lookup S L V’ ->
+
+64
+
+%%
+val-eq V V’ ->
+type.
+%mode st-lookup-fun +X1 +X2 -X3.
+- : st-lookup-fun st-lo-z st-lo-z val-eq_.
+- : st-lookup-fun (st-lo-s Dup) (st-lo-s Dup’) Deq
+<- st-lookup-fun Dup Dup’ Deq.
+%worlds (var-block) (st-lookup-fun _ _ _).
+%total {D1 D2} (st-lookup-fun D1 D2 _).
+%%
+st-eq-preserves-emp : st-empty S1 -> st-eq S1 S2 -> st-empty S2 -> type.
+%mode st-eq-preserves-emp +X1 +X2 -X3.
+- : st-eq-preserves-emp _ (st-eq-nx Emp) Emp.
+- : st-eq-preserves-emp _ (st-eq-xn _) st-empty-n.
+- : st-eq-preserves-emp (st-empty-e Emp1) (st-eq-cc Eq _) (st-empty-e Emp2)
+<- st-eq-preserves-emp Emp1 Eq Emp2.
+%worlds () (st-eq-preserves-emp _ _ _).
+%total D (st-eq-preserves-emp _ D _).
+%%
+st-emp-eq-emp : st-empty S1 -> st-empty S2 -> st-eq S1 S2 -> type.
+%mode st-emp-eq-emp +E1 +E2 -E3.
+- : st-emp-eq-emp st-empty-n Emp2 (st-eq-nx Emp2).
+- : st-emp-eq-emp Emp1 st-empty-n (st-eq-xn Emp1).
+- : st-emp-eq-emp (st-empty-e Emp1) (st-empty-e Emp2) (st-eq-cc Emp sv-eq_)
+<- st-emp-eq-emp Emp1 Emp2 Emp.
+%worlds () (st-emp-eq-emp _ _ _).
+%total D (st-emp-eq-emp D _ _).
+%%
+st-eq-refl : {S} st-eq S S -> type.
+%mode st-eq-refl +X1 -X2.
+- : st-eq-refl st-nil (st-eq-nx st-empty-n).
+- : st-eq-refl (st-cons V S) (st-eq-cc Eq sv-eq_)
+
+65
+
+<- st-eq-refl S Eq.
+%worlds () (st-eq-refl _ _).
+%total S (st-eq-refl S _).
+%%
+st-eq-comm : st-eq S1 S2 -> st-eq S2 S1 -> type.
+%mode st-eq-comm +X1 -X2.
+- : st-eq-comm (st-eq-nx E) (st-eq-xn E).
+- : st-eq-comm (st-eq-xn E) (st-eq-nx E).
+- : st-eq-comm (st-eq-cc Eq12 _) (st-eq-cc Eq21 sv-eq_)
+<- st-eq-comm Eq12 Eq21.
+%worlds () (st-eq-comm _ _).
+%total D (st-eq-comm D _).
+%%
+st-eq-trans : st-eq S1 S2 -> st-eq S2 S3 -> st-eq S1 S3 -> type.
+%mode st-eq-trans +X1 +X2 -X3.
+- : st-eq-trans (st-eq-nx E1) Eq2 (st-eq-nx E)
+<- st-eq-preserves-emp E1 Eq2 E.
+- : st-eq-trans (st-eq-xn E1) (st-eq-nx E3) Eq
+<- st-emp-eq-emp E1 E3 Eq.
+- : st-eq-trans Eq12 (st-eq-xn E2) (st-eq-xn E1)
+<- st-eq-comm Eq12 Eq21
+<- st-eq-preserves-emp E2 Eq21 E1.
+- : st-eq-trans (st-eq-cc Eq1 _) (st-eq-cc Eq2 _) (st-eq-cc Eq sv-eq_)
+<- st-eq-trans Eq1 Eq2 Eq.
+%worlds () (st-eq-trans _ _ _).
+%total D (st-eq-trans D _ _).
+%%
+st-sqsubeq-ex-refl :
+{S}{X}
+%%
+st-sqsubeq-ex S X S ->
+type.
+%mode st-sqsubeq-ex-refl +X1 +X2 -X3.
+
+66
+
+- : st-sqsubeq-ex-refl st-nil _ st-ssee-nxx.
+- : st-sqsubeq-ex-refl
+(st-cons sv-free S) ls-nil
+(st-ssee-fnc Dssee)
+<- st-sqsubeq-ex-refl S ls-nil Dssee.
+- : st-sqsubeq-ex-refl
+(st-cons sv-free S) ls-nil
+(st-ssee-fnc Dssee)
+<- st-sqsubeq-ex-refl S ls-nil Dssee.
+- : st-sqsubeq-ex-refl
+(st-cons (sv-val _) S) ls-nil
+(st-ssee-vnv Dssee val-eq_)
+<- st-sqsubeq-ex-refl S ls-nil Dssee.
+- : st-sqsubeq-ex-refl
+(st-cons sv-free S) (ls-cons _ X)
+(st-ssee-fcc Dssee)
+<- st-sqsubeq-ex-refl S X Dssee.
+- : st-sqsubeq-ex-refl
+(st-cons (sv-val _) S) (ls-cons loc-absent X)
+(st-ssee-vav Dssee val-eq_)
+<- st-sqsubeq-ex-refl S X Dssee.
+- : st-sqsubeq-ex-refl
+(st-cons _ S) (ls-cons loc-present X)
+(st-ssee-cpc Dssee)
+<- st-sqsubeq-ex-refl S X Dssee.
+%worlds () (st-sqsubeq-ex-refl _ _ _).
+%total D (st-sqsubeq-ex-refl D _ _).
+%%
+st-sqsubeq-ex-nil-impl-any :
+{S’}
+st-sqsubeq-ex S X st-nil ->
+%%
+st-sqsubeq-ex S X S’ -> type.
+%mode st-sqsubeq-ex-nil-impl-any +S +X1 -X2.
+- : st-sqsubeq-ex-nil-impl-any _ st-ssee-nxx st-ssee-nxx.
+- : st-sqsubeq-ex-nil-impl-any
+st-nil (st-ssee-fnn Dssee) (st-ssee-fnn Dssee’)
+<- st-sqsubeq-ex-nil-impl-any st-nil Dssee Dssee’.
+- : st-sqsubeq-ex-nil-impl-any
+(st-cons _ S’) (st-ssee-fnn Dssee) (st-ssee-fnc Dssee’)
+<- st-sqsubeq-ex-nil-impl-any S’ Dssee Dssee’.
+
+67
+
+- : st-sqsubeq-ex-nil-impl-any
+st-nil (st-ssee-fcn Dssee) (st-ssee-fcn Dssee’)
+<- st-sqsubeq-ex-nil-impl-any st-nil Dssee Dssee’.
+- : st-sqsubeq-ex-nil-impl-any
+(st-cons _ S’) (st-ssee-fcn Dssee) (st-ssee-fcc Dssee’)
+<- st-sqsubeq-ex-nil-impl-any S’ Dssee Dssee’.
+- : st-sqsubeq-ex-nil-impl-any
+st-nil (st-ssee-cpn Dssee) (st-ssee-cpn Dssee’)
+<- st-sqsubeq-ex-nil-impl-any st-nil Dssee Dssee’.
+- : st-sqsubeq-ex-nil-impl-any
+(st-cons _ S’) (st-ssee-cpn Dssee) (st-ssee-cpc Dssee’)
+<- st-sqsubeq-ex-nil-impl-any S’ Dssee Dssee’.
+%worlds () (st-sqsubeq-ex-nil-impl-any _ _ _).
+%total D (st-sqsubeq-ex-nil-impl-any _ D _).
+%%
+st-sqsubeq-ex-trans :
+st-sqsubeq-ex S1 X S2 ->
+st-sqsubeq-ex S2 X S3 ->
+%%
+st-sqsubeq-ex S1 X S3 ->
+type.
+%mode st-sqsubeq-ex-trans +X1 +X2 -X3.
+- : st-sqsubeq-ex-trans st-ssee-nxx _ st-ssee-nxx.
+- : st-sqsubeq-ex-trans
+(Dssee12 : st-sqsubeq-ex _ _ st-nil)
+(_ : st-sqsubeq-ex st-nil _ S3)
+Dssee13
+<- st-sqsubeq-ex-nil-impl-any S3 Dssee12 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fnc Dssee12) (st-ssee-fnn Dssee23) (st-ssee-fnn Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fcc Dssee12) (st-ssee-fcn Dssee23) (st-ssee-fcn Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fnc Dssee12) (st-ssee-fnc Dssee23) (st-ssee-fnc Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fcc Dssee12) (st-ssee-fcc Dssee23) (st-ssee-fcc Dssee13)
+
+68
+
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fnc Dssee12) (st-ssee-vnv Dssee23 _) (st-ssee-fnc Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fcc Dssee12) (st-ssee-vav Dssee23 _) (st-ssee-fcc Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fcc Dssee12) (st-ssee-cpn Dssee23) (st-ssee-fcn Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-fcc Dssee12) (st-ssee-cpc Dssee23) (st-ssee-fcc Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-vnv Dssee12 _) (st-ssee-vnv Dssee23 _)
+(st-ssee-vnv Dssee13 val-eq_)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-vav Dssee12 _) (st-ssee-vav Dssee23 _)
+(st-ssee-vav Dssee13 val-eq_)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-cpc Dssee12) (st-ssee-fcn Dssee23) (st-ssee-cpn Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-cpc Dssee12) (st-ssee-fcc Dssee23) (st-ssee-cpc Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-cpc Dssee12) (st-ssee-cpn Dssee23) (st-ssee-cpn Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+- : st-sqsubeq-ex-trans
+(st-ssee-cpc Dssee12) (st-ssee-cpc Dssee23) (st-ssee-cpc Dssee13)
+<- st-sqsubeq-ex-trans Dssee12 Dssee23 Dssee13.
+%worlds () (st-sqsubeq-ex-trans _ _ _).
+%total D (st-sqsubeq-ex-trans D _ _).
+
+69
+
+st-sqsubeq-ex-resp-subeq :
+st-sqsubeq-ex S1 X S2 ->
+ls-subeq X X’ ->
+%%
+st-sqsubeq-ex S1 X’ S2 ->
+type.
+%mode st-sqsubeq-ex-resp-subeq +X1 +X2 -X3.
+
+- : st-sqsubeq-ex-resp-subeq st-ssee-nxx _ st-ssee-nxx.
+- : st-sqsubeq-ex-resp-subeq (st-ssee-fnn D) ls-subeq-nx (st-ssee-fnn D’)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq (st-ssee-fnn D) ls-subeq-nx (st-ssee-fcn D’)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fnn D) (ls-subeq-xn ls-empty-n) (st-ssee-fnn D’)
+<- st-sqsubeq-ex-resp-subeq D (ls-subeq-xn ls-empty-n) D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fcn D) (ls-subeq-xn (ls-empty-a Emp)) (st-ssee-fnn D’)
+<- st-sqsubeq-ex-resp-subeq D (ls-subeq-xn Emp) D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fcn D) (ls-subeq-ax Dsub) (st-ssee-fcn D’)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fcn D) (ls-subeq-pp Dsub) (st-ssee-fcn D’)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq (st-ssee-fnc D) ls-subeq-nx (st-ssee-fnc D’)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq (st-ssee-fnc D) ls-subeq-nx (st-ssee-fcc D’)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fnc D) (ls-subeq-xn ls-empty-n) (st-ssee-fnc D’)
+<- st-sqsubeq-ex-resp-subeq D (ls-subeq-xn ls-empty-n) D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fcc D) (ls-subeq-xn (ls-empty-a Emp)) (st-ssee-fnc D’)
+<- st-sqsubeq-ex-resp-subeq D (ls-subeq-xn Emp) D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fcc D) (ls-subeq-ax Dsub) (st-ssee-fcc D’)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-fcc D) (ls-subeq-pp Dsub) (st-ssee-fcc D’)
+
+70
+
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vnv D _) (ls-subeq-xn _) (st-ssee-vnv D’ val-eq_)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vav D _) (ls-subeq-xn _) (st-ssee-vnv D’ val-eq_)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vnv D _) ls-subeq-nx (st-ssee-vnv D’ val-eq_)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vnv D _) ls-subeq-nx (st-ssee-vav D’ val-eq_)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq (st-ssee-vnv D _) ls-subeq-nx (st-ssee-cpc D’)
+<- st-sqsubeq-ex-resp-subeq D ls-subeq-nx D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vav D _) (ls-subeq-xn (ls-empty-a Emp)) (st-ssee-vnv D’ val-eq_)
+<- st-sqsubeq-ex-resp-subeq D (ls-subeq-xn Emp) D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vav D _) (ls-subeq-ax Dsub) (st-ssee-vav D’ val-eq_)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-vav D _) (ls-subeq-ax Dsub) (st-ssee-cpc D’)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-cpn D) (ls-subeq-pp Dsub) (st-ssee-cpn D’)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+- : st-sqsubeq-ex-resp-subeq
+(st-ssee-cpc D) (ls-subeq-pp Dsub) (st-ssee-cpc D’)
+<- st-sqsubeq-ex-resp-subeq D Dsub D’.
+%worlds () (st-sqsubeq-ex-resp-subeq _ _ _).
+%total D (st-sqsubeq-ex-resp-subeq D _ _).
+
+st-update-imp-st-sqsubeq-ex :
+st-update S L V S’ ->
+ls-sing L X ->
+%%
+st-sqsubeq-ex S X S’ ->
+type.
+%mode st-update-imp-st-sqsubeq-ex +X1 +X2 -X3.
+
+71
+
+- : st-update-imp-st-sqsubeq-ex st-up-nz ls-sing-z st-ssee-nxx.
+- : st-update-imp-st-sqsubeq-ex (st-up-ns _) _ st-ssee-nxx.
+- : st-update-imp-st-sqsubeq-ex
+(st-up-cz : st-update (st-cons sv-free S) _ _ _)
+ls-sing-z
+(st-ssee-fcc D)
+<- st-sqsubeq-ex-refl S ls-nil D.
+- : st-update-imp-st-sqsubeq-ex
+(st-up-cz : st-update (st-cons (sv-val _) S) _ _ _)
+ls-sing-z
+(st-ssee-cpc D)
+<- st-sqsubeq-ex-refl S ls-nil D.
+- : st-update-imp-st-sqsubeq-ex
+(st-up-cs Dup : st-update (st-cons sv-free S) _ _ _)
+(ls-sing-s Dls)
+(st-ssee-fcc D)
+<- st-update-imp-st-sqsubeq-ex Dup Dls D.
+- : st-update-imp-st-sqsubeq-ex
+(st-up-cs Dup : st-update (st-cons (sv-val _) S) _ _ _)
+(ls-sing-s Dls)
+(st-ssee-vav D val-eq_)
+<- st-update-imp-st-sqsubeq-ex Dup Dls D.
+%worlds () (st-update-imp-st-sqsubeq-ex _ _ _).
+%total D (st-update-imp-st-sqsubeq-ex D _ _).
+%%
+st-lo-ssee-nil-contradiction :
+st-lookup S L _ ->
+ls-sing L X ->
+ls-disjoint X G ->
+st-sqsubeq-ex S G st-nil ->
+false ->
+type.
+%mode st-lo-ssee-nil-contradiction +X1 +X2 +X3 +X4 -X3.
+- : st-lo-ssee-nil-contradiction
+(st-lo-s L)
+(ls-sing-s Sg)
+ls-dj-xn
+(st-ssee-fnn Dssee)
+False
+<- st-lo-ssee-nil-contradiction L Sg ls-dj-xn Dssee False.
+
+72
+
+- : st-lo-ssee-nil-contradiction
+(st-lo-s L)
+(ls-sing-s Sg)
+(ls-dj-ac Dj)
+(st-ssee-fcn Dssee)
+False
+<- st-lo-ssee-nil-contradiction L Sg Dj Dssee False.
+- : st-lo-ssee-nil-contradiction
+(st-lo-s L)
+(ls-sing-s Sg)
+(ls-dj-ac Dj)
+(st-ssee-cpn Dssee)
+False
+<- st-lo-ssee-nil-contradiction L Sg Dj Dssee False.
+- : st-lo-ssee-nil-contradiction
+(st-lo-s L)
+(ls-sing-s Sg)
+(ls-dj-ca Dj)
+(st-ssee-fcn Dssee)
+False
+<- st-lo-ssee-nil-contradiction L Sg Dj Dssee False.
+%worlds (var-block) (st-lo-ssee-nil-contradiction _ _ _ _ _).
+%total D (st-lo-ssee-nil-contradiction D _ _ _ _).
+%%
+st-false-implies-nil-lookup :
+{L}{V} false -> st-lookup st-nil L V -> type.
+%mode st-false-implies-nil-lookup +L +V +F -Dlu.
+%worlds (var-block) (st-false-implies-nil-lookup _ _ _ _).
+%total {} (st-false-implies-nil-lookup _ _ _ _).
+%%
+%{
+This lemma is the motivation for our representation of stores and
+location sets; it is a straightforward induction in this
+representation, but would seem to require a lot of sub-lemmas in
+some more "obvious" representations (e.g. association lists for
+stores and lists for location sets).
+
+73
+
+}%
+st-lookup-resp-sqsubeq-ex-notin :
+st-lookup S L V ->
+st-sqsubeq-ex S G S’ ->
+ls-sing L X ->
+ls-disjoint X G ->
+%%
+st-lookup S’ L V ->
+type.
+%mode st-lookup-resp-sqsubeq-ex-notin +X1 +X2 +X3 +X4 -X5.
+- : st-lookup-resp-sqsubeq-ex-notin Dlo Dssee Sg Dj Dlo’
+<- st-lo-ssee-nil-contradiction Dlo Sg Dj Dssee False
+<- st-false-implies-nil-lookup _ _ False Dlo’.
+- : st-lookup-resp-sqsubeq-ex-notin
+st-lo-z
+(st-ssee-vnv _ _)
+ls-sing-z
+ls-dj-xn
+st-lo-z.
+- : st-lookup-resp-sqsubeq-ex-notin
+st-lo-z
+(st-ssee-vav _ _)
+ls-sing-z
+(ls-dj-ca _)
+st-lo-z.
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-fnc Dssee)
+(ls-sing-s Sg)
+ls-dj-xn
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg ls-dj-xn L’.
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-fcc Dssee)
+(ls-sing-s Sg)
+(ls-dj-ac Dj)
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg Dj L’.
+
+74
+
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-fcc Dssee)
+(ls-sing-s Sg)
+(ls-dj-ca Dj)
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg Dj L’.
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-vnv Dssee _)
+(ls-sing-s Sg)
+ls-dj-xn
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg ls-dj-xn L’.
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-vav Dssee _)
+(ls-sing-s Sg)
+(ls-dj-ac Dj)
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg Dj L’.
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-vav Dssee _)
+(ls-sing-s Sg)
+(ls-dj-ca Dj)
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg Dj L’.
+- : st-lookup-resp-sqsubeq-ex-notin
+(st-lo-s L)
+(st-ssee-cpc Dssee)
+(ls-sing-s Sg)
+(ls-dj-ac Dj)
+(st-lo-s L’)
+<- st-lookup-resp-sqsubeq-ex-notin L Dssee Sg Dj L’.
+%worlds (var-block) (st-lookup-resp-sqsubeq-ex-notin _ _ _ _ _).
+%total D (st-lookup-resp-sqsubeq-ex-notin D _ _ _ _).
+%%
+
+75
+
+st-lookup-nodep :
+({v : val} st-lookup S L (V v)) ->
+%%
+st-lookup S L V’ ->
+({v : val} val-eq (V v) V’) ->
+type.
+%mode st-lookup-nodep +X1 -X2 -X3.
+- : st-lookup-nodep
+([v] st-lo-z)
+%%
+st-lo-z
+([v] val-eq_)
+.
+- : st-lookup-nodep
+([v] st-lo-s (Dstl v))
+%%
+(st-lo-s Dstl’)
+Deq
+<- st-lookup-nodep Dstl Dstl’ Deq.
+%worlds (var-block) (st-lookup-nodep _ _ _).
+%total D (st-lookup-nodep D _ _).
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% trace-lemmas.thm
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+trs-gen-fun :
+trs-gen Ts X ->
+trs-gen Ts X’ ->
+%%
+ls-eq X X’ ->
+type.
+%mode trs-gen-fun +X1 +X2 -X3.
+trc-gen-fun :
+trc-gen Tc X ->
+trc-gen Tc X’ ->
+%%
+ls-eq X X’ ->
+type.
+%mode trc-gen-fun +X1 +X2 -X3.
+
+76
+
+%{
+cases for trs-gen-fun
+}%
+- : trs-gen-fun trs-gen-nil _ (ls-eq-nx ls-empty-n).
+- : trs-gen-fun
+(trs-gen-mod Dlu Dls Dcg) (trs-gen-mod Dlu’ Dls’ Dcg’) Deq
+<- trc-gen-fun Dcg Dcg’ Deq1
+<- ls-sing-fun Dls Dls’ Deq2
+<- ls-union-fun Deq1 Deq2 Dlu Dlu’ Deq.
+- : trs-gen-fun
+(trs-gen-let Dun Dsg1 Dsg2) (trs-gen-let Dun’ Dsg1’ Dsg2’) Eqres
+<- trs-gen-fun Dsg1 Dsg1’ Eq1
+<- trs-gen-fun Dsg2 Dsg2’ Eq2
+<- ls-union-fun Eq2 Eq1 Dun Dun’ Eqres.
+%{
+cases for trc-gen-fun
+}%
+- : trc-gen-fun trc-gen-wr _ (ls-eq-nx ls-empty-n).
+- : trc-gen-fun
+(trc-gen-let Dun Dcg Dsg) (trc-gen-let Dun’ Dcg’ Dsg’) Eqres
+<- trc-gen-fun Dcg Dcg’ Eqc
+<- trs-gen-fun Dsg Dsg’ Eqs
+<- ls-union-fun Eqs Eqc Dun Dun’ Eqres.
+- : trc-gen-fun
+(trc-gen-rd Dcg) (trc-gen-rd Dcg’) Eqres
+<- trc-gen-fun Dcg Dcg’ Eqres.
+%worlds ()
+(trs-gen-fun _ _ _)
+(trc-gen-fun _ _ _).
+%total (Dc Ds)
+(trc-gen-fun Dc _ _)
+(trs-gen-fun Ds _ _).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% eval-lemmas.thm
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+evals-imp-st-sqsubeq-ex-trs-gen :
+evals S _ _ S’ Ts ->
+trs-gen Ts G ->
+%%
+st-sqsubeq-ex S G S’ ->
+
+77
+
+type.
+%mode evals-imp-st-sqsubeq-ex-trs-gen +X1 +X2 -X3.
+evalc-imp-st-sqsubeq-ex-trc-gen :
+evalc S L _ S’ Ts ->
+trc-gen Ts G ->
+ls-sing L X ->
+ls-union G X G+X ->
+%%
+st-sqsubeq-ex S G+X S’ ->
+type.
+%mode evalc-imp-st-sqsubeq-ex-trc-gen +X1 +X2 +X3 +X4 -X5.
+cps-imp-st-sqsubeq-ex-trs-gen :
+cps S _ S’ Ts’ ->
+trs-gen Ts’ G ->
+%%
+st-sqsubeq-ex S G S’ ->
+type.
+%mode cps-imp-st-sqsubeq-ex-trs-gen +X1 +X2 -X3.
+cpc-imp-st-sqsubeq-ex-trc-gen :
+cpc S L _ S’ Ts’ ->
+trc-gen Ts’ G ->
+ls-sing L X ->
+ls-union G X G+X ->
+%%
+st-sqsubeq-ex S G+X S’ ->
+type.
+%mode cpc-imp-st-sqsubeq-ex-trc-gen +X1 +X2 +X3 +X4 -X5.
+
+%%
+- : evals-imp-st-sqsubeq-ex-trs-gen
+evals-val
+trs-gen-nil
+%%
+Dssee’
+<- st-sqsubeq-ex-refl _ _ Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-plus Dsum)
+
+78
+
+trs-gen-nil
+%%
+Dssee’
+<- st-sqsubeq-ex-refl _ _ Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-mod _ _ _ Devalc)
+(trs-gen-mod Dlu Dls Dtg)
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-memo-miss Devals)
+Dtg
+%%
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals Dtg Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-memo-hit Dcps _ _)
+Dtg
+%%
+Dssee’
+<- cps-imp-st-sqsubeq-ex-trs-gen Dcps Dtg Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-app Devals)
+Dtg
+%%
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals Dtg Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-let _ _ _ Devals2 Devals1)
+(trs-gen-let (Dlu : ls-union G1 G2 G1+G2) Dtg2 Dtg1)
+%%
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals1 Dtg1 Dssee1
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals2 Dtg2 Dssee2
+
+79
+
+<- ls-union-imp-subeq Dlu (Dlse1 : ls-subeq G1 G1+G2) (Dlse2 : ls-subeq G2 G1+
+<- st-sqsubeq-ex-resp-subeq Dssee1 Dlse1 Dssee1’
+<- st-sqsubeq-ex-resp-subeq Dssee2 Dlse2 Dssee2’
+<- st-sqsubeq-ex-trans Dssee1’ Dssee2’ Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-letp Devals)
+Dtg
+%%
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals Dtg Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-case-inl Devals)
+Dtg
+%%
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals Dtg Dssee’
+.
+- : evals-imp-st-sqsubeq-ex-trs-gen
+(evals-case-inr Devals)
+Dtg
+%%
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals Dtg Dssee’
+.
+
+%%
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-write Dstu)
+trc-gen-wr
+Dls
+_
+%%
+Dssee’
+<- st-update-imp-st-sqsubeq-ex Dstu Dls Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+
+80
+
+(evalc-read Devalc _)
+(trc-gen-rd Dtg)
+Dls
+Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-memo-miss Devalc)
+Dtg
+Dls
+Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-memo-hit Dcpc _ _)
+Dtg
+Dls
+Dlu
+%%
+Dssee’
+<- cpc-imp-st-sqsubeq-ex-trc-gen Dcpc Dtg Dls Dlu Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-app Devalc)
+Dtg
+Dls
+Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-let _ _ _ Devalc2 Devals1)
+(trc-gen-let (Dlu : ls-union G1 G2 G1+G2) Dtg2 Dtg1)
+Dls
+(Dlu2 : ls-union G1+G2 X G1+G2+X)
+%%
+
+81
+
+Dssee’
+<- evals-imp-st-sqsubeq-ex-trs-gen Devals1 Dtg1 Dssee1
+<- can-ls-union _ _ (Dlu3 : ls-union G2 X G2+X)
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc2 Dtg2 Dls Dlu3 Dssee2
+<- ls-union-imp-subeq Dlu2 (Dlse5 : ls-subeq G1+G2 G1+G2+X) (Dlse6 : ls-subeq
+<- ls-union-imp-subeq Dlu (Dlse7 : ls-subeq G1 G1+G2) (Dlse8 : ls-subeq G2 G1+
+<- ls-subeq-trans Dlse7 Dlse5 (Dlse3 : ls-subeq G1 G1+G2+X)
+<- ls-subeq-trans Dlse8 Dlse5 (Dlse9 : ls-subeq G2 G1+G2+X)
+<- ls-subeq-union Dlse9 Dlse6 Dlu3 (Dlse4 : ls-subeq G2+X G1+G2+X)
+<- st-sqsubeq-ex-resp-subeq Dssee1 Dlse3 Dssee1’
+<- st-sqsubeq-ex-resp-subeq Dssee2 Dlse4 Dssee2’
+<- st-sqsubeq-ex-trans Dssee1’ Dssee2’ Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-letp Devalc)
+Dtg
+Dls
+Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-case-inl Devalc)
+Dtg
+Dls
+Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+- : evalc-imp-st-sqsubeq-ex-trc-gen
+(evalc-case-inr Devalc)
+Dtg
+Dls Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+
+82
+
+%%
+- : cps-imp-st-sqsubeq-ex-trs-gen
+cps-nil
+trs-gen-nil
+%%
+Dssee’
+<- st-sqsubeq-ex-refl _ _ Dssee’
+.
+- : cps-imp-st-sqsubeq-ex-trs-gen
+(cps-mod _ _ _ Dcpc)
+(trs-gen-mod Dlu Dls Dtg)
+%%
+Dssee’
+<- cpc-imp-st-sqsubeq-ex-trc-gen Dcpc Dtg Dls Dlu Dssee’
+.
+
+- : cps-imp-st-sqsubeq-ex-trs-gen
+(cps-let _ _ _ Dcps2 Dcps1)
+(trs-gen-let (Dlu : ls-union G1 G2 G1+G2) Dtg2 Dtg1)
+%%
+Dssee’
+<- cps-imp-st-sqsubeq-ex-trs-gen Dcps1 Dtg1 Dssee1
+<- cps-imp-st-sqsubeq-ex-trs-gen Dcps2 Dtg2 Dssee2
+<- ls-union-imp-subeq Dlu (Dlse1 : ls-subeq G1 G1+G2) (Dlse2 : ls-subeq G2 G1+
+<- st-sqsubeq-ex-resp-subeq Dssee1 Dlse1 Dssee1’
+<- st-sqsubeq-ex-resp-subeq Dssee2 Dlse2 Dssee2’
+<- st-sqsubeq-ex-trans Dssee1’ Dssee2’ Dssee’
+.
+
+%%
+- : cpc-imp-st-sqsubeq-ex-trc-gen
+(cpc-write Dstu)
+trc-gen-wr
+Dls
+Dlu
+%%
+Dssee’
+<- st-update-imp-st-sqsubeq-ex Dstu Dls Dssee’
+.
+
+83
+
+- : cpc-imp-st-sqsubeq-ex-trc-gen
+(cpc-let _ _ _ Dcpc2 Dcps1)
+(trc-gen-let (Dlu : ls-union G1 G2 G1+G2) Dtg2 Dtg1)
+Dls
+(Dlu2 : ls-union G1+G2 X G1+G2+X)
+%%
+Dssee’
+<- cps-imp-st-sqsubeq-ex-trs-gen Dcps1 Dtg1 Dssee1
+<- can-ls-union _ _ (Dlu3 : ls-union G2 X G2+X)
+<- cpc-imp-st-sqsubeq-ex-trc-gen Dcpc2 Dtg2 Dls Dlu3 Dssee2
+<- ls-union-imp-subeq Dlu2 (Dlse5 : ls-subeq G1+G2 G1+G2+X) (Dlse6 : ls-subeq
+<- ls-union-imp-subeq Dlu (Dlse7 : ls-subeq G1 G1+G2) (Dlse8 : ls-subeq G2 G1+
+<- ls-subeq-trans Dlse7 Dlse5 (Dlse3 : ls-subeq G1 G1+G2+X)
+<- ls-subeq-trans Dlse8 Dlse5 (Dlse9 : ls-subeq G2 G1+G2+X)
+<- ls-subeq-union Dlse9 Dlse6 Dlu3 (Dlse4 : ls-subeq G2+X G1+G2+X)
+<- st-sqsubeq-ex-resp-subeq Dssee1 Dlse3 Dssee1’
+<- st-sqsubeq-ex-resp-subeq Dssee2 Dlse4 Dssee2’
+<- st-sqsubeq-ex-trans Dssee1’ Dssee2’ Dssee’
+.
+- : cpc-imp-st-sqsubeq-ex-trc-gen
+(cpc-read/noch Dcpc _)
+(trc-gen-rd Dtg)
+Dls
+Dlu
+%%
+Dssee’
+<- cpc-imp-st-sqsubeq-ex-trc-gen Dcpc Dtg Dls Dlu Dssee’
+.
+- : cpc-imp-st-sqsubeq-ex-trc-gen
+(cpc-read/ch Devalc _ _)
+(trc-gen-rd Dtg)
+Dls
+Dlu
+%%
+Dssee’
+<- evalc-imp-st-sqsubeq-ex-trc-gen Devalc Dtg Dls Dlu Dssee’
+.
+
+%%
+%worlds ()
+
+84
+
+(evals-imp-st-sqsubeq-ex-trs-gen _ _ _)
+(evalc-imp-st-sqsubeq-ex-trc-gen _ _ _ _ _)
+(cps-imp-st-sqsubeq-ex-trs-gen _ _ _)
+(cpc-imp-st-sqsubeq-ex-trc-gen _ _ _ _ _).
+%total (D1 D2 D3 D4)
+(evals-imp-st-sqsubeq-ex-trs-gen D1 _ _)
+(evalc-imp-st-sqsubeq-ex-trc-gen D2 _ _ _ _)
+(cps-imp-st-sqsubeq-ex-trs-gen D3 _ _)
+(cpc-imp-st-sqsubeq-ex-trc-gen D4 _ _ _ _).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% syntax-lemmas.thm
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+val-eq-nat : nat-eq N N’ -> val-eq (val-nat N) (val-nat N’) -> type.
+%mode val-eq-nat +X1 -X2.
+- : val-eq-nat nat-eq_ val-eq_.
+%worlds () (val-eq-nat _ _).
+%total {} (val-eq-nat _ _).
+
+val-eq-pr : val-eq V1 V1’ -> val-eq V2 V2’ -> val-eq (val-pr V1 V2) (val-pr V1’ V2’
+%mode val-eq-pr +X1 +X2 -X3.
+- : val-eq-pr val-eq_ val-eq_ val-eq_.
+%worlds (val-block) (val-eq-pr _ _ _).
+%total {} (val-eq-pr _ _ _).
+val-eq-inl : val-eq V V’ -> val-eq (val-inl V) (val-inl V’) -> type.
+%mode val-eq-inl +X1 -X2.
+- : val-eq-inl val-eq_ val-eq_.
+%worlds (val-block) (val-eq-inl _ _).
+%total {} (val-eq-inl _ _).
+val-eq-inr : val-eq V V’ -> val-eq (val-inr V) (val-inr V’) -> type.
+%mode val-eq-inr +X1 -X2.
+- : val-eq-inr val-eq_ val-eq_.
+%worlds (val-block) (val-eq-inr _ _).
+%total {} (val-eq-inr _ _).
+
+val-eq-fns : ({v1}{v2} es-eq (Es v1 v2) (Es’ v1 v2)) -> val-eq (val-fns Es) (val-fn
+%mode val-eq-fns +X1 -X2.
+- : val-eq-fns ([v1][v2] es-eq_) val-eq_.
+%worlds (val-block) (val-eq-fns _ _).
+%total {} (val-eq-fns _ _).
+
+val-eq-fnc : ({v1}{v2} ec-eq (Ec v1 v2) (Ec’ v1 v2)) -> val-eq (val-fnc Ec) (val-fn
+
+85
+
+%mode val-eq-fnc +X1 -X2.
+- : val-eq-fnc ([v1][v2] ec-eq_) val-eq_.
+%worlds (val-block) (val-eq-fnc _ _).
+%total {} (val-eq-fnc _ _).
+es-eq-val : val-eq V V’ -> es-eq (es-val V) (es-val V’) -> type.
+%mode es-eq-val +X1 -X2.
+- : es-eq-val val-eq_ es-eq_.
+%worlds (val-block) (es-eq-val _ _).
+%total {} (es-eq-val _ _).
+
+es-eq-plus : val-eq V1 V1’ -> val-eq V2 V2’ -> es-eq (es-plus V1 V2) (es-plus V1’ V
+%mode es-eq-plus +X1 +X2 -X3.
+- : es-eq-plus val-eq_ val-eq_ es-eq_.
+%worlds (val-block) (es-eq-plus _ _ _).
+%total {} (es-eq-plus _ _ _).
+es-eq-mod : ec-eq Ec Ec’ -> es-eq (es-mod Ec) (es-mod Ec’) -> type.
+%mode es-eq-mod +X1 -X2.
+- : es-eq-mod ec-eq_ es-eq_.
+%worlds (val-block) (es-eq-mod _ _).
+%total {} (es-eq-mod _ _).
+
+es-eq-app : val-eq V1 V1’ -> val-eq V2 V2’ -> es-eq (es-app V1 V2) (es-app V1’ V2’)
+%mode es-eq-app +X1 +X2 -X3.
+- : es-eq-app val-eq_ val-eq_ es-eq_.
+%worlds (val-block) (es-eq-app _ _ _).
+%total {} (es-eq-app _ _ _).
+es-eq-let :
+es-eq Es1 Es1’ -> ({v} es-eq (Es2 v) (Es2’ v)) ->
+es-eq (es-let Es1 Es2) (es-let Es1’ Es2’) -> type.
+%mode es-eq-let +X1 +X2 -X3.
+- : es-eq-let es-eq_ ([v] es-eq_) es-eq_.
+%worlds (val-block) (es-eq-let _ _ _).
+%total {} (es-eq-let _ _ _).
+es-eq-letp :
+val-eq V1 V1’ -> ({v1}{v2} es-eq (Es2 v1 v2) (Es2’ v1 v2)) ->
+es-eq (es-letp V1 Es2) (es-letp V1’ Es2’) -> type.
+%mode es-eq-letp +X1 +X2 -X3.
+- : es-eq-letp val-eq_ ([v1][v2] es-eq_) es-eq_.
+%worlds (val-block) (es-eq-letp _ _ _).
+%total {} (es-eq-letp _ _ _).
+
+86
+
+es-eq-case :
+val-eq V0 V0’ -> ({v} es-eq (Es1 v) (Es1’ v)) -> ({v} es-eq (Es2 v) (Es2’ v)) ->
+es-eq (es-case V0 Es1 Es2) (es-case V0’ Es1’ Es2’) -> type.
+%mode es-eq-case +X1 +X2 +X3 -X4.
+- : es-eq-case val-eq_ ([v] es-eq_) ([v] es-eq_) es-eq_.
+%worlds (val-block) (es-eq-case _ _ _ _).
+%total {} (es-eq-case _ _ _ _).
+es-eq-memo : es-eq Es Es’ -> es-eq (es-memo Es) (es-memo Es’) -> type.
+%mode es-eq-memo +X1 -X2.
+- : es-eq-memo es-eq_ es-eq_.
+%worlds (val-block) (es-eq-memo _ _).
+%total {} (es-eq-memo _ _).
+ec-eq-wr : val-eq V V’ -> ec-eq (ec-wr V) (ec-wr V’) -> type.
+%mode ec-eq-wr +
+
+87
+
+

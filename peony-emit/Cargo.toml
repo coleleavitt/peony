@@ -1,0 +1,17 @@
+[package]
+name = "peony-emit"
+description = "Output ELF binary emission: section serialization, patch-in-place, deterministic output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peony-object      = { path = "../peony-object" }
+peony-symbols     = { path = "../peony-symbols" }
+peony-layout      = { path = "../peony-layout" }
+peony-reloc       = { path = "../peony-reloc" }
+object.workspace     = true
+memmap2.workspace    = true
+ws-deque.workspace   = true
+thiserror.workspace  = true
+tracing.workspace    = true

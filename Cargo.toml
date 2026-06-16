@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "peony",
+    "peony-object",
+    "peony-symbols",
+    "peony-layout",
+    "peony-reloc",
+    "peony-cache",
+    "peony-emit",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = []
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# ELF parsing
+object = { version = "0.36", features = ["read_core", "elf"] }
+# Work-stealing scheduler (Chase-Lev deque + lifeline load balancer)
+ws-deque = { path = "/home/cole/RustProjects/ws-deque" }
+# Parallel iteration (kept for crossbeam compat; prefer ws-deque for hot paths)
+rayon = "1.10"
+# Fast hashing
+rustc-hash = "2"
+# Memory-mapped I/O
+memmap2 = "0.9"
+# Error handling
+thiserror = "2"
+anyhow = "1"
+# Serialization for incremental cache
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# CLI (driver only)
+clap = { version = "4", features = ["derive"] }

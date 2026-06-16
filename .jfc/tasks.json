@@ -1,0 +1,288 @@
+{
+  "next_id": 28,
+  "tasks": {
+    "t12": {
+      "id": "t12",
+      "subject": "Write SPEC.md — complete implementation specification",
+      "description": "Translate QUAD.md theory into a concrete engineering spec: wire protocol, data formats, API contracts, phase pipeline, persistence schema, test oracle spec. Every data structure should have a formal invariant. Every phase should have a pre/postcondition.",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [
+        "t11"
+      ],
+      "created_at_ms": 1781449672130,
+      "kind": "task",
+      "effort": "max"
+    },
+    "t13": {
+      "id": "t13",
+      "subject": "Add tests for new algorithms",
+      "description": "Write tests verifying S3-GC correctness, parallel emit determinism, incremental red-green patch-in-place, PreHashed lookups",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781456926459,
+      "kind": "task"
+    },
+    "t21": {
+      "id": "t21",
+      "subject": "Linker: R_X86_64_RELATIVE in .rela.dyn for PIE",
+      "description": "Emit R_X86_64_RELATIVE dynamic relocations + DT_RELACOUNT for absolute pointers in PIE; required for PIE data pointers",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397688,
+      "kind": "task"
+    },
+    "t7": {
+      "id": "t7",
+      "subject": "Explore Wild linker codebase",
+      "description": "Use CodeGraph to explore /tmp/wild — find incremental linking implementation, symbol table, relocation scan, cache/diff logic, section layout. Extract key design patterns for peony.",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "metadata": {
+        "agent_task_id": "toolu_01AwHQK7X2K7SAgjm8wHFQ8u",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "created_at_ms": 1781447272215,
+      "kind": "task"
+    },
+    "t24": {
+      "id": "t24",
+      "subject": "Rocq: build harness (_CoqProject + Makefile) compiles",
+      "description": "rocq-tests/_CoqProject, Makefile; all .v compile clean under coqc 9.1.0; add README mapping each theorem to QUAD.md section",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397688,
+      "kind": "task"
+    },
+    "t14": {
+      "id": "t14",
+      "subject": "Implement parallel reloc apply + TLB-aware emit",
+      "description": "Parallelize section copy and relocation application in peony-emit; implement TLB-aware overwrite-in-place (QUAD §7, SPEC Phase 8)",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781456926459,
+      "kind": "task"
+    },
+    "t10": {
+      "id": "t10",
+      "subject": "Deep codebase analysis — Wild + raddebugger",
+      "description": "Read Wild source excerpts (symbol_db, layout, resolution, elf_writer, save_dir, string_merging) and raddebugger RDI format headers. Extract concrete algorithms, data structure invariants, and design patterns not documented anywhere.",
+      "status": "completed",
+      "blocks": [
+        "t11"
+      ],
+      "blockedBy": [],
+      "metadata": {
+        "agent_task_id": "toolu_01KpV273ghYfMzWS9tfnfK9A",
+        "model": "claude-sonnet-4-6"
+      },
+      "created_at_ms": 1781449652508,
+      "kind": "task",
+      "effort": "high"
+    },
+    "t8": {
+      "id": "t8",
+      "subject": "Deep paper analysis — read all 15 PDFs + blog sources",
+      "description": "Use haiku to read and extract key theoretical content from all PDFs in research/: dwarf5, x86-64 ABI, ELF specs, all 9 arXiv papers, mold design, Wild blog series, MaskRay posts. Produce a structured digest per paper with: key definitions, algorithms, complexity bounds, and what novel ideas they suggest for peony.",
+      "status": "completed",
+      "blocks": [
+        "t11"
+      ],
+      "blockedBy": [],
+      "metadata": {
+        "agent_task_id": "toolu_014tK7ChZEFCdNLErqevAsKE",
+        "model": "claude-sonnet-4-6"
+      },
+      "created_at_ms": 1781449652507,
+      "kind": "task",
+      "effort": "high"
+    },
+    "t17": {
+      "id": "t17",
+      "subject": "Implement S3-GC parallel BFS section GC",
+      "description": "Replace serial BFS in peony-layout gc_sections() with adaptive level-synchronous parallel BFS (S3-GC from QUAD §3.2 / SPEC Phase 3)",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781456926460,
+      "kind": "task"
+    },
+    "t9": {
+      "id": "t9",
+      "subject": "Extended research sweep — arXiv, primo, uni, dblp",
+      "description": "Use the Research tool + WebSearch with arXiv:/primo:/uni:/dblp:/scholar: prefixes to find papers on: incremental graph maintenance, persistent data structures for compilers, parallel hash join algorithms, delta-compressed binary patching, demand-driven dataflow, section-level liveness analysis. Download all hits to research/.",
+      "status": "completed",
+      "blocks": [
+        "t11"
+      ],
+      "blockedBy": [],
+      "metadata": {
+        "agent_task_id": "toolu_01KJ3NJRF4ELC83hxjaoCAEJ",
+        "model": "claude-sonnet-4-6"
+      },
+      "created_at_ms": 1781449652507,
+      "kind": "task",
+      "effort": "high"
+    },
+    "t19": {
+      "id": "t19",
+      "subject": "Fix premature done.store(true) in ws-deque workers",
+      "description": "Fix the termination signal in peony-layout gc_sections() and peony-emit write_section_data_parallel() so workers drain fully via stealing before exiting",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781460807022,
+      "kind": "task"
+    },
+    "t25": {
+      "id": "t25",
+      "subject": "Linker: symbol versioning + IRELATIVE + GNU_RELRO",
+      "description": ".gnu.version/.gnu.version_r verneed records, R_X86_64_IRELATIVE ifunc relocations, PT_GNU_RELRO segment for glibc linkage",
+      "status": "in_progress",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397688,
+      "kind": "task"
+    },
+    "t18": {
+      "id": "t18",
+      "subject": "Fix section_references_moved heuristic",
+      "description": "Replace the 3-hardcoded-name heuristic with the actual relocation reverse index lookup, and wire compute_red_green into the driver pipeline",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781460807021,
+      "kind": "task"
+    },
+    "t11": {
+      "id": "t11",
+      "subject": "Write QUAD.md — theoretical foundations with proofs",
+      "description": "Synthesize all research into a formal academic document. Must include: formal definitions of the incremental linking problem, theorems on correctness of incremental reuse, complexity analysis of parallel symbol resolution, proof of determinism, novel algorithmic contributions (with pseudocode and proofs).",
+      "status": "completed",
+      "blocks": [
+        "t12"
+      ],
+      "blockedBy": [
+        "t10",
+        "t8",
+        "t9"
+      ],
+      "created_at_ms": 1781449652508,
+      "kind": "task",
+      "effort": "max"
+    },
+    "t27": {
+      "id": "t27",
+      "subject": "Linker: .eh_frame_hdr + PT_GNU_EH_FRAME",
+      "description": "Synthesize sorted .eh_frame_hdr binary-search table from .eh_frame FDEs + PT_GNU_EH_FRAME segment; required for Rust unwinding",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397689,
+      "kind": "task"
+    },
+    "t28": {
+      "id": "t28",
+      "subject": "Rocq: NOVEL incremental-relink soundness + minimal-cut theorems",
+      "description": "rocq-tests/IncrementalSoundness.v — byte-identical incremental-relink soundness under capacity-stable invariant + minimal recomputation cut (genuinely novel per research/council); rocq-tests/RelocMonoid.v — relocation composition as partial commutative monoid",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781651665646,
+      "kind": "task"
+    },
+    "t16": {
+      "id": "t16",
+      "subject": "Implement epoch-gated cache + red-green + reloc reverse index",
+      "description": "Upgrade peony-cache: epoch key (args_hash+mtimes), section-level diff, red-green coloring, reloc reverse index (QUAD §6, §10.2, SPEC §4 + §7.3)",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781456926459,
+      "kind": "task"
+    },
+    "t6": {
+      "id": "t6",
+      "subject": "Explore raddebugger codebase",
+      "description": "Use CodeGraph to explore /tmp/raddebugger — find RADDBG format, debug info structures, linker-relevant sections. Extract design patterns for debug info handling in peony-emit.",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "metadata": {
+        "agent_task_id": "toolu_01XSYpAx4Bf6kLhU3YzXDcEZ",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "created_at_ms": 1781447272214,
+      "kind": "task"
+    },
+    "t20": {
+      "id": "t20",
+      "subject": "Linker: gcc lib-path auto-discovery",
+      "description": "Query `gcc -print-search-dirs` at startup, add library paths so -lgcc_s/-lc resolve without explicit -L",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397688,
+      "kind": "task"
+    },
+    "t23": {
+      "id": "t23",
+      "subject": "Rocq: relocation disjoint-write + determinism",
+      "description": "rocq-tests/RelocDisjoint.v — footprint function, pairwise-disjoint partition theorem, parallel apply commutes = sequential (separation), determinism as confluence corollary",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397688,
+      "kind": "task"
+    },
+    "t15": {
+      "id": "t15",
+      "subject": "Implement PreHashed + parallel symbol scan",
+      "description": "Add PreHashed<K> type to peony-symbols, switch SymbolTable to use pre-hashed lookups per SPEC §5 / QUAD §2.3",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781456926459,
+      "kind": "task"
+    },
+    "t5": {
+      "id": "t5",
+      "subject": "Deep arXiv paper search",
+      "description": "Search arXiv/scholarly for more relevant papers: DWARF compression, persistent data structures, parallel symbol resolution, demand-driven compilation, whole-program optimization, debug info linkers",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "metadata": {
+        "agent_task_id": "toolu_01SBfVFpLsXVwufGGLDZocTn",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "created_at_ms": 1781447272214,
+      "kind": "task"
+    },
+    "t22": {
+      "id": "t22",
+      "subject": "Rocq: GC reachability + layout congruence",
+      "description": "rocq-tests/SectionGC.v (level-sync BFS = reachable set) and rocq-tests/Layout.v (conditional layout existence + page-congruence invariant with bounded addresses)",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397688,
+      "kind": "task"
+    },
+    "t26": {
+      "id": "t26",
+      "subject": "Rocq: symbol resolution semilattice proofs",
+      "description": "rocq-tests/SymbolLattice.v — binding-strength join-semilattice with associativity, commutativity, idempotence; confluence of parallel resolution under fixed precedence tie-break (per council guidance)",
+      "status": "completed",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781650397689,
+      "kind": "task"
+    }
+  }
+}

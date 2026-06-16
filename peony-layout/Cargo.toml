@@ -1,0 +1,14 @@
+[package]
+name = "peony-layout"
+description = "Section layout, address assignment, and segment mapping"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peony-object      = { path = "../peony-object" }
+peony-symbols     = { path = "../peony-symbols" }
+ws-deque.workspace   = true
+rustc-hash.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true

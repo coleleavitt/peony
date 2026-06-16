@@ -1,0 +1,651 @@
+//! `peony-object` — ELF object file parsing and section/symbol extraction.
+//!
+//! This crate wraps the [`object`] crate and exposes the subset of ELF that
+//! the linker cares about:
+//!
+//! * Parsed [`InputObject`]s loaded from disk via `mmap`.
+//! * Per-object [`InputSection`] and [`InputSymbol`] tables.
+//! * Archive (`.rlib` / `.a`) member iteration with byte-level comparison
+//!   for incremental diffing (rustc does not set timestamps on archive members).
+//!
+//! ## Design notes
+//!
+//! Objects are memory-mapped and parsed in parallel by the caller (via
+//! `rayon`).  This crate is intentionally stateless — all parsing state lives
+//! in the returned structs; the caller is responsible for lifetime management.
+//!
+//! Section names that follow the Rust mangled-name convention
+//! (`.text._ZN…`, `.rodata._ZN…`) are *stable* across incremental rebuilds
+//! and can be used directly as diff keys.  Anonymous sections
+//! (`.rodata..L__unnamed_N`) must be matched by their referrer set — that
+//! logic lives in `peony-cache`.
+
+use std::path::Path;
+
+use memmap2::Mmap;
+use object::read::elf::{ElfFile64, SectionHeader};
+use object::{Endianness, Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolIndex};
+use rustc_hash::FxHashMap;
+use thiserror::Error;
+
+// ── Error type ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum ObjectError {
+    #[error("I/O error reading {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("ELF parse error in {path}: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: object::Error,
+    },
+    #[error("unsupported ELF class or architecture in {path}")]
+    UnsupportedArch { path: String },
+}
+
+pub type Result<T> = std::result::Result<T, ObjectError>;
+
+// ── Section kinds ─────────────────────────────────────────────────────────────
+
+/// Coarse classification of an ELF input section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SectionKind {
+    /// Executable code (`.text*`).
+    Text,
+    /// Read-only data (`.rodata*`).
+    ReadOnly,
+    /// Read-write data (`.data*`).
+    Data,
+    /// Zero-initialised data (`.bss*`).
+    Bss,
+    /// DWARF debug information (`.debug_*`).
+    Debug,
+    /// Exception-handling frames (`.eh_frame`).
+    EhFrame,
+    /// Mergeable strings (SHF_MERGE | SHF_STRINGS).
+    MergeString,
+    /// Mergeable fixed-width constants (SHF_MERGE without SHF_STRINGS).
+    MergeConst,
+    /// Init/fini array (`.init_array`, `.fini_array`).
+    InitArray,
+    /// Thread-local initialized data (`.tdata`, `SHF_TLS`).
+    Tdata,
+    /// Thread-local zero data (`.tbss`, `SHF_TLS` + NOBITS).
+    Tbss,
+    /// Anything else we pass through without interpretation.
+    Other,
+}
+
+// ── Core data types ───────────────────────────────────────────────────────────
+
+/// A single ELF section extracted from an [`InputObject`].
+#[derive(Debug, Clone)]
+pub struct InputSection {
+    /// Index within the parent object's section table.
+    pub index: SectionIndex,
+    /// Section name, interned as a `Vec<u8>` (may not be valid UTF-8).
+    pub name: Vec<u8>,
+    /// Coarse classification.
+    pub kind: SectionKind,
+    /// Raw section data (a slice into the mmap'd file).
+    pub data: Vec<u8>,
+    /// Section alignment (must be a power of two).
+    pub align: u64,
+    /// Size in bytes (may differ from `data.len()` for BSS).
+    pub size: u64,
+    /// SHF_* flags from the ELF header.
+    pub flags: u64,
+    /// Relocations targeting this section.
+    pub relocs: Vec<InputReloc>,
+}
+
+/// A single relocation entry within an [`InputSection`].
+#[derive(Debug, Clone)]
+pub struct InputReloc {
+    /// Offset within the section being relocated.
+    pub offset: u64,
+    /// Relocation type (architecture-specific; e.g. `R_X86_64_PC32 = 2`).
+    pub r_type: u32,
+    /// Index of the symbol this relocation references.
+    pub symbol: SymbolIndex,
+    /// Addend (for RELA; zero for REL).
+    pub addend: i64,
+}
+
+/// Binding strength of a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    Local,
+    Global,
+    Weak,
+}
+
+/// A symbol defined or referenced in an [`InputObject`].
+#[derive(Debug, Clone)]
+pub struct InputSymbol {
+    pub index: SymbolIndex,
+    /// Symbol name bytes (interned from mmap; clone to persist).
+    pub name: Vec<u8>,
+    pub binding: Binding,
+    pub is_undefined: bool,
+    /// Tentative (common) definition: `value` holds the required alignment and
+    /// `size` the byte size. The linker allocates space in `.bss`.
+    pub is_common: bool,
+    /// Section index for defined symbols; `None` for absolute/common/undefined.
+    pub section: Option<SectionIndex>,
+    /// Value (offset within section for defined symbols; alignment for common).
+    pub value: u64,
+    pub size: u64,
+}
+
+/// A parsed ELF-64 input object file.
+///
+/// All section/symbol bytes are copied out of the source buffer during parsing,
+/// so the object is self-contained (the backing file/mmap need not outlive it).
+pub struct InputObject {
+    /// Original path (for diagnostics). For archive members: `archive(member.o)`.
+    pub path: String,
+    pub sections: Vec<InputSection>,
+    pub symbols: Vec<InputSymbol>,
+    /// Map from section index → position in `sections`.
+    pub section_map: FxHashMap<usize, usize>,
+    /// Map from symbol index → position in `symbols`.
+    pub symbol_map: FxHashMap<usize, usize>,
+    /// COMDAT groups defined in this object (for cross-object deduplication).
+    pub comdat_groups: Vec<ComdatGroup>,
+}
+
+/// A COMDAT section group: a set of member sections kept only once across all
+/// objects that share the same `signature` (e.g. a C++ inline function).
+#[derive(Debug, Clone)]
+pub struct ComdatGroup {
+    /// The group signature symbol's name.
+    pub signature: Vec<u8>,
+    /// Member section indices (within the defining object).
+    pub members: Vec<usize>,
+}
+
+impl std::fmt::Debug for InputObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputObject")
+            .field("path", &self.path)
+            .field("sections", &self.sections.len())
+            .field("symbols", &self.symbols.len())
+            .finish()
+    }
+}
+
+// ── Parsing ───────────────────────────────────────────────────────────────────
+
+/// Open and parse a single ELF-64 object file.
+///
+/// The file is memory-mapped; the returned [`InputObject`] owns the map.
+/// Parsing is cheap — it copies only section/symbol metadata, not bulk data.
+pub fn parse_object(path: &Path) -> Result<InputObject> {
+    let file = std::fs::File::open(path).map_err(|e| ObjectError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    // SAFETY: we never mutate the mmap; parsing copies out everything it needs.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| ObjectError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+
+    parse_bytes(path.display().to_string(), &mmap)
+}
+
+/// Parse an ELF-64 object from an in-memory byte buffer (e.g. an archive member).
+pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
+    let elf: ElfFile64<Endianness> = ElfFile64::parse(data).map_err(|e| ObjectError::Parse {
+        path: path.clone(),
+        source: e,
+    })?;
+
+    let mut sections = Vec::new();
+    let mut section_map = FxHashMap::default();
+
+    for section in elf.sections() {
+        let idx = section.index();
+        let name = section.name_bytes().unwrap_or(b"").to_vec();
+        let raw_data = section.data().unwrap_or(&[]).to_vec();
+        let sh_flags = match section.flags() {
+            object::SectionFlags::Elf { sh_flags } => sh_flags,
+            _ => 0,
+        };
+        let kind = classify_section(&name, sh_flags);
+        let relocs = collect_relocs(&section);
+
+        let isec = InputSection {
+            index: idx,
+            name,
+            kind,
+            data: raw_data,
+            align: section.align(),
+            size: section.size(),
+            flags: sh_flags,
+            relocs,
+        };
+        section_map.insert(idx.0, sections.len());
+        sections.push(isec);
+    }
+
+    let mut symbols = Vec::new();
+    let mut symbol_map = FxHashMap::default();
+
+    for sym in elf.symbols() {
+        let idx = sym.index();
+        let name = sym.name_bytes().unwrap_or(b"").to_vec();
+        let binding = if sym.scope() == object::SymbolScope::Compilation {
+            Binding::Local
+        } else if sym.is_weak() {
+            Binding::Weak
+        } else {
+            Binding::Global
+        };
+        let isym = InputSymbol {
+            index: idx,
+            name,
+            binding,
+            is_undefined: sym.is_undefined(),
+            is_common: sym.is_common(),
+            section: sym.section_index(),
+            value: sym.address(),
+            size: sym.size(),
+        };
+        symbol_map.insert(idx.0, symbols.len());
+        symbols.push(isym);
+    }
+
+    let comdat_groups = parse_comdat_groups(&elf);
+
+    Ok(InputObject {
+        path,
+        sections,
+        symbols,
+        section_map,
+        symbol_map,
+        comdat_groups,
+    })
+}
+
+/// Parse `SHT_GROUP` sections with the `GRP_COMDAT` flag.
+fn parse_comdat_groups(elf: &ElfFile64<Endianness>) -> Vec<ComdatGroup> {
+    const SHT_GROUP: u32 = 17;
+    const GRP_COMDAT: u32 = 0x1;
+    let endian = elf.endian();
+    let mut groups = Vec::new();
+    for section in elf.sections() {
+        let hdr = section.elf_section_header();
+        if hdr.sh_type(endian) != SHT_GROUP {
+            continue;
+        }
+        let Ok(data) = section.data() else { continue };
+        if data.len() < 4 {
+            continue;
+        }
+        let flags = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if flags & GRP_COMDAT == 0 {
+            continue;
+        }
+        let members = data[4..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+            .collect();
+        let sig_idx = hdr.sh_info(endian) as usize;
+        let signature = elf
+            .symbol_by_index(SymbolIndex(sig_idx))
+            .ok()
+            .and_then(|s| s.name_bytes().ok())
+            .map(|n| n.to_vec())
+            .unwrap_or_default();
+        groups.push(ComdatGroup { signature, members });
+    }
+    groups
+}
+
+fn classify_section(name: &[u8], flags: u64) -> SectionKind {
+    // SHF_MERGE = 0x10, SHF_STRINGS = 0x20, SHF_TLS = 0x400
+    const SHF_MERGE: u64 = 0x10;
+    const SHF_STRINGS: u64 = 0x20;
+    const SHF_TLS: u64 = 0x400;
+
+    if flags & SHF_TLS != 0 {
+        return if name.starts_with(b".tbss") {
+            SectionKind::Tbss
+        } else {
+            SectionKind::Tdata
+        };
+    }
+
+    if flags & SHF_MERGE != 0 {
+        return if flags & SHF_STRINGS != 0 {
+            SectionKind::MergeString
+        } else {
+            SectionKind::MergeConst
+        };
+    }
+
+    if name.starts_with(b".text") {
+        SectionKind::Text
+    } else if name.starts_with(b".rodata") {
+        SectionKind::ReadOnly
+    } else if name.starts_with(b".data") {
+        SectionKind::Data
+    } else if name.starts_with(b".bss") {
+        SectionKind::Bss
+    } else if name.starts_with(b".debug_") {
+        SectionKind::Debug
+    } else if name == b".eh_frame" {
+        SectionKind::EhFrame
+    } else if name.starts_with(b".init_array") || name.starts_with(b".fini_array") {
+        SectionKind::InitArray
+    } else {
+        SectionKind::Other
+    }
+}
+
+fn collect_relocs(section: &object::read::elf::ElfSection64<Endianness>) -> Vec<InputReloc> {
+    let mut out = Vec::new();
+    for (offset, reloc) in section.relocations() {
+        let symbol = match reloc.target() {
+            object::RelocationTarget::Symbol(s) => s,
+            _ => continue,
+        };
+        // Use the *raw* ELF relocation type, NOT the `object` crate's generic
+        // `RelocationKind` (whose discriminants only coincidentally match a few
+        // ELF type numbers).
+        let r_type = match reloc.flags() {
+            object::RelocationFlags::Elf { r_type } => r_type,
+            _ => continue,
+        };
+        out.push(InputReloc {
+            offset,
+            r_type,
+            symbol,
+            addend: reloc.addend(),
+        });
+    }
+    out
+}
+
+// ── Archive support ───────────────────────────────────────────────────────────
+
+/// A single member extracted from an `.rlib` / `.a` archive.
+pub struct ArchiveMember {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// Iterate over all members of an `ar`-format archive, yielding raw bytes.
+///
+/// Used for `.rlib` files: rustc does **not** set modification timestamps on
+/// archive members, so byte-level comparison is required for incremental
+/// diffing.
+pub fn iter_archive_members(path: &Path) -> Result<Vec<ArchiveMember>> {
+    let data = std::fs::read(path).map_err(|e| ObjectError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+
+    // Minimal `ar` parser: magic + repeated header+data blocks.
+    const MAGIC: &[u8] = b"!<arch>\n";
+    if !data.starts_with(MAGIC) {
+        return Ok(Vec::new()); // treat non-archive as empty
+    }
+
+    let mut members = Vec::new();
+    let mut pos = MAGIC.len();
+
+    while pos + 60 <= data.len() {
+        let header = &data[pos..pos + 60];
+        pos += 60;
+
+        // Identifier: bytes 0..16, right-padded with spaces.
+        let name = std::str::from_utf8(&header[0..16])
+            .unwrap_or("")
+            .trim_end()
+            .to_string();
+
+        // Size: bytes 48..58, ASCII decimal.
+        let size_str = std::str::from_utf8(&header[48..58]).unwrap_or("0").trim();
+        let size: usize = size_str.parse().unwrap_or(0);
+
+        if pos + size > data.len() {
+            break;
+        }
+        let member_data = data[pos..pos + size].to_vec();
+        pos += size;
+        if !size.is_multiple_of(2) {
+            pos += 1; // `ar` pads odd-sized entries to even alignment
+        }
+
+        // Skip symbol table and string table pseudo-members.
+        if name == "/" || name == "//" || name == "__.SYMDEF" {
+            continue;
+        }
+
+        members.push(ArchiveMember {
+            name,
+            data: member_data,
+        });
+    }
+
+    Ok(members)
+}
+
+// ── Shared object (.so) support ─────────────────────────────────────────────────
+
+/// A parsed shared library: the name to record as `DT_NEEDED` and the global
+/// symbols it exports (used to satisfy dynamic imports).
+#[derive(Debug, Clone)]
+pub struct SharedObject {
+    pub soname: String,
+    pub exports: Vec<Vec<u8>>,
+}
+
+/// Returns true if `path` is an ELF shared object (`ET_DYN`).
+pub fn is_shared_object(path: &Path) -> bool {
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    matches!(
+        ElfFile64::<Endianness>::parse(data.as_slice()).map(|e| e.kind()),
+        Ok(object::ObjectKind::Dynamic)
+    )
+}
+
+/// Parse a shared object's exported dynamic symbols and its `DT_SONAME`
+/// (falling back to the file's base name).
+pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
+    let data = std::fs::read(path).map_err(|e| ObjectError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let elf: ElfFile64<Endianness> =
+        ElfFile64::parse(data.as_slice()).map_err(|e| ObjectError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+
+    let mut exports = Vec::new();
+    for sym in elf.dynamic_symbols() {
+        if sym.is_undefined() || sym.is_local() {
+            continue;
+        }
+        if let Ok(name) = sym.name_bytes() {
+            if !name.is_empty() {
+                exports.push(name.to_vec());
+            }
+        }
+    }
+
+    let soname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    Ok(SharedObject { soname, exports })
+}
+
+// ── ELF64 format constants ──────────────────────────────────────────────────────
+
+/// Authoritative ELF64 + x86-64 constants used by the layout and emit passes.
+///
+/// Values are taken verbatim from the ELF-64 / TIS ELF specs and the AMD64 SysV
+/// ABI (see `research/SPEC_AND_LITERATURE_DIGEST.md` §A–B).
+pub mod elf {
+    // ── e_ident ──
+    pub const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+    pub const ELFCLASS64: u8 = 2;
+    pub const ELFDATA2LSB: u8 = 1;
+    pub const EV_CURRENT: u8 = 1;
+    pub const ELFOSABI_SYSV: u8 = 0;
+
+    // ── e_type ──
+    pub const ET_REL: u16 = 1;
+    pub const ET_EXEC: u16 = 2;
+    pub const ET_DYN: u16 = 3;
+
+    // ── e_machine ──
+    pub const EM_X86_64: u16 = 62;
+
+    // ── fixed record sizes ──
+    pub const EHDR_SIZE: u64 = 64;
+    pub const PHDR_SIZE: u64 = 56;
+    pub const SHDR_SIZE: u64 = 64;
+    pub const SYM_SIZE: u64 = 24;
+    pub const RELA_SIZE: u64 = 24;
+
+    // ── p_type ──
+    pub const PT_NULL: u32 = 0;
+    pub const PT_LOAD: u32 = 1;
+    pub const PT_DYNAMIC: u32 = 2;
+    pub const PT_INTERP: u32 = 3;
+    pub const PT_NOTE: u32 = 4;
+    pub const PT_PHDR: u32 = 6;
+    pub const PT_TLS: u32 = 7;
+    pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
+    pub const PT_GNU_STACK: u32 = 0x6474_e551;
+    pub const PT_GNU_RELRO: u32 = 0x6474_e552;
+
+    // ── p_flags ──
+    pub const PF_X: u32 = 0x1;
+    pub const PF_W: u32 = 0x2;
+    pub const PF_R: u32 = 0x4;
+
+    // ── sh_type ──
+    pub const SHT_NULL: u32 = 0;
+    pub const SHT_PROGBITS: u32 = 1;
+    pub const SHT_SYMTAB: u32 = 2;
+    pub const SHT_STRTAB: u32 = 3;
+    pub const SHT_RELA: u32 = 4;
+    pub const SHT_HASH: u32 = 5;
+    pub const SHT_DYNAMIC: u32 = 6;
+    pub const SHT_NOTE: u32 = 7;
+    pub const SHT_NOBITS: u32 = 8;
+    pub const SHT_DYNSYM: u32 = 11;
+
+    /// GNU build-id note type.
+    pub const NT_GNU_BUILD_ID: u32 = 3;
+
+    // ── dynamic section tags (Elf64_Dyn d_tag) ──
+    pub const DT_NULL: i64 = 0;
+    pub const DT_NEEDED: i64 = 1;
+    pub const DT_PLTRELSZ: i64 = 2;
+    pub const DT_PLTGOT: i64 = 3;
+    pub const DT_HASH: i64 = 4;
+    pub const DT_PLTREL: i64 = 20;
+    pub const DT_JMPREL: i64 = 23;
+    pub const DT_STRTAB: i64 = 5;
+    pub const DT_SYMTAB: i64 = 6;
+    pub const DT_RELA: i64 = 7;
+    pub const DT_RELASZ: i64 = 8;
+    pub const DT_RELAENT: i64 = 9;
+    pub const DT_STRSZ: i64 = 10;
+    pub const DT_SYMENT: i64 = 11;
+    pub const DT_INIT_ARRAY: i64 = 25;
+    pub const DT_FINI_ARRAY: i64 = 26;
+    pub const DT_INIT_ARRAYSZ: i64 = 27;
+    pub const DT_FINI_ARRAYSZ: i64 = 28;
+    pub const DT_FLAGS: i64 = 30;
+    pub const DT_RELACOUNT: i64 = 0x6fff_fff9;
+    pub const DT_GNU_HASH: i64 = 0x6fff_fef5;
+    pub const DT_FLAGS_1: i64 = 0x6fff_fffb;
+    pub const DT_VERSYM: i64 = 0x6fff_fff0;
+    pub const DT_VERNEED: i64 = 0x6fff_fffe;
+    pub const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
+    pub const DF_BIND_NOW: u64 = 0x8;
+    pub const DF_1_NOW: u64 = 0x1;
+    pub const DF_1_PIE: u64 = 0x0800_0000;
+
+    // ── dynamic relocation types ──
+    pub const R_X86_64_64: u32 = 1;
+    pub const R_X86_64_GLOB_DAT: u32 = 6;
+    pub const R_X86_64_JUMP_SLOT: u32 = 7;
+    pub const R_X86_64_RELATIVE: u32 = 8;
+    pub const R_X86_64_IRELATIVE: u32 = 37;
+
+    /// Default ELF interpreter for x86-64 glibc.
+    pub const DEFAULT_INTERP: &[u8] = b"/lib64/ld-linux-x86-64.so.2\0";
+
+    // ── sh_flags ──
+    pub const SHF_WRITE: u64 = 0x1;
+    pub const SHF_ALLOC: u64 = 0x2;
+    pub const SHF_EXECINSTR: u64 = 0x4;
+    pub const SHF_MERGE: u64 = 0x10;
+    pub const SHF_STRINGS: u64 = 0x20;
+    pub const SHF_TLS: u64 = 0x400;
+
+    // ── special section indices ──
+    pub const SHN_UNDEF: u16 = 0;
+    pub const SHN_ABS: u16 = 0xfff1;
+    pub const SHN_COMMON: u16 = 0xfff2;
+
+    // ── symbol binding / type / visibility ──
+    pub const STB_LOCAL: u8 = 0;
+    pub const STB_GLOBAL: u8 = 1;
+    pub const STB_WEAK: u8 = 2;
+    pub const STT_NOTYPE: u8 = 0;
+    pub const STT_OBJECT: u8 = 1;
+    pub const STT_FUNC: u8 = 2;
+    pub const STT_SECTION: u8 = 3;
+    pub const STT_FILE: u8 = 4;
+    pub const STT_TLS: u8 = 6;
+    pub const STV_DEFAULT: u8 = 0;
+
+    /// `st_info = (bind << 4) | (type & 0xf)`.
+    #[inline]
+    pub const fn st_info(bind: u8, typ: u8) -> u8 {
+        (bind << 4) | (typ & 0xf)
+    }
+}
+
+#[cfg(test)]
+mod dyn_probe {
+    #[test]
+    fn probe_shared() {
+        // smoke: parsing a system libc.so.6 should yield exports
+        for p in [
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+        ] {
+            let path = std::path::Path::new(p);
+            if path.exists() {
+                let r = super::parse_shared_object(path).unwrap();
+                assert!(!r.exports.is_empty(), "libc should export symbols");
+                assert!(
+                    r.exports.iter().any(|e| e == b"printf"),
+                    "libc should export printf"
+                );
+                return;
+            }
+        }
+    }
+}

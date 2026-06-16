@@ -1,0 +1,25 @@
+[package]
+name = "peony"
+description = "Incremental parallel ELF linker — driver binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "peony"
+path = "src/main.rs"
+
+[dependencies]
+peony-object  = { path = "../peony-object" }
+peony-symbols = { path = "../peony-symbols" }
+peony-layout  = { path = "../peony-layout" }
+peony-reloc   = { path = "../peony-reloc" }
+peony-cache   = { path = "../peony-cache" }
+peony-emit    = { path = "../peony-emit" }
+
+anyhow.workspace     = true
+clap.workspace       = true
+rayon.workspace      = true
+rustc-hash.workspace = true
+tracing.workspace    = true
+tracing-subscriber.workspace = true

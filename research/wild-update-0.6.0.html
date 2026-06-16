@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wild Linker Update - 0.6.0 | David Lattimore</title>
+
+  <link href="/css/common.css" rel="stylesheet" />
+  <link href="/css/monokai.sublime.css" rel="stylesheet" />
+
+  <link rel="alternate" type="application/atom+xml" title="David Lattimore's Blog" href="/feed.xml" />
+</head>
+
+
+<body>
+  <header>
+    <h1>Wild Linker Update - 0.6.0 </h1>
+</header>
+  <nav>
+    <ul>
+        <li><a href="/">Home</a></li>
+        <li><a href="/about">About</a></li>
+    </ul>
+</nav>
+
+
+  <main>
+    <article>
+      <p class="post-meta">
+  
+  David Lattimore - <time class="publish-date" datetime="2025-09-23">2025-09-23</time>
+  
+  
+</p>
+      <p>Today, we’ve released <a href="https://github.com/davidlattimore/wild/releases/tag/0.6.0">Wild version
+0.6.0</a>. There were many changes and we
+were probably overdue for a release, having last released in May.</p>
+
+<p>This release saw contributions from many people:</p>
+
+<ul>
+  <li>davidlattimore: 90</li>
+  <li>marxin: 69</li>
+  <li>lapla-cogito: 41</li>
+  <li>mati865: 28</li>
+  <li>RossSmyth: 6</li>
+  <li>daniel-levin: 3</li>
+  <li>Noratrieb: 2</li>
+  <li>lqd: 1</li>
+  <li>m-hugo: 1</li>
+  <li>dawnofmidnight: 1</li>
+</ul>
+
+<p>That’s the number of commits, which isn’t a great measure, but it’s something. Importantly, more
+than half of the commits made were made by people other than me. It’s awesome to see wild growing
+into a team project. If you’d like to contribute, come along and have a chat on the <a href="https://wild.zulipchat.com/join/bbopdeg6howwjpaiyowngyde/">Wild
+Zulip</a> or have a look through the issues
+for something you think you’d like to try implementing / fixing.</p>
+
+<p>My work on the project has been reduced a bit the last couple of months due to me speaking at first
+RustForge, then RustChinaConf. Conference preparation takes me a lot of time and I need to get
+better at managing that preparation work while still getting other stuff done. In any case, the
+conferences are over now and I’m looking forward to getting some solid work done.</p>
+
+<p>The last few months we had Kei (lapla-cogito) join us for Google Summer of Code (GSoC). It was
+awesome having Kei work with us. As you can see above, a lot of work got done. The project focused
+on setting things up to run Mold’s test suite with wild. This is now running in CI and helps fill
+some gaps in our own tests as well as highlight things that we haven’t yet implemented. Kei also did
+a lot of other fixes and improvements. One of the more notable ones was implementing <code class="language-plaintext highlighter-rouge">--help</code>, which
+was something we’d wanted for a while. I look forward to continuing to work with Kei going forward.</p>
+
+<p>Martin (marxin) added initial RISC-V support to this release. There’s still probably a little bit
+more that could be done on this, but it basically works. Kei is working on adding RISC-V support to
+linker-diff, which will help with further work in this area.</p>
+
+<p>With this release, we now do release builds of Wild with Wild. i.e., we’re using it in “production”.
+As such, we’ve removed the language from our README that used to say not to use it in production.
+That’s not to say you should do production builds with it and just put them out there. We definitely
+recommend thorough testing. Wild is still intended primarily for fast development, but if you’d like
+to use it for other things, who are we to stop you. As always, be sure to let us know if you hit any
+problems.</p>
+
+<p>With 0.6.0, we can now link the Chromium web browser. This is an interesting stress test for linkers
+because it’s really big - about 1.4 GiB (a previous version of this post incorrectly said that this
+was without debug info, it’s actually with debug info).</p>
+
+<p><img src="/images/0.6.0/chromium.svg" alt="Benchmark of time to link Chromium" /></p>
+
+<p>It’s worth noting that the relative difference between lld and mold is very different to what’s seen
+in the benchmarks on the <a href="https://github.com/rui314/mold">mold repo</a>. This is likely due to the
+benchmark machine being very different. i.e., my laptop has a lot less cores.</p>
+
+<p>The following benchmark is for librustc-driver, which is where most of the code in the Rust compiler
+goes.</p>
+
+<p><img src="/images/0.6.0/librustc-driver.svg" alt="Benchmark of time to link librustc-driver" /></p>
+
+<p>Our final benchmark is the bevy dylib. This is an interesting benchmark since it has a very large
+version script and produces a shared object with more than half a million dynamic symbols.</p>
+
+<p><img src="/images/0.6.0/bevy-dylib.svg" alt="Benchmark of time to link bevy dylib" /></p>
+
+<p>My laptop has 4 cores and 8 threads. All my development work to date has been on this machine and on
+it, Wild performs really well, often beating other linkers by a factor of 2 or sometimes more.
+However, on machines with more cores, the performance isn’t so great. We’ve started to look into
+this to see what we can do about it. One area that particularly stands out is string merging. This
+is where there’s a section containing null-terminated strings that need to be deduplicated with
+similar sections in other object files. Sounds easy, but getting it to perform well with multiple
+threads is hard. We’ve gone through several different implementations of string merging in an
+attempt to get good performance. Our current implementation is probably too complex. It’s also
+performing badly in some cases. In particular when there aren’t many input sections but there are
+lots of threads. In this case it’s actually getting slower the more threads it has.</p>
+
+<p>As such, I’m considering doing another rewrite of string merging. One option I’m considering here is
+to change the way string-merge sections are represented in ELF files. I suspect that with a few
+tweaks to how they’re represented, we could get much better performance.</p>
+
+<p>At a high level, the idea would be to store an additional section containing an index of the strings
+to be merged. This index, similar to the symbol table, would contain the start offset of each
+string. Where string relocations (references) are currently by section number + section offset, we’d
+change them to be section number + string number. That means that we’d need a new relocation type.
+Additionally, the string index would also store a hash of each string and the strings would be
+sorted by hash.</p>
+
+<p>I’ll probably do some experiments on this front to see what’s possible. If it performs well, then we
+can talk to other linker authors and compiler writers to see if there’s interest in the new
+representation. I’ll try to write a blog post about the outcome, even if it doesn’t work out.</p>
+
+<p>While string-merging is the worst offender in terms of scaling the number of threads, it looks like
+other areas are also not ideal. This needs more investigation. I suspect at least part of the issue
+might be rayon.</p>
+
+<p>One area where we know we have a problem with rayon is its <code class="language-plaintext highlighter-rouge">try_for_each_init</code> API. We use this to
+allocate a per-thread arena in a couple of cases. Unfortunately, rayon runs the init block for
+pretty much every work item rather than just running it once per thread. This means that we end up
+generating many times more arenas that we need, which is pretty wasteful. This is a known issue in
+rayon, but I think it’s perhaps not clear how to fix it with rayon’s architecture.</p>
+
+<p>I’m keen to try alternatives to rayon to see what difference they make. In particular, I’ve been
+looking at <a href="https://github.com/orxfun/orx-parallel/">orx-parallel</a>. Once it has thread-pool support
+and some way to handle graph algorithms (e.g. task spawning), I’ll definitely be giving it a try.</p>
+
+<p>Trying <a href="https://github.com/dragostis/chili">chili</a> would also be interesting, but it’s pretty low
+level, so we’d need quite a few abstractions built on top of it (e.g. par_iter) before we could
+reasonably use it.</p>
+
+<p>If you’ve been following this project for a while, you might be wondering what’s happening with
+incremental linking. I thought that I was ready to start on this about a year ago, but it turns out
+that I underestimated how much more there was to get a solid linker, so fixing bugs and adding
+missing features has occupied most of my time. When I started the linker, I wasn’t expecting to get
+such good performance with non-incremental linking. Seeing the performance that we’ve gotten has
+changed the equation a bit in terms of what seems important to work on. Anyway, I still intend to
+get to incremental eventually, but I won’t promise when.</p>
+
+<p>There are lots of other things that we may or may not work on in the coming months. Possibilities
+are:</p>
+
+<ul>
+  <li>Improving linker-script support</li>
+  <li>Linker-plugin LTO. Not needed for Rust LTO, but is needed for LTO of other languages.</li>
+  <li>Improved symbol version support (Martin might be looking at this)</li>
+  <li>Garbage collection of redundant / unused debug info. This one is a bit daunting, so we probably
+won’t do it, but it’d be cool if we did, since it’s something that none of the other linkers do.</li>
+  <li>Putting ELF-specific stuff behind a trait to make porting to Windows / Mac easier.</li>
+</ul>
+
+<p>Thanks to everyone who has been <a href="https://github.com/sponsors/davidlattimore">sponsoring me</a>, in
+particular the following people who have sponsored at least $30 since the last release:</p>
+
+<ul>
+  <li>CodeursenLiberte</li>
+  <li>pmarks</li>
+  <li>mati865</li>
+  <li>repi</li>
+  <li>Urgau</li>
+  <li>teburd</li>
+  <li>flba-eb</li>
+  <li>tommythorn</li>
+  <li>binarybana</li>
+  <li>bcmyers</li>
+  <li>Kobzol</li>
+  <li>HadrienG2</li>
+  <li>bes</li>
+  <li>twilco</li>
+  <li>mstange</li>
+  <li>marxin</li>
+  <li>joshtriplett</li>
+  <li>jonhoo</li>
+  <li>+1 anonymous</li>
+</ul>
+
+<h1 id="discussions">Discussions</h1>
+
+<ul>
+  <li><a href="https://www.reddit.com/r/rust/comments/1no80lz/wild_linker_update_060/">Reddit</a></li>
+</ul>
+
+    </article>
+  </main>
+
+  <div class="social-links">
+    <a rel="me" href="https://mas.to/@davidlattimore" target="_blank" rel="noopener noreferrer">
+        <img src="/images/social/mastodon.svg">
+    </a>
+    <a href="https://github.com/davidlattimore" target="_blank" rel="noopener noreferrer">
+        <img src="/images/social/github-mark-white.svg">
+    </a>
+    <a href="mailto:dvdlttmr@gmail.com" target="_blank">
+        <img src="/images/social/email.svg">
+    </a>
+    <a href="/feed.xml" target="_blank">
+        <img src="/images/social/rss.svg">
+    </a>
+</div>
+
+</body>
+
+</html>
