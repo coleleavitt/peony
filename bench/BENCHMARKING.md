@@ -70,14 +70,16 @@ the honest figure).
 
 | corpus       | inputs | peony/mold (start) | peony/mold (now) |
 |--------------|-------:|-------------------:|-----------------:|
-| hello-c      | 1      | ~2.6×              | **1.13×** (near parity) |
-| hello-cxx    | 1      | ~2.4×              | **1.36×**        |
-| rust-hello   | 23     | ~2.0×              | **1.45×**        |
-| ripgrep      | 419    | ~3.3×              | **2.17×**        |
+| hello-c      | 1      | ~2.6×              | **1.11×** (near parity) |
+| hello-cxx    | 1      | ~2.4×              | **1.23×**        |
+| rust-hello   | 23     | ~2.0×              | **1.39×**        |
+| ripgrep      | 419    | ~3.3×              | **2.04×**        |
 
-The headline: **ripgrep closed from 3.3× to 2.17×** behind mold, and the small
-links are now within ~1.1–1.4×. All four still pass the correctness gate (peony
-output runs and matches the lld reference).
+The headline: **ripgrep closed from 3.3× to 2.04× behind mold; the small links
+from ~2.4–2.6× to ~1.1–1.2×** (near parity — the case users hit most). All four
+still pass the correctness gate (peony output runs and matches the lld
+reference). Five measured wins shipped this epoch (build-id, zero-copy, parallel
+parse, is_linker_script peek, + the prof harness that found them).
 
 **What moved the needle (measured, not guessed)** — a per-phase scaling profiler
 (`--stats`/`--trace`, see `baselines/phase0-baseline/FINDINGS.md`) drove three
