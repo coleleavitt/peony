@@ -140,6 +140,13 @@ pub struct InputSymbol {
     /// reference to it gets an `R_X86_64_IRELATIVE` dynamic relocation so the
     /// loader runs the resolver and stores its result.
     pub is_ifunc: bool,
+    /// ELF symbol type (`STT_*`) — `STT_FUNC`/`STT_OBJECT`/`STT_NOTYPE`/…. Used
+    /// to tag exported `.dynsym` entries in a shared object so `dlsym` reports
+    /// the right kind.
+    pub st_type: u8,
+    /// ELF symbol visibility (`STV_*`). A `STV_HIDDEN`/`STV_INTERNAL` symbol is
+    /// never exported from a shared object's `.dynsym`.
+    pub visibility: u8,
     /// Section index for defined symbols; `None` for absolute/common/undefined.
     pub section: Option<SectionIndex>,
     /// Value (offset within section for defined symbols; alignment for common).
@@ -292,10 +299,12 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
         } else {
             Binding::Global
         };
-        let is_ifunc = elf_symtab
-            .symbol(idx)
-            .map(|s| s.st_type() == elf::STT_GNU_IFUNC)
-            .unwrap_or(false);
+        // Read the raw ELF type + visibility (the high-level API folds IFUNC into
+        // Text and exposes no visibility). Default to NOTYPE/DEFAULT if absent.
+        let raw = elf_symtab.symbol(idx).ok();
+        let st_type = raw.map(|s| s.st_type()).unwrap_or(elf::STT_NOTYPE);
+        let visibility = raw.map(|s| s.st_visibility()).unwrap_or(elf::STV_DEFAULT);
+        let is_ifunc = st_type == elf::STT_GNU_IFUNC;
         let isym = InputSymbol {
             index: idx,
             name,
@@ -303,6 +312,8 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
             is_undefined: sym.is_undefined(),
             is_common: sym.is_common(),
             is_ifunc,
+            st_type,
+            visibility,
             section: sym.section_index(),
             value: sym.address(),
             size: sym.size(),
@@ -838,6 +849,9 @@ pub mod elf {
     pub const STT_FILE: u8 = 4;
     pub const STT_TLS: u8 = 6;
     pub const STV_DEFAULT: u8 = 0;
+    pub const STV_INTERNAL: u8 = 1;
+    pub const STV_HIDDEN: u8 = 2;
+    pub const STV_PROTECTED: u8 = 3;
 
     /// `st_info = (bind << 4) | (type & 0xf)`.
     #[inline]

@@ -56,6 +56,15 @@ struct Args {
     build_id: bool,
     strip: bool,
     pie: bool,
+    /// Produce a shared object (`-shared`): ET_DYN with exported `.dynsym`, no
+    /// crt startup objects, no `PT_INTERP`, no mandatory entry point.
+    shared: bool,
+    /// `DT_SONAME` value (`-soname`/`-h`). Defaults to the output file name when
+    /// producing a shared object.
+    soname: Option<String>,
+    /// `--version-script` path. rustc emits one for a cdylib listing exactly the
+    /// symbols to export (`global:`) and hiding the rest (`local: *`).
+    version_script: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -74,6 +83,9 @@ impl Default for Args {
             build_id: false,
             strip: false,
             pie: false,
+            shared: false,
+            soname: None,
+            version_script: None,
         }
     }
 }
@@ -90,7 +102,6 @@ fn parse_args() -> Result<Args> {
         "-plugin-opt",
         "-rpath",
         "-rpath-link",
-        "-soname",
         "-T",
         "-y",
         "-Y",
@@ -98,7 +109,6 @@ fn parse_args() -> Result<Args> {
         "-a",
         "-A",
         "--hash-style",
-        "--version-script",
         "--sysroot",
         "-dynamic-linker",
         "--dynamic-linker",
@@ -133,6 +143,9 @@ fn parse_args() -> Result<Args> {
             "-s" | "-S" | "--strip-all" | "--strip-debug" => a.strip = true,
             "-pie" | "--pie" => a.pie = true,
             "-no-pie" | "--no-pie" => a.pie = false,
+            "-shared" | "--shared" | "-Bshareable" => a.shared = true,
+            "-soname" | "-h" | "--soname" => a.soname = Some(take(&argv, &mut i, arg)?),
+            "--version-script" => a.version_script = Some(PathBuf::from(take(&argv, &mut i, arg)?)),
             _ if IGNORE_WITH_VALUE.contains(&arg) => {
                 let _ = take(&argv, &mut i, arg); // consume and ignore the value
             }
@@ -141,6 +154,11 @@ fn parse_args() -> Result<Args> {
             _ if arg.starts_with("--threads=") => a.threads = arg[10..].parse().unwrap_or(0),
             _ if arg.starts_with("--base-address=") => a.base_address = arg[15..].to_string(),
             _ if arg.starts_with("--build-id") => a.build_id = true, // --build-id=<style>
+            _ if arg.starts_with("--version-script=") => {
+                a.version_script = Some(PathBuf::from(&arg["--version-script=".len()..]))
+            }
+            _ if arg.starts_with("-soname=") => a.soname = Some(arg[8..].to_string()),
+            _ if arg.starts_with("-h") && arg.len() > 2 => a.soname = Some(arg[2..].to_string()),
             _ if arg.starts_with("-o") => a.output = PathBuf::from(&arg[2..]),
             _ if arg.starts_with("-L") => a.library_paths.push(PathBuf::from(&arg[2..])),
             _ if arg.starts_with("-l") => a.libraries.push(arg[2..].to_string()),
@@ -162,11 +180,17 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr) // diagnostics on stderr, like a real linker
         .init();
 
-    let args = parse_args()?;
+    let mut args = parse_args()?;
+    // `-shared` wins over `-pie`: a shared object is ET_DYN but is not a PIE
+    // (no DF_1_PIE, no PT_INTERP, no entry). Some drivers pass both.
+    if args.shared {
+        args.pie = false;
+    }
     init_thread_pool(args.threads)?;
 
-    // A PIE is loaded at a kernel-chosen bias, so it is laid out from base 0.
-    let base_address = if args.pie {
+    // A PIE or shared object is loaded at a kernel/loader-chosen bias, so it is
+    // laid out from base 0 (ET_DYN). Only a fixed-address ET_EXEC uses a base.
+    let base_address = if args.pie || args.shared {
         0
     } else {
         parse_hex_or_dec(&args.base_address)
@@ -179,8 +203,12 @@ fn main() -> Result<()> {
     let inputs = expand_inputs(inputs, &library_search_paths(&args.library_paths))?;
     // When invoked directly as the linker (e.g. by rustc), the C-runtime startup
     // objects that provide `_start`/`_init` are not passed; inject them as `cc`
-    // would for a dynamic/PIE executable.
-    let inputs = inject_crt_objects(inputs, &args);
+    // would for a dynamic/PIE executable. A shared object has no `_start`/crt1.
+    let inputs = if args.shared {
+        inputs
+    } else {
+        inject_crt_objects(inputs, &args)
+    };
 
     // Incremental fast-path: if every input and the previous output are
     // byte-identical to the last link, the existing output is already correct.
@@ -221,6 +249,7 @@ fn main() -> Result<()> {
         &symbols,
         &args.entry,
         &comdat_excluded,
+        args.shared, // shared-object exports are GC roots
     );
     if let Some(l) = &live {
         tracing::info!(live_sections = l.len(), "section selection complete");
@@ -245,7 +274,10 @@ fn main() -> Result<()> {
     // A PIE needs R_X86_64_RELATIVE dynamic relocations for absolute pointers,
     // even with no imports. Emit dynamic sections whenever there are imports OR
     // the output is a PIE (rustc/cc default).
-    let (n_relative, n_irelative) = if args.pie {
+    // Both PIE and shared objects are ET_DYN and need R_X86_64_RELATIVE dynamic
+    // relocations for absolute pointers the loader must bias.
+    let et_dyn = args.pie || args.shared;
+    let (n_relative, n_irelative) = if et_dyn {
         let total = peony_reloc::count_relative(&objects, &symbols)
             + peony_reloc::count_got_relative(&got_syms, &symbols);
         let irel = peony_reloc::count_irelative(&objects, &symbols, &got_syms);
@@ -253,7 +285,50 @@ fn main() -> Result<()> {
     } else {
         (0, 0)
     };
-    let dynamic = (!imports.is_empty() || args.pie).then(|| peony_layout::DynamicInfo {
+    // A shared object exports its defined, non-hidden global/weak symbols so
+    // `dlsym` can find them. When rustc supplies a `--version-script`, it lists
+    // exactly the symbols to export (`global:`) and localizes the rest
+    // (`local: *`), so we honour it as an allowlist — otherwise std's thousands
+    // of internal globals would all leak into `.dynsym`.
+    let version_script = match &args.version_script {
+        Some(p) => Some(parse_version_script(p)?),
+        None => None,
+    };
+    let exports: Vec<peony_layout::ExportSym> = if args.shared {
+        let mut e: Vec<peony_layout::ExportSym> = symbols
+            .iter()
+            .filter(|(_, r)| r.is_export())
+            .filter(|(name, _)| version_script.as_ref().is_none_or(|vs| vs.exports(name)))
+            .map(|(name, r)| {
+                let bind = match r.binding {
+                    peony_object::Binding::Weak => peony_object::elf::STB_WEAK,
+                    _ => peony_object::elf::STB_GLOBAL,
+                };
+                peony_layout::ExportSym {
+                    name: name.to_vec(),
+                    info: peony_object::elf::st_info(bind, r.st_type),
+                    other: r.visibility,
+                }
+            })
+            .collect();
+        e.sort_by(|a, b| a.name.cmp(&b.name));
+        e
+    } else {
+        Vec::new()
+    };
+    // A shared object's SONAME: explicit -soname, else the output file name.
+    let soname = if args.shared {
+        Some(args.soname.clone().unwrap_or_else(|| {
+            args.output
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "a.out".to_string())
+        }))
+    } else {
+        None
+    };
+    // Dynamic sections are needed for any import, any PIE, or a shared object.
+    let dynamic = (!imports.is_empty() || et_dyn).then(|| peony_layout::DynamicInfo {
         imports,
         import_versions,
         import_sonames,
@@ -261,9 +336,17 @@ fn main() -> Result<()> {
         pie: args.pie,
         n_relative,
         n_irelative,
+        shared: args.shared,
+        soname,
+        exports,
     });
     if dynamic.is_some() {
-        tracing::info!(needed = needed.len(), n_relative, "dynamic executable");
+        tracing::info!(
+            needed = needed.len(),
+            n_relative,
+            shared = args.shared,
+            "dynamic object"
+        );
     }
 
     // Predefine linker-provided symbols and `--defsym`s BEFORE layout so they are
@@ -277,6 +360,7 @@ fn main() -> Result<()> {
         build_id: args.build_id,
         strip: args.strip,
         pie: args.pie,
+        shared: args.shared,
         ..Default::default()
     };
     tracing::info!("computing layout");
@@ -300,16 +384,21 @@ fn main() -> Result<()> {
 
     set_linker_addresses(&mut symbols, &layout, &provided);
     finalize_symbols(&mut symbols, &layout);
-    check_undefined(&symbols).context("unresolved symbols")?;
+    // A shared object may legitimately reference symbols it does not define;
+    // they are resolved at load time against the process image. Only enforce
+    // full resolution for executables.
+    if !args.shared {
+        check_undefined(&symbols).context("unresolved symbols")?;
+    }
 
     // Assemble `.rela.dyn` now that symbol VAs are final: the R_X86_64_RELATIVE
-    // entries (PIE only) come first, then the GLOB_DATs. For a non-PIE dynamic
+    // entries (ET_DYN only) come first, then the GLOB_DATs. For a non-PIE dynamic
     // executable there are no relatives, so this just materialises the GLOB_DATs.
     if dynamic.is_some() {
         // Partition data relocations into RELATIVE (normal) and IRELATIVE (IFUNC,
-        // resolver run at startup). Only meaningful for PIE; a non-PIE dynamic
-        // exe has no base-relative data relocs.
-        let (relative, irelative) = if args.pie {
+        // resolver run at startup). Meaningful for any ET_DYN (PIE or shared); a
+        // non-PIE dynamic exe has no base-relative data relocs.
+        let (relative, irelative) = if et_dyn {
             peony_reloc::collect_dynamic_data_relocs(&objects, &symbols, &layout)
         } else {
             (Vec::new(), Vec::new())
@@ -581,12 +670,13 @@ fn compute_live(
     symbols: &SymbolTable,
     entry: &str,
     comdat_excluded: &FxHashSet<(usize, usize)>,
+    export_roots: bool,
 ) -> Option<FxHashSet<(usize, usize)>> {
     if !gc && comdat_excluded.is_empty() {
         return None;
     }
     let mut live = if gc {
-        peony_layout::gc_sections(objects, symbols, entry)
+        peony_layout::gc_sections_rooted(objects, symbols, entry, export_roots)
     } else {
         all_sections(objects)
     };
@@ -594,6 +684,68 @@ fn compute_live(
         live.remove(key);
     }
     Some(live)
+}
+
+/// The export allowlist parsed from a `--version-script`.
+///
+/// peony supports the subset rustc emits for a cdylib: a single anonymous
+/// version node with a `global:` list of exact symbol names and a `local: *;`
+/// catch-all. `exact` holds the named globals; `global_wildcard` is true if
+/// `global: *` appears (export everything not explicitly localized).
+#[derive(Debug, Default)]
+struct VersionScript {
+    exact: std::collections::HashSet<Vec<u8>>,
+    global_wildcard: bool,
+}
+
+impl VersionScript {
+    /// Whether a symbol named `name` should be exported under this script.
+    fn exports(&self, name: &[u8]) -> bool {
+        self.global_wildcard || self.exact.contains(name)
+    }
+}
+
+/// Parse the subset of GNU version-script syntax rustc emits: `global:`/`local:`
+/// sections with `;`-terminated bare symbol names and `*` wildcards. Comments
+/// (`#`/`//`) and version-node names are ignored; we treat the file as one flat
+/// global/local partition (sufficient for cdylib export control).
+fn parse_version_script(path: &Path) -> Result<VersionScript> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading version script `{}`", path.display()))?;
+    let mut vs = VersionScript::default();
+    let mut in_global = false;
+    for raw in text.lines() {
+        // Strip comments and braces/version-node tokens.
+        let line = raw.split('#').next().unwrap_or("");
+        let line = line.split("//").next().unwrap_or("");
+        for tok in line.split([' ', '\t', '{', '}', '(', ')']) {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            match tok {
+                "global:" => in_global = true,
+                "local:" => in_global = false,
+                _ => {
+                    // A name list entry, possibly several `name;` on one line.
+                    for name in tok.split(';') {
+                        let name = name.trim();
+                        if name.is_empty() || name == ";" {
+                            continue;
+                        }
+                        if in_global {
+                            if name == "*" {
+                                vs.global_wildcard = true;
+                            } else {
+                                vs.exact.insert(name.as_bytes().to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(vs)
 }
 
 fn all_sections(objects: &[InputObject]) -> FxHashSet<(usize, usize)> {

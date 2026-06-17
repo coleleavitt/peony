@@ -128,6 +128,28 @@ pub struct DynamicInfo {
     /// `DT_RELACOUNT`, which counts only the leading plain-RELATIVE entries:
     /// when `n_relative == n_irelative` (IFUNC-only), no DT_RELACOUNT is emitted.
     pub n_irelative: usize,
+    /// Producing a shared object (`-shared`): emit exported defined globals into
+    /// `.dynsym` (with a real SysV `.hash`), set `DT_SONAME`, and omit
+    /// `PT_INTERP`/`.interp` (a `.so` has no program interpreter).
+    pub shared: bool,
+    /// `DT_SONAME` for a shared object (the library's logical name).
+    pub soname: Option<String>,
+    /// Exported symbols for a shared object's `.dynsym`, in export order:
+    /// `(name, st_info, st_other, output_section_index_or_special, value, size)`.
+    /// Filled by the driver after layout addresses are final is not possible
+    /// (sizes drive layout), so names+metadata are provided here and the final
+    /// `st_value`/`st_shndx` are resolved at emit time by name.
+    pub exports: Vec<ExportSym>,
+}
+
+/// One exported symbol of a shared object, destined for `.dynsym`.
+#[derive(Debug, Clone)]
+pub struct ExportSym {
+    pub name: Vec<u8>,
+    /// `st_info` = (binding << 4) | type.
+    pub info: u8,
+    /// `st_other` = visibility.
+    pub other: u8,
 }
 
 /// Pre-built byte blobs for the dynamic-linking sections (filled by layout,
@@ -443,6 +465,8 @@ pub struct LayoutConfig {
     /// Produce a position-independent executable (`ET_DYN`, base 0); the kernel
     /// applies a load bias, so only PC-relative code/data is valid.
     pub pie: bool,
+    /// Produce a shared object (`ET_DYN`, no `PT_INTERP`, no entry requirement).
+    pub shared: bool,
 }
 
 impl Default for LayoutConfig {
@@ -454,6 +478,7 @@ impl Default for LayoutConfig {
             build_id: false,
             strip: false,
             pie: false,
+            shared: false,
         }
     }
 }
@@ -486,8 +511,9 @@ struct Builder {
     contributions: Vec<SectionContribution>,
 }
 
-/// The classic ELF (SysV) hash used for `vna_hash`/`vd_hash` in version records.
-fn elf_gnu_hash_ver(name: &[u8]) -> u32 {
+/// The classic ELF (SysV) hash, used both for `.hash` buckets and for
+/// `vna_hash`/`vd_hash` in version records.
+fn elf_sysv_hash(name: &[u8]) -> u32 {
     let mut h: u32 = 0;
     for &b in name {
         h = (h << 4).wrapping_add(b as u32);
@@ -521,6 +547,11 @@ pub fn compute_layout(
     let mut dyn_blobs = DynBlobs::default();
     let mut import_dynsym: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
     let mut needed_off: Vec<u32> = Vec::new();
+    // For a shared object: (export name, byte offset of its `.dynsym` entry) so
+    // its `st_value`/`st_shndx` can be patched once addresses are final.
+    let mut export_patch: Vec<(Vec<u8>, usize)> = Vec::new();
+    // `DT_SONAME` string offset in `.dynstr` (shared only).
+    let mut soname_dt_off: Option<u32> = None;
     if let Some(dynj) = dynamic {
         let mut dynstr = vec![0u8];
         let mut import_name_off = Vec::with_capacity(dynj.imports.len());
@@ -537,6 +568,9 @@ pub fn compute_layout(
             dynstr.extend_from_slice(so.as_bytes());
             dynstr.push(0);
         }
+        // `.dynsym` layout: [null][imports (UND)…][exports (defined)…]. Locals
+        // come before globals; imports are UND globals, exports are defined
+        // globals — both are non-local, so `sh_info` = 1 (first global = index 1).
         let mut dynsym = vec![0u8; 24]; // null symbol
         for &off in &import_name_off {
             let mut e = [0u8; 24];
@@ -544,6 +578,29 @@ pub fn compute_layout(
             e[4] = elf::st_info(elf::STB_GLOBAL, elf::STT_NOTYPE); // st_info
             // st_other = 0, st_shndx = SHN_UNDEF (0), st_value/st_size = 0
             dynsym.extend_from_slice(&e);
+        }
+        // Exported defined symbols (shared object). `st_value`/`st_shndx` are
+        // patched after addresses are final; record each entry's byte offset.
+        // The dynstr name offsets are captured for the SysV `.hash` build below.
+        let mut export_name_off: Vec<u32> = Vec::with_capacity(dynj.exports.len());
+        for ex in &dynj.exports {
+            let name_off = dynstr.len() as u32;
+            dynstr.extend_from_slice(&ex.name);
+            dynstr.push(0);
+            export_name_off.push(name_off);
+            let mut e = [0u8; 24];
+            e[0..4].copy_from_slice(&name_off.to_le_bytes()); // st_name
+            e[4] = ex.info; // st_info (bind<<4 | type)
+            e[5] = ex.other; // st_other (visibility)
+            // st_shndx/st_value/st_size patched post-layout.
+            export_patch.push((ex.name.clone(), dynsym.len()));
+            dynsym.extend_from_slice(&e);
+        }
+        // DT_SONAME string (shared object).
+        if let Some(name) = &dynj.soname {
+            soname_dt_off = Some(dynstr.len() as u32);
+            dynstr.extend_from_slice(name.as_bytes());
+            dynstr.push(0);
         }
 
         // ── Symbol versioning: .gnu.version + .gnu.version_r ──────────────────
@@ -594,6 +651,10 @@ pub fn compute_layout(
             };
             versym.extend_from_slice(&idx.to_le_bytes());
         }
+        // Exports are unversioned (index 1 = global/base) in our output.
+        for _ in &dynj.exports {
+            versym.extend_from_slice(&1u16.to_le_bytes());
+        }
 
         // verneed: one Verneed per library that has versioned requirements, each
         // with one Vernaux per distinct version.
@@ -621,7 +682,7 @@ pub fn compute_layout(
             // Elf64_Vernaux: vna_hash(4) vna_flags(2) vna_other(2) vna_name(4) vna_next(4) = 16
             for (i, (vname, vidx, name_off)) in versions.iter().enumerate() {
                 let next = if i + 1 < versions.len() { 16u32 } else { 0u32 };
-                verneed.extend_from_slice(&elf_gnu_hash_ver(vname).to_le_bytes());
+                verneed.extend_from_slice(&elf_sysv_hash(vname).to_le_bytes());
                 verneed.extend_from_slice(&0u16.to_le_bytes()); // vna_flags
                 verneed.extend_from_slice(&vidx.to_le_bytes()); // vna_other
                 verneed.extend_from_slice(&name_off.to_le_bytes()); // vna_name
@@ -630,14 +691,30 @@ pub fn compute_layout(
             verneed_num += 1;
         }
 
-        // SysV hash with no exported symbols (we only import).
-        let nchain = (dynj.imports.len() + 1) as u32;
-        let mut hash = Vec::new();
-        hash.extend_from_slice(&1u32.to_le_bytes()); // nbucket
-        hash.extend_from_slice(&nchain.to_le_bytes()); // nchain
-        hash.extend_from_slice(&0u32.to_le_bytes()); // bucket[0] = STN_UNDEF
-        for _ in 0..nchain {
-            hash.extend_from_slice(&0u32.to_le_bytes()); // chain[]
+        // SysV `.hash` (DT_HASH). The chain is parallel-indexed with `.dynsym`
+        // (nchain == total dynsym entries, incl. the null symbol). Exported
+        // defined symbols are inserted so `dlsym` can find them; imports (UND)
+        // are not looked up *in this object*, so they stay out of the buckets.
+        // `.dynsym` index of export i = 1 + imports + i.
+        let total_dynsym = 1 + dynj.imports.len() + dynj.exports.len();
+        let nbucket = (dynj.exports.len().max(1)) as u32; // ≥1 (avoid div-by-zero)
+        let mut buckets = vec![0u32; nbucket as usize];
+        let mut chain = vec![0u32; total_dynsym];
+        let import_base = 1 + dynj.imports.len();
+        for (i, ex) in dynj.exports.iter().enumerate() {
+            let sym_idx = (import_base + i) as u32;
+            let h = elf_sysv_hash(&ex.name) % nbucket;
+            chain[sym_idx as usize] = buckets[h as usize];
+            buckets[h as usize] = sym_idx;
+        }
+        let mut hash = Vec::with_capacity((2 + nbucket as usize + total_dynsym) * 4);
+        hash.extend_from_slice(&nbucket.to_le_bytes());
+        hash.extend_from_slice(&(total_dynsym as u32).to_le_bytes()); // nchain
+        for b in &buckets {
+            hash.extend_from_slice(&b.to_le_bytes());
+        }
+        for c in &chain {
+            hash.extend_from_slice(&c.to_le_bytes());
         }
 
         // GNU hash table. The executable's `.dynsym` contains only undefined
@@ -646,20 +723,31 @@ pub fn compute_layout(
         //   thus excluded from the hash), bloom_size=1 (one all-zero word),
         //   bloom_shift=0. bucket[0]=0 (no chain). This is the minimal valid
         //   GNU hash glibc accepts; ld.so prefers DT_GNU_HASH when present.
+        // The stub `.gnu.hash` (below) hashes NOTHING. It is correct only when
+        // there are no exports — for an executable importing symbols. A shared
+        // object HAS exports, and glibc prefers DT_GNU_HASH when present, so a
+        // stub would make `dlsym` silently fail. We therefore only build (and
+        // later tag) `.gnu.hash` when there are no exports; `.hash` (DT_HASH)
+        // covers the export case fully (glibc falls back to it).
         let nsyms = (dynj.imports.len() + 1) as u32; // incl. null symbol
         let mut gnu_hash = Vec::new();
-        gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // nbuckets
-        gnu_hash.extend_from_slice(&nsyms.to_le_bytes()); // symoffset (all excluded)
-        gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // bloom_size (words)
-        gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bloom_shift
-        gnu_hash.extend_from_slice(&0u64.to_le_bytes()); // bloom[0] = 0 (matches nothing)
-        gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bucket[0] = 0 (empty)
+        if dynj.exports.is_empty() {
+            gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // nbuckets
+            gnu_hash.extend_from_slice(&nsyms.to_le_bytes()); // symoffset (all excluded)
+            gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // bloom_size (words)
+            gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bloom_shift
+            gnu_hash.extend_from_slice(&0u64.to_le_bytes()); // bloom[0] = 0 (matches nothing)
+            gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bucket[0] = 0 (empty)
+        }
 
         dyn_blobs.dynstr = dynstr;
         dyn_blobs.dynsym = dynsym;
         dyn_blobs.hash = hash;
         dyn_blobs.gnu_hash = gnu_hash;
-        dyn_blobs.interp = elf::DEFAULT_INTERP.to_vec();
+        // A shared object has no program interpreter, so no `.interp`/PT_INTERP.
+        if !config.shared {
+            dyn_blobs.interp = elf::DEFAULT_INTERP.to_vec();
+        }
         // Only attach versym/verneed when there is something to version.
         if verneed_num > 0 {
             dyn_blobs.gnu_version = versym;
@@ -955,8 +1043,9 @@ pub fn compute_layout(
             .filter(|b| b.name == ".init_array" || b.name == ".fini_array")
             .count();
         let has_rela = n_glob_dat + dynj.n_relative > 0;
-        // FLAGS entries: PIE → DT_FLAGS + DT_FLAGS_1 (2); else PLT-only → DT_FLAGS (1).
-        let n_flags = if dynj.pie {
+        // FLAGS entries: PIE or shared → DT_FLAGS + DT_FLAGS_1 (2; both eager-bind
+        // ET_DYN, though shared omits DF_1_PIE); else PLT-only → DT_FLAGS (1).
+        let n_flags = if dynj.pie || dynj.shared {
             2
         } else if n_plt > 0 {
             1
@@ -964,12 +1053,15 @@ pub fn compute_layout(
             0
         };
         let has_ver = dyn_blobs.verneed_num > 0;
+        let has_gnu_hash = !dyn_blobs.gnu_hash.is_empty();
+        let has_soname = soname_dt_off.is_some();
         // DT_INIT / DT_FINI when the corresponding (executable) sections exist.
         let n_init = rx.iter().filter(|b| b.name == ".init").count();
         let n_fini = rx.iter().filter(|b| b.name == ".fini").count();
         dyn_entries = dynj.needed.len()
             + 5                                  // HASH,STRTAB,SYMTAB,STRSZ,SYMENT
-            + 1                                  // DT_GNU_HASH
+            + usize::from(has_gnu_hash)          // DT_GNU_HASH (omitted when it would hash nothing)
+            + usize::from(has_soname)            // DT_SONAME (shared object)
             + if has_rela { 3 } else { 0 }       // DT_RELA, DT_RELASZ, DT_RELAENT
             + if dynj.n_relative > dynj.n_irelative { 1 } else { 0 } // DT_RELACOUNT (plain RELATIVE only)
             + if n_plt > 0 { 4 } else { 0 }      // PLTGOT,PLTRELSZ,PLTREL,JMPREL
@@ -1008,9 +1100,16 @@ pub fn compute_layout(
     // `.dynamic` section, which is itself a RELRO member, so the span is always
     // non-empty — but the push falls back to `.dynamic` defensively regardless.
     let has_relro = dynamic.is_some();
+    // A dynamic object has PT_DYNAMIC; an executable also has PT_INTERP, but a
+    // shared object has no program interpreter (no `.interp`/PT_INTERP).
+    let n_dyn_segs = match dynamic {
+        Some(_) if config.shared => 1, // PT_DYNAMIC only
+        Some(_) => 2,                  // PT_INTERP + PT_DYNAMIC
+        None => 0,
+    };
     let phnum = (1
         + usize::from(config.build_id)
-        + if dynamic.is_some() { 2 } else { 0 }
+        + n_dyn_segs
         + usize::from(has_tls)
         + usize::from(has_eh_frame_hdr)
         + usize::from(has_relro)
@@ -1285,7 +1384,13 @@ pub fn compute_layout(
     );
 
     // ── Entry point ──────────────────────────────────────────────────────────
-    let entry = resolve_entry(symbols, &addresses, &config.entry_symbol)?;
+    // A shared object has no mandatory entry symbol (e_entry = 0); only an
+    // executable requires `_start`.
+    let entry = if config.shared {
+        resolve_entry(symbols, &addresses, &config.entry_symbol).unwrap_or(0)
+    } else {
+        resolve_entry(symbols, &addresses, &config.entry_symbol)?
+    };
 
     // ── Dynamic blobs (.rela.dyn, .dynamic) — now that section VAs are known ──
     let mut plt_base = 0u64;
@@ -1372,8 +1477,16 @@ pub fn compute_layout(
         for &off in &needed_off {
             push_dyn(elf::DT_NEEDED, off as u64);
         }
+        // DT_SONAME for a shared object (its logical library name).
+        if let Some(off) = soname_dt_off {
+            push_dyn(elf::DT_SONAME, off as u64);
+        }
         push_dyn(elf::DT_HASH, va_of(SecSource::Hash));
-        push_dyn(elf::DT_GNU_HASH, va_of(SecSource::GnuHash));
+        // DT_GNU_HASH only when `.gnu.hash` actually indexes symbols (see the
+        // export gating above) — otherwise glibc would prefer it and find nothing.
+        if !dyn_blobs.gnu_hash.is_empty() {
+            push_dyn(elf::DT_GNU_HASH, va_of(SecSource::GnuHash));
+        }
         push_dyn(elf::DT_STRTAB, va_of(SecSource::DynStr));
         push_dyn(elf::DT_SYMTAB, va_of(SecSource::DynSym));
         push_dyn(elf::DT_STRSZ, dyn_blobs.dynstr.len() as u64);
@@ -1407,10 +1520,14 @@ pub fn compute_layout(
             push_dyn(elf::DT_VERNEED, va_of(SecSource::GnuVersionR));
             push_dyn(elf::DT_VERNEEDNUM, dyn_blobs.verneed_num);
         }
-        // PIE / eager-binding flags.
+        // Eager-binding / ET_DYN flags. A PIE adds DF_1_PIE; a shared object is
+        // ET_DYN but NOT a PIE, so it sets DF_1_NOW without DF_1_PIE.
         if dynj.pie {
             push_dyn(elf::DT_FLAGS, elf::DF_BIND_NOW);
             push_dyn(elf::DT_FLAGS_1, elf::DF_1_NOW | elf::DF_1_PIE);
+        } else if dynj.shared {
+            push_dyn(elf::DT_FLAGS, elf::DF_BIND_NOW);
+            push_dyn(elf::DT_FLAGS_1, elf::DF_1_NOW);
         } else if !plt_syms.is_empty() {
             push_dyn(elf::DT_FLAGS, elf::DF_BIND_NOW); // eager binding (no lazy resolver)
         }
@@ -1434,6 +1551,32 @@ pub fn compute_layout(
         }
         push_dyn(elf::DT_NULL, 0);
         dyn_blobs.dynamic = dyn_bytes;
+
+        // Patch exported `.dynsym` entries with their final `st_value`/`st_shndx`/
+        // `st_size` now that addresses and the output-section map are known. A
+        // dlsym lookup returns `load_base + st_value`, so these must be correct.
+        for (name, off) in &export_patch {
+            let Some(res) = symbols.lookup(name) else {
+                continue;
+            };
+            let (shndx, value) = match res.section_index {
+                None => (elf::SHN_ABS, res.value),
+                Some(si) => {
+                    let key = (res.defined_in.map(|o| o.0 as usize).unwrap_or(0), si);
+                    match sec_to_out.get(&key) {
+                        Some(&idx) => {
+                            let va = addresses.get(&key).copied().unwrap_or(0) + res.value;
+                            ((idx + 1) as u16, va)
+                        }
+                        None => (elf::SHN_ABS, res.value),
+                    }
+                }
+            };
+            let e = &mut dyn_blobs.dynsym[*off..*off + 24];
+            e[6..8].copy_from_slice(&shndx.to_le_bytes());
+            e[8..16].copy_from_slice(&value.to_le_bytes());
+            e[16..24].copy_from_slice(&res.size.to_le_bytes());
+        }
     }
 
     // ── Program headers ──────────────────────────────────────────────────────
@@ -1710,7 +1853,7 @@ pub fn compute_layout(
         addresses,
         segments,
         entry,
-        e_type: if config.pie {
+        e_type: if config.pie || config.shared {
             elf::ET_DYN
         } else {
             elf::ET_EXEC
@@ -1760,6 +1903,19 @@ pub fn gc_sections(
     symbols: &SymbolTable,
     entry_symbol: &str,
 ) -> FxHashSet<(usize, usize)> {
+    gc_sections_rooted(objects, symbols, entry_symbol, false)
+}
+
+/// As [`gc_sections`], but when `export_roots` is set every defined, non-hidden
+/// global/weak symbol is also a GC root. Required for a shared object: its
+/// exported symbols (and everything they reach) must be retained even though no
+/// `_start` references them.
+pub fn gc_sections_rooted(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    entry_symbol: &str,
+    export_roots: bool,
+) -> FxHashSet<(usize, usize)> {
     let resolve_target =
         |obj_id: usize, sym: &peony_object::InputSymbol| -> Option<(usize, usize)> {
             if sym.binding == peony_object::Binding::Local {
@@ -1780,6 +1936,21 @@ pub fn gc_sections(
             let key = (def.0 as usize, si);
             if live.insert(key) {
                 frontier.push(key);
+            }
+        }
+    }
+    // Shared-object exports are roots: the section defining each exported symbol
+    // must survive GC so `dlsym` can resolve it to real code/data.
+    if export_roots {
+        for (_, res) in symbols.iter() {
+            if !res.is_export() {
+                continue;
+            }
+            if let (Some(def), Some(si)) = (res.defined_in, res.section_index) {
+                let key = (def.0 as usize, si);
+                if live.insert(key) {
+                    frontier.push(key);
+                }
             }
         }
     }

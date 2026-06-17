@@ -144,6 +144,23 @@ pub struct SymbolResolution {
     /// `STT_GNU_IFUNC`: the definition is an indirect function. A GOT slot for it
     /// gets an `R_X86_64_IRELATIVE` so the loader runs the resolver at startup.
     pub is_ifunc: bool,
+    /// ELF symbol type (`STT_*`) of the definition, for `.dynsym` export tagging.
+    pub st_type: u8,
+    /// ELF visibility (`STV_*`) of the definition. Hidden/internal symbols are
+    /// not exported from a shared object.
+    pub visibility: u8,
+}
+
+impl SymbolResolution {
+    /// True if this symbol should be placed in a shared object's `.dynsym` as an
+    /// export: it is locally defined (not an import, not still-undefined, not a
+    /// pending common) and has default/protected visibility.
+    pub fn is_export(&self) -> bool {
+        self.defined_in.is_some()
+            && !self.import
+            && self.common.is_none()
+            && (self.visibility == 0 /* STV_DEFAULT */ || self.visibility == 3/* STV_PROTECTED */)
+    }
 }
 
 impl SymbolResolution {
@@ -249,6 +266,8 @@ impl SymbolTable {
                 e.value = sym.value;
                 e.size = sym.size;
                 e.common = None;
+                e.st_type = sym.st_type;
+                e.visibility = sym.visibility;
                 return Ok(());
             }
         }
@@ -277,6 +296,8 @@ impl SymbolTable {
                     e.value = sym.value;
                     e.size = sym.size;
                     e.is_ifunc = sym.is_ifunc;
+                    e.st_type = sym.st_type;
+                    e.visibility = sym.visibility;
                 }
                 ConflictAction::KeepExisting => {}
                 ConflictAction::WarnLocal => {
@@ -308,6 +329,8 @@ impl SymbolTable {
                     version: None,
                     soname: None,
                     is_ifunc: sym.is_ifunc,
+                    st_type: sym.st_type,
+                    visibility: sym.visibility,
                 },
             );
         }
@@ -367,6 +390,8 @@ impl SymbolTable {
                         version: None,
                         soname: None,
                         is_ifunc: false,
+                        st_type: 0,
+                        visibility: 0,
                     },
                 );
             }
@@ -392,6 +417,8 @@ impl SymbolTable {
             version: None,
             soname: None,
             is_ifunc: false,
+            st_type: 0,
+            visibility: 0,
         }
     }
 
