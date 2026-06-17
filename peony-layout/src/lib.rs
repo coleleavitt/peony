@@ -885,6 +885,14 @@ pub fn compute_layout(
     }
 
     // RW segment: progbits (file-backed) then nobits (.bss).
+    // TLS contiguity: the static TLS template requires `.tdata` immediately
+    // followed by `.tbss`. Make `.tdata` the LAST file-backed RW section and
+    // `.tbss` the FIRST nobits section so they abut across the progbits→nobits
+    // boundary, placing `.tbss`'s address inside the PT_TLS range. This runs
+    // after all synthetic RW sections (`.got`, `.dynamic`, …) have been added.
+    rw_pb.sort_by_key(|b| b.kind == SectionKind::Tdata); // false<true ⇒ .tdata last
+    rw_bss.sort_by_key(|b| b.kind != SectionKind::Tbss); // false<true ⇒ .tbss first
+
     let mut rw_seg: Option<(u64, u64, u64)> = None; // (start, file_end, mem_end)
     if has_rw {
         va = align_up(va, page);
