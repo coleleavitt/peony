@@ -202,12 +202,12 @@ _start:
     let out = dir.join("tlb.out");
 
     // First link: creates the file.
-    link(&out, &[obj.clone()], &[]);
+    link(&out, std::slice::from_ref(&obj), &[]);
     let bytes1 = fs::read(&out).unwrap();
     let size1 = fs::metadata(&out).unwrap().len();
 
     // Second link: should detect same-size file and overwrite in-place.
-    link(&out, &[obj.clone()], &[]);
+    link(&out, std::slice::from_ref(&obj), &[]);
     let bytes2 = fs::read(&out).unwrap();
 
     assert_eq!(bytes1, bytes2, "overwrite-in-place changed the binary");
@@ -452,12 +452,12 @@ _start:
     let out = dir.join("incr.out");
 
     // First link: no cache.
-    link(&out, &[obj.clone()], &["--incremental"]);
+    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
     let bytes1 = fs::read(&out).unwrap();
     assert_eq!(run(&out), 55);
 
     // Second link: cache hit → output unchanged.
-    link(&out, &[obj.clone()], &["--incremental"]);
+    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
     let bytes2 = fs::read(&out).unwrap();
     assert_eq!(bytes1, bytes2, "cached link must produce identical binary");
     assert_eq!(

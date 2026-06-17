@@ -1,0 +1,21 @@
+[package]
+name = "peony-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Micro-benchmarks of peony's internal hot paths. End-to-end wall-clock (the
+# bench/ shell harness) is the source of truth; these localize WHERE a
+# regression came from. CodSpeed-compatible: `cargo codspeed build/run` in CI.
+
+[dependencies]
+peony-symbols = { path = "../peony-symbols" }
+
+[dev-dependencies]
+# codspeed-criterion-compat is a drop-in for criterion that also works under the
+# CodSpeed CI runner. Locally it behaves exactly like criterion.
+criterion = { package = "codspeed-criterion-compat", version = "4", default-features = false }
+
+[[bench]]
+name = "hot_paths"
+harness = false

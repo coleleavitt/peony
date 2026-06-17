@@ -838,8 +838,8 @@ pub fn compute_layout(
                 continue;
             };
             let key = (lib, v.clone());
-            if !version_idx.contains_key(&key) {
-                version_idx.insert(key, next_vidx);
+            if let std::collections::hash_map::Entry::Vacant(slot) = version_idx.entry(key) {
+                slot.insert(next_vidx);
                 let off = dynstr.len() as u32;
                 dynstr.extend_from_slice(v);
                 dynstr.push(0);
@@ -2673,7 +2673,7 @@ pub fn gc_sections_rooted(
         // Move each Worker (owner) into its thread; thieves use cloned Stealers.
         std::thread::scope(|scope| {
             for (t, worker) in workers.into_iter().enumerate() {
-                let all_stealers: Vec<_> = stealers.iter().map(|s| s.clone()).collect();
+                let all_stealers: Vec<_> = stealers.to_vec();
                 let results = Arc::clone(&results);
                 let idle_count = Arc::clone(&idle_count);
 
@@ -3390,7 +3390,7 @@ fn script_pattern_matches(pattern: &str, name: &str) -> bool {
 }
 
 fn copy_reloc_align(size: u64) -> u64 {
-    size.next_power_of_two().min(16).max(1)
+    size.next_power_of_two().clamp(1, 16)
 }
 
 #[inline]

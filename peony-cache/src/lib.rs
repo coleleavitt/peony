@@ -22,6 +22,7 @@
 //! Persistent flat-array linked list:
 //! - `reloc_heads[symbol_id]` → first relocation referencing this symbol
 //! - `reloc_next[reloc_id]` → next relocation in the per-symbol list
+//!
 //! Built lock-free with atomic compare-exchange from parallel threads.
 
 use std::collections::HashMap;
@@ -230,7 +231,7 @@ pub fn compute_epoch_key(inputs: &[PathBuf], args_hash: u64) -> u64 {
             .and_then(|m| m.modified())
             .and_then(|t| {
                 t.duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    .map_err(std::io::Error::other)
             })
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
