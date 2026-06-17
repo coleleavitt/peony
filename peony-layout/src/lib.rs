@@ -934,13 +934,17 @@ pub fn compute_layout(
         .any(|b| matches!(b.kind, SectionKind::Tdata | SectionKind::Tbss));
     let num_load = 1 + usize::from(has_rx) + usize::from(has_rw); // RO(headers) + RX? + RW?
     // PT_PHDR + PT_NOTE? + (PT_INTERP + PT_DYNAMIC)? + PT_TLS? + PT_GNU_EH_FRAME?
-    //   + loads + PT_GNU_STACK
+    //   + loads + PT_GNU_RELRO? + PT_GNU_STACK
     let has_eh_frame_hdr = n_fdes > 0;
+    // RELRO applies to dynamic links that have any of the relro sections. The
+    // exact span is computed later; here we just need to know if one will exist.
+    let has_relro = dynamic.is_some();
     let phnum = (1
         + usize::from(config.build_id)
         + if dynamic.is_some() { 2 } else { 0 }
         + usize::from(has_tls)
         + usize::from(has_eh_frame_hdr)
+        + usize::from(has_relro)
         + num_load
         + 1) as u64;
     let header_size = elf::EHDR_SIZE + phnum * elf::PHDR_SIZE;
@@ -1481,6 +1485,57 @@ pub fn compute_layout(
             p_align: 4,
         });
     }
+    // PT_GNU_RELRO: the sub-region of the RW segment that holds relocation
+    // targets resolved at load time (`.init_array`, `.fini_array`,
+    // `.data.rel.ro`, `.dynamic`, `.got`) and can be made read-only afterwards.
+    // With BIND_NOW (which peony sets) the whole region is eagerly resolved, so
+    // the loader can mprotect it read-only — a standard hardening.
+    let relro_names = [
+        ".init_array",
+        ".fini_array",
+        ".data.rel.ro",
+        ".dynamic",
+        ".got",
+    ];
+    // RELRO is only meaningful for dynamic links (it protects load-time
+    // relocation targets); a static executable has no such region. This guard
+    // must match `has_relro` used for the program-header count.
+    let relro_secs: Vec<&OutputSection> = if dynamic.is_some() {
+        sections
+            .iter()
+            .filter(|s| relro_names.contains(&s.name.as_str()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let (Some(lo), Some(hi)) = (
+        relro_secs.iter().map(|s| s.sh_addr).min(),
+        relro_secs.iter().map(|s| s.sh_addr + s.sh_size).max(),
+    ) {
+        let lo_off = relro_secs
+            .iter()
+            .min_by_key(|s| s.sh_addr)
+            .map(|s| s.sh_offset)
+            .unwrap_or(0);
+        let size = hi - lo;
+        tracing::debug!(
+            relro_lo = format_args!("{lo:#x}"),
+            relro_hi = format_args!("{hi:#x}"),
+            size,
+            sections = relro_secs.len(),
+            "PT_GNU_RELRO span"
+        );
+        segments.push(ProgramHeader {
+            p_type: elf::PT_GNU_RELRO,
+            p_flags: elf::PF_R,
+            p_offset: lo_off,
+            p_vaddr: lo,
+            p_paddr: lo,
+            p_filesz: size,
+            p_memsz: size,
+            p_align: 1,
+        });
+    }
     // Non-executable stack marker.
     segments.push(ProgramHeader {
         p_type: elf::PT_GNU_STACK,
@@ -1492,6 +1547,18 @@ pub fn compute_layout(
         p_memsz: 0,
         p_align: 0,
     });
+    tracing::debug!(
+        predicted_phnum = phnum,
+        actual_segments = segments.len(),
+        has_tls,
+        has_eh_frame_hdr,
+        has_relro,
+        num_load,
+        build_id = config.build_id,
+        dynamic = dynamic.is_some(),
+        segment_types = ?segments.iter().map(|s| s.p_type).collect::<Vec<_>>(),
+        "segment count check"
+    );
     debug_assert_eq!(segments.len() as u64, phnum);
 
     // ── Linker-defined symbol addresses ──────────────────────────────────────
