@@ -941,6 +941,14 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
         .filter(|ar| seen.insert((**ar).clone()))
         .copied()
         .collect();
+
+    // Collect + parse every member serially. NOTE: parallelising the member
+    // parse was MEASURED net-negative (--trace + strace A/B): it cut the parse
+    // sub-phase 8.7→3.1ms but spinning the rayon pool here ADDED ~40 futex +
+    // ~250 sched_yield and raised total syscall time 0.39→0.46s — the Amdahl
+    // wall. The win only materialises once the baseline thread-pool contention
+    // (the futex/sched_yield storm shared with emit) is eliminated, which is the
+    // sharded-resolution/arena work, not this isolated fan-out. Kept serial.
     for ar in unique {
         for m in iter_archive_members(ar)
             .with_context(|| format!("reading archive `{}`", ar.display()))?

@@ -540,10 +540,13 @@ fn dispatch_parallel(
         return Ok(());
     }
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(work_items.len());
+    // Use the link's CONFIGURED worker count (rayon's global pool, which honours
+    // `--threads` and the small-link cap), not `available_parallelism()`. emit
+    // formerly always spawned up to all cores, so a link configured for fewer
+    // workers still spun 24 ws-deque threads here — measured as the bulk of the
+    // futex/sched_yield churn on ripgrep (1040 sched_yield at the 8-thread cap).
+    // Capping to the pool size keeps emit consistent with the rest of the link.
+    let num_threads = rayon::current_num_threads().max(1).min(work_items.len());
 
     let error_slot: std::sync::Mutex<Option<peony_reloc::RelocError>> = std::sync::Mutex::new(None);
 
