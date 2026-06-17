@@ -1466,9 +1466,16 @@ pub fn compute_layout_icf(
 
     // ── Pass 8: assign virtual addresses + file offsets ──────────────────────
     // Invariant for all loadable content: file_offset == vaddr - base.
+    // Pre-size the (object, section) → address/output-index maps from the total
+    // input-section count; they take one entry per contribution and otherwise
+    // grow+rehash repeatedly on a large link (profiling showed reserve_rehash on
+    // these `(usize,usize)` maps at ~4% of self-time).
+    let total_input_sections: usize = objects.iter().map(|o| o.sections.len()).sum();
     let mut sections: Vec<OutputSection> = Vec::new();
-    let mut addresses: FxHashMap<(usize, usize), u64> = FxHashMap::default();
-    let mut sec_to_out: FxHashMap<(usize, usize), usize> = FxHashMap::default();
+    let mut addresses: FxHashMap<(usize, usize), u64> =
+        FxHashMap::with_capacity_and_hasher(total_input_sections, Default::default());
+    let mut sec_to_out: FxHashMap<(usize, usize), usize> =
+        FxHashMap::with_capacity_and_hasher(total_input_sections, Default::default());
 
     // RO segment: headers, then read-only sections.
     let ro_seg_start = base;
