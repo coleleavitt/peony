@@ -16,18 +16,39 @@
 //! case (duplicate monomorphisations, identical small helpers) with no chance of
 //! an unsound merge. Anything uncertain is simply not folded.
 
-use peony_object::{InputObject, SymbolIndex};
+use peony_object::{InputArena, InputObject, SymbolIndex};
 use rustc_hash::FxHashMap;
 
-/// A canonical key identifying a foldable section's observable content: its raw
-/// bytes plus a normalised view of its relocations (target *name*, not index, so
-/// the same call across two objects hashes equal).
+/// A canonical key identifying a foldable section's observable content: a
+/// 128-bit digest of its raw bytes (zero-copy: hashed straight from the arena,
+/// never cloned) plus a normalised view of its relocations (target *name*, not
+/// index, so the same call across two objects hashes equal). The byte *length*
+/// is part of the key so two sections must agree on length before a digest hit
+/// is trusted; a digest collision is verified by a real byte compare in
+/// [`compute_fold_map`] before folding (sound — no wrong folds).
 #[derive(PartialEq, Eq, Hash)]
 struct FoldKey {
     flags: u64,
-    data: Vec<u8>,
+    /// 128-bit content digest of the section bytes.
+    digest: u128,
+    /// Section byte length (guards the digest).
+    len: u32,
     /// (offset, r_type, addend, target-symbol-name) per relocation, in order.
     relocs: Vec<(u64, u32, i64, Vec<u8>)>,
+}
+
+/// A fast 128-bit content digest (double-FNV) of a section's bytes. Used as the
+/// ICF fold key so identical bytes hash equal without cloning the bytes.
+fn content_digest(bytes: &[u8]) -> u128 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h1 = OFFSET;
+    let mut h2 = 0x9e37_79b9_7f4a_7c15u64;
+    for &b in bytes {
+        h1 = (h1 ^ b as u64).wrapping_mul(PRIME);
+        h2 = (h2.wrapping_add(b as u64)).wrapping_mul(PRIME) ^ (h2 >> 29);
+    }
+    ((h1 as u128) << 64) | h2 as u128
 }
 
 /// Resolve a relocation's target symbol to its name bytes (stable across
@@ -100,7 +121,7 @@ fn read_uleb128(data: &[u8], pos: &mut usize) -> Option<u64> {
 /// non-call relocation anywhere in the link. A section is ineligible for folding
 /// if it defines a name-taken symbol OR is itself the (object, section) target of
 /// a section-relative address-taking reloc.
-fn address_taint(objects: &[InputObject]) -> AddrTaint {
+fn address_taint(arena: &InputArena, objects: &[InputObject]) -> AddrTaint {
     let mut t = AddrTaint::default();
     for (obj_id, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
@@ -108,7 +129,7 @@ fn address_taint(objects: &[InputObject]) -> AddrTaint {
                 taint_one_reloc(&mut t, obj, obj_id, r);
             }
         }
-        parse_addrsig(&mut t, obj, obj_id);
+        parse_addrsig(arena, &mut t, obj, obj_id);
     }
     t
 }
@@ -116,14 +137,15 @@ fn address_taint(objects: &[InputObject]) -> AddrTaint {
 /// Parse this object's `.llvm_addrsig` section (if present): record that the
 /// object HAS the table, and which of its symbols are address-significant. The
 /// table is a sequence of ULEB128 ELF symbol-table indices.
-fn parse_addrsig(t: &mut AddrTaint, obj: &InputObject, obj_id: usize) {
+fn parse_addrsig(arena: &InputArena, t: &mut AddrTaint, obj: &InputObject, obj_id: usize) {
     let Some(sec) = obj.sections.iter().find(|s| s.sh_type == SHT_LLVM_ADDRSIG) else {
         return;
     };
     t.objects_with_addrsig.insert(obj_id);
+    let data = arena.bytes(sec.data);
     let mut pos = 0usize;
-    while pos < sec.data.len() {
-        let Some(sym_idx) = read_uleb128(&sec.data, &mut pos) else {
+    while pos < data.len() {
+        let Some(sym_idx) = read_uleb128(data, &mut pos) else {
             break;
         };
         if let Some(&sym_pos) = obj.symbol_map.get(&(sym_idx as usize)) {
@@ -246,6 +268,7 @@ pub type FoldMap = FxHashMap<(usize, usize), (usize, usize)>;
 /// Build the fold key for one section, or `None` if it is ineligible (not text,
 /// empty, address-significant, or has an unresolvable reloc target).
 fn fold_key_for(
+    arena: &InputArena,
     obj: &InputObject,
     obj_id: usize,
     pos: usize,
@@ -265,7 +288,8 @@ fn fold_key_for(
     }
     Some(FoldKey {
         flags: sec.flags,
-        data: sec.data.clone(),
+        digest: content_digest(arena.bytes(sec.data)),
+        len: sec.data.len() as u32,
         relocs,
     })
 }
@@ -274,26 +298,34 @@ fn fold_key_for(
 /// that are byte+reloc identical and free of address-significant symbols are
 /// folded. Deterministic: the canonical is the first `(object_id, section_index)`
 /// seen in iteration order, so output is stable.
-pub fn compute_fold_map(objects: &[InputObject]) -> FoldMap {
-    let mut canonical: FxHashMap<FoldKey, (usize, usize)> = FxHashMap::default();
+pub fn compute_fold_map(arena: &InputArena, objects: &[InputObject]) -> FoldMap {
+    // The canonical value carries both the output key `(obj_id, section_index)`
+    // AND the `(obj_id, pos)` needed to re-read the canonical bytes for a
+    // collision check, so a 128-bit digest collision can never fold two sections
+    // whose bytes actually differ.
+    let mut canonical: FxHashMap<FoldKey, (usize, usize, usize)> = FxHashMap::default();
     let mut folds: FoldMap = FxHashMap::default();
     // Address-significance taint — sections defining/pointed-at by address-taking
     // relocations are never folded (the sound substitute for `.llvm_addrsig`).
-    let taint = address_taint(objects);
+    let taint = address_taint(arena, objects);
 
     for (obj_id, obj) in objects.iter().enumerate() {
         for pos in 0..obj.sections.len() {
-            let Some(key) = fold_key_for(obj, obj_id, pos, &taint) else {
+            let Some(key) = fold_key_for(arena, obj, obj_id, pos, &taint) else {
                 continue;
             };
-            let here = (obj_id, obj.sections[pos].index.0);
-            match canonical.get(&key) {
-                Some(&canon) => {
-                    folds.insert(here, canon);
-                }
-                None => {
-                    canonical.insert(key, here);
-                }
+            let Some(&(c_obj, c_pos, c_index)) = canonical.get(&key) else {
+                // First section with this key becomes the canonical.
+                canonical.insert(key, (obj_id, pos, obj.sections[pos].index.0));
+                continue;
+            };
+            // Verify byte-equality before folding (digest collision guard). On the
+            // astronomically-rare digest collision with differing bytes, do not
+            // fold `here` (sound — it is simply left un-canonicalised).
+            let here_bytes = arena.bytes(obj.sections[pos].data);
+            let canon_bytes = arena.bytes(objects[c_obj].sections[c_pos].data);
+            if here_bytes == canon_bytes {
+                folds.insert((obj_id, obj.sections[pos].index.0), (c_obj, c_index));
             }
         }
     }
@@ -314,13 +346,13 @@ mod tests {
 
     use super::*;
 
-    fn text_section(index: usize, data: &[u8]) -> InputSection {
+    fn text_section(arena: &mut InputArena, index: usize, data: &[u8]) -> InputSection {
         InputSection {
             index: SectionIndex(index),
             name: b".text.f".to_vec(),
             kind: SectionKind::Text,
             sh_type: 1,
-            data: data.to_vec(),
+            data: arena.intern_bytes(data),
             align: 1,
             size: data.len() as u64,
             flags: 0x6, // ALLOC | EXEC
@@ -347,7 +379,11 @@ mod tests {
     /// An `.llvm_addrsig` section whose body is the ULEB128 list of the given raw
     /// symbol indices (the address-significant ones). Empty list = the object
     /// opts into ICF with nothing address-significant.
-    fn addrsig_section(index: usize, sig_sym_indices: &[u64]) -> InputSection {
+    fn addrsig_section(
+        arena: &mut InputArena,
+        index: usize,
+        sig_sym_indices: &[u64],
+    ) -> InputSection {
         let mut data = Vec::new();
         for &i in sig_sym_indices {
             // single-byte ULEB128 is enough for small test indices
@@ -360,7 +396,7 @@ mod tests {
             kind: SectionKind::Other,
             sh_type: super::SHT_LLVM_ADDRSIG,
             size: data.len() as u64,
-            data,
+            data: arena.intern_bytes(&data),
             align: 1,
             flags: 0,
             relocs: Vec::new(),
@@ -368,13 +404,19 @@ mod tests {
     }
 
     /// Build an object that OPTS INTO ICF (carries an empty `.llvm_addrsig`).
-    fn obj(path: &str, sections: Vec<InputSection>, symbols: Vec<InputSymbol>) -> InputObject {
-        obj_addrsig(path, sections, symbols, Some(&[]))
+    fn obj(
+        arena: &mut InputArena,
+        path: &str,
+        sections: Vec<InputSection>,
+        symbols: Vec<InputSymbol>,
+    ) -> InputObject {
+        obj_addrsig(arena, path, sections, symbols, Some(&[]))
     }
 
     /// Build an object; `addrsig` is `Some(significant indices)` to include an
     /// `.llvm_addrsig` table, or `None` to omit it entirely (ICF must decline).
     fn obj_addrsig(
+        arena: &mut InputArena,
         path: &str,
         mut sections: Vec<InputSection>,
         symbols: Vec<InputSymbol>,
@@ -382,7 +424,7 @@ mod tests {
     ) -> InputObject {
         if let Some(sig) = addrsig {
             let idx = sections.iter().map(|s| s.index.0).max().unwrap_or(0) + 1;
-            sections.push(addrsig_section(idx, sig));
+            sections.push(addrsig_section(arena, idx, sig));
         }
         let mut section_map = FxHashMap::default();
         for (pos, s) in sections.iter().enumerate() {
@@ -405,17 +447,12 @@ mod tests {
     #[test]
     fn folds_two_identical_local_text_sections() {
         // Two objects, each with a byte-identical local .text section.
-        let o0 = obj(
-            "a.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![local_sym(b"f", 1)],
-        );
-        let o1 = obj(
-            "b.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![local_sym(b"g", 1)],
-        );
-        let folds = compute_fold_map(&[o0, o1]);
+        let mut arena = InputArena::new();
+        let s0 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o0 = obj(&mut arena, "a.o", s0, vec![local_sym(b"f", 1)]);
+        let s1 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o1 = obj(&mut arena, "b.o", s1, vec![local_sym(b"g", 1)]);
+        let folds = compute_fold_map(&arena, &[o0, o1]);
         // The second section folds onto the first.
         assert_eq!(folds.get(&(1, 1)), Some(&(0, 1)));
         assert_eq!(folds.len(), 1);
@@ -423,17 +460,12 @@ mod tests {
 
     #[test]
     fn does_not_fold_different_bytes() {
-        let o0 = obj(
-            "a.o",
-            vec![text_section(1, &[0xc3])],
-            vec![local_sym(b"f", 1)],
-        );
-        let o1 = obj(
-            "b.o",
-            vec![text_section(1, &[0x90])],
-            vec![local_sym(b"g", 1)],
-        );
-        assert!(compute_fold_map(&[o0, o1]).is_empty());
+        let mut arena = InputArena::new();
+        let s0 = vec![text_section(&mut arena, 1, &[0xc3])];
+        let o0 = obj(&mut arena, "a.o", s0, vec![local_sym(b"f", 1)]);
+        let s1 = vec![text_section(&mut arena, 1, &[0x90])];
+        let o1 = obj(&mut arena, "b.o", s1, vec![local_sym(b"g", 1)]);
+        assert!(compute_fold_map(&arena, &[o0, o1]).is_empty());
     }
 
     #[test]
@@ -443,24 +475,22 @@ mod tests {
         g0.binding = Binding::Global;
         let mut g1 = local_sym(b"g", 1);
         g1.binding = Binding::Global;
-        let o0 = obj("a.o", vec![text_section(1, &[0xc3, 0x90])], vec![g0]);
-        let o1 = obj("b.o", vec![text_section(1, &[0xc3, 0x90])], vec![g1]);
-        assert!(compute_fold_map(&[o0, o1]).is_empty());
+        let mut arena = InputArena::new();
+        let s0 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o0 = obj(&mut arena, "a.o", s0, vec![g0]);
+        let s1 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o1 = obj(&mut arena, "b.o", s1, vec![g1]);
+        assert!(compute_fold_map(&arena, &[o0, o1]).is_empty());
     }
 
     #[test]
     fn does_not_fold_vtable_even_if_local() {
-        let o0 = obj(
-            "a.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![local_sym(b"_ZTV1A", 1)],
-        );
-        let o1 = obj(
-            "b.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![local_sym(b"_ZTV1B", 1)],
-        );
-        assert!(compute_fold_map(&[o0, o1]).is_empty());
+        let mut arena = InputArena::new();
+        let s0 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o0 = obj(&mut arena, "a.o", s0, vec![local_sym(b"_ZTV1A", 1)]);
+        let s1 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o1 = obj(&mut arena, "b.o", s1, vec![local_sym(b"_ZTV1B", 1)]);
+        assert!(compute_fold_map(&arena, &[o0, o1]).is_empty());
     }
 
     #[test]
@@ -468,20 +498,13 @@ mod tests {
         // Objects with NO `.llvm_addrsig` section must never fold — we have no
         // proof any symbol is address-insignificant. This is what makes ICF a
         // safe no-op on rustc output (which omits the table).
-        let o0 = obj_addrsig(
-            "a.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![local_sym(b"f", 1)],
-            None,
-        );
-        let o1 = obj_addrsig(
-            "b.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![local_sym(b"g", 1)],
-            None,
-        );
+        let mut arena = InputArena::new();
+        let s0 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o0 = obj_addrsig(&mut arena, "a.o", s0, vec![local_sym(b"f", 1)], None);
+        let s1 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o1 = obj_addrsig(&mut arena, "b.o", s1, vec![local_sym(b"g", 1)], None);
         assert!(
-            compute_fold_map(&[o0, o1]).is_empty(),
+            compute_fold_map(&arena, &[o0, o1]).is_empty(),
             "no .llvm_addrsig ⇒ ICF must decline to fold"
         );
     }
@@ -493,20 +516,13 @@ mod tests {
         s0.index = SymbolIndex(0);
         let mut s1 = local_sym(b"g", 1);
         s1.index = SymbolIndex(0);
-        let o0 = obj_addrsig(
-            "a.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![s0],
-            Some(&[0]),
-        );
-        let o1 = obj_addrsig(
-            "b.o",
-            vec![text_section(1, &[0xc3, 0x90])],
-            vec![s1],
-            Some(&[0]),
-        );
+        let mut arena = InputArena::new();
+        let sec0 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o0 = obj_addrsig(&mut arena, "a.o", sec0, vec![s0], Some(&[0]));
+        let sec1 = vec![text_section(&mut arena, 1, &[0xc3, 0x90])];
+        let o1 = obj_addrsig(&mut arena, "b.o", sec1, vec![s1], Some(&[0]));
         assert!(
-            compute_fold_map(&[o0, o1]).is_empty(),
+            compute_fold_map(&arena, &[o0, o1]).is_empty(),
             "addrsig-listed symbol's section must not fold"
         );
     }

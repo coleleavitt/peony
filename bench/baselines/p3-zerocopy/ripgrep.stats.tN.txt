@@ -1,0 +1,13 @@
+
+── peony --stats ──────────────────────────────────────────
+phase                    wall       %         bytes      items
+resolve-inputs        13.74ms    8.5%           0B          0
+parse+resolve         73.94ms   45.5%           0B        423
+reloc-scan             3.70ms    2.3%           0B          0
+reloc-postproc        26.06ms   16.0%           0B          0
+layout                16.47ms   10.1%           0B          0
+finalize-syms          8.12ms    5.0%           0B          0
+emit                  15.09ms    9.3%           0B          0
+other                  5.33ms    3.3%  (startup/teardown/untimed)
+TOTAL                162.45ms
+───────────────────────────────────────────────────────────

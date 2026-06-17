@@ -84,6 +84,132 @@ pub enum SectionKind {
     Other,
 }
 
+// ── Zero-copy section backing store ────────────────────────────────────────────
+
+/// Link-wide backing store for all input section bytes. Holds every input
+/// `mmap` (bare objects *and* archives) for the whole link, plus the rare
+/// transformed-bytes cases (decompressed `.debug_*`). Sections reference their
+/// bytes by index into this arena — so [`InputSection`] carries no lifetime and
+/// stays `Copy`-cheap, while the actual 17MB+ of section data is never copied
+/// out of the `mmap` (it used to be `memcpy`'d into a per-section `Vec<u8>`,
+/// which dominated parse bandwidth and inflated peak RSS).
+///
+/// The arena must outlive layout and emit (its bytes are read during the output
+/// blit). It is created in `load_and_resolve` and returned alongside the
+/// objects so it lives for the whole link.
+#[derive(Default)]
+pub struct InputArena {
+    /// Memory-mapped input files, indexed by `file_id` ([`DataSrc::Mmap`]).
+    mmaps: Vec<Mmap>,
+    /// Transformed/synthesized bytes (decompressed debug), indexed by
+    /// [`DataSrc::Owned`]. Allocated only for genuinely-transformed sections.
+    owned: Vec<Vec<u8>>,
+}
+
+impl InputArena {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Move a mapped input file in; returns its `file_id` for [`DataSrc::Mmap`].
+    pub fn push_mmap(&mut self, m: Mmap) -> u32 {
+        let id = self.mmaps.len() as u32;
+        self.mmaps.push(m);
+        id
+    }
+
+    /// Store transformed bytes; returns the index for [`DataSrc::Owned`].
+    pub fn push_owned(&mut self, v: Vec<u8>) -> u32 {
+        let id = self.owned.len() as u32;
+        self.owned.push(v);
+        id
+    }
+
+    /// Intern raw bytes and return a [`SectionData`] handle pointing at them.
+    /// Convenience for callers (and tests) that have bytes in hand rather than a
+    /// file range — the bytes go into the owned store.
+    pub fn intern_bytes(&mut self, bytes: &[u8]) -> SectionData {
+        assert!(
+            bytes.len() <= u32::MAX as usize,
+            "section too large for u32 len"
+        );
+        let len = bytes.len() as u32;
+        let id = self.push_owned(bytes.to_vec());
+        SectionData {
+            src: DataSrc::Owned(id),
+            off: 0,
+            len,
+        }
+    }
+
+    /// The full bytes of a mapped input file (used to parse straight from the map).
+    #[inline]
+    pub fn mmap_bytes(&self, file_id: u32) -> &[u8] {
+        &self.mmaps[file_id as usize]
+    }
+
+    /// The full bytes of an owned buffer (e.g. an archive member blob). The
+    /// inner `Vec<u8>` is heap-stable across later `push_owned` calls (only the
+    /// outer `Vec` of buffers may realloc), so a slice taken here stays valid.
+    #[inline]
+    pub fn owned_bytes(&self, owned_id: u32) -> &[u8] {
+        &self.owned[owned_id as usize]
+    }
+
+    /// Resolve a [`SectionData`] handle to its byte slice.
+    #[inline]
+    pub fn bytes(&self, d: SectionData) -> &[u8] {
+        let base: &[u8] = match d.src {
+            DataSrc::Mmap(i) => &self.mmaps[i as usize],
+            DataSrc::Owned(i) => &self.owned[i as usize],
+        };
+        &base[d.off as usize..d.off as usize + d.len as usize]
+    }
+}
+
+/// Where an [`InputSection`]'s bytes live. `Copy + Send + Sync + 'static` — it
+/// carries no lifetime, so it does not infect `InputObject`/`SymbolTable`/layout
+/// with an arena lifetime parameter.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionData {
+    pub src: DataSrc,
+    /// Byte offset of the section within its backing buffer.
+    pub off: u32,
+    /// Section byte length (the contribution length; may be < `InputSection.size`
+    /// for BSS, and is 4 bytes shorter than the file range for a stripped
+    /// `.eh_frame` terminator).
+    pub len: u32,
+}
+
+impl SectionData {
+    /// An empty handle (no bytes), e.g. for BSS / zero-length sections.
+    pub const EMPTY: SectionData = SectionData {
+        src: DataSrc::Mmap(0),
+        off: 0,
+        len: 0,
+    };
+    /// Byte length, without needing the arena.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The backing buffer kind for [`SectionData`]. Archives are NOT a separate
+/// variant — an archive's whole file is `mmap`'d into `mmaps` and a member
+/// section is `Mmap(archive_file_id)` with an absolute offset.
+#[derive(Debug, Clone, Copy)]
+pub enum DataSrc {
+    /// Index into [`InputArena::mmaps`].
+    Mmap(u32),
+    /// Index into [`InputArena::owned`].
+    Owned(u32),
+}
+
 // ── Core data types ───────────────────────────────────────────────────────────
 
 /// A single ELF section extracted from an [`InputObject`].
@@ -97,8 +223,9 @@ pub struct InputSection {
     pub kind: SectionKind,
     /// Raw ELF section type (`SHT_*`).
     pub sh_type: u32,
-    /// Raw section data (a slice into the mmap'd file).
-    pub data: Vec<u8>,
+    /// Handle to the section's raw bytes in the [`InputArena`] (zero-copy: a
+    /// borrow into the input `mmap`, not an owned copy).
+    pub data: SectionData,
     /// Section alignment (must be a power of two).
     pub align: u64,
     /// Size in bytes (may differ from `data.len()` for BSS).
@@ -198,26 +325,72 @@ impl std::fmt::Debug for InputObject {
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
-/// Open and parse a single ELF-64 object file.
+/// Open and parse a single ELF-64 object file into `arena`.
 ///
-/// The file is memory-mapped; the returned [`InputObject`] owns the map.
-/// Parsing is cheap — it copies only section/symbol metadata, not bulk data.
-pub fn parse_object(path: &Path) -> Result<InputObject> {
+/// The file is memory-mapped into the arena and the returned [`InputObject`]'s
+/// sections borrow their bytes from that map (zero-copy) — only section/symbol
+/// *metadata* is materialised, never the bulk section bytes.
+pub fn parse_object(arena: &mut InputArena, path: &Path) -> Result<InputObject> {
     let file = std::fs::File::open(path).map_err(|e| ObjectError::Io {
         path: path.display().to_string(),
         source: e,
     })?;
-    // SAFETY: we never mutate the mmap; parsing copies out everything it needs.
+    // SAFETY: the arena holds the map read-only for the whole link; never mutated.
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| ObjectError::Io {
         path: path.display().to_string(),
         source: e,
     })?;
-
-    parse_bytes(path.display().to_string(), &mmap)
+    let file_id = arena.push_mmap(mmap);
+    let bytes = arena.mmap_bytes(file_id);
+    // SAFETY: `bytes` borrows `arena.mmaps[file_id]`, which is never moved or
+    // mutated for the arena's lifetime; parse_bytes only needs it transiently
+    // and copies nothing out. We reborrow to decouple from `&mut arena` (the
+    // owned-debug sink path needs &mut arena). The map's backing pages are
+    // stable, so this raw reborrow is sound.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+    parse_bytes_into(arena, file_id, path.display().to_string(), bytes)
 }
 
-/// Parse an ELF-64 object from an in-memory byte buffer (e.g. an archive member).
-pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
+/// Parse an ELF-64 object whose bytes are already in `arena` at `file_id`
+/// (a bare object's mmap, or an archive's mmap with member at `base_off`).
+/// Sections reference `arena.mmaps[file_id]` by absolute offset — no copy.
+/// `base_off` is the member's byte offset within the backing buffer (0 for a
+/// bare object that maps to the start of its own file).
+pub fn parse_bytes_into(
+    arena: &mut InputArena,
+    file_id: u32,
+    path: String,
+    data: &[u8],
+) -> Result<InputObject> {
+    parse_backed(arena, DataSrc::Mmap(file_id), 0, path, data)
+}
+
+/// Parse an archive member whose bytes were copied into the arena's `owned`
+/// store at `owned_id`. The member is a self-contained ELF blob starting at
+/// offset 0 of that buffer, so section offsets are taken directly. (Archives
+/// are not zero-copy from the `.a` file — a small, non-hot cost — but bare
+/// objects, the bulk of a link, are.)
+pub fn parse_owned_member(
+    arena: &mut InputArena,
+    owned_id: u32,
+    path: String,
+    data: &[u8],
+) -> Result<InputObject> {
+    parse_backed(arena, DataSrc::Owned(owned_id), 0, path, data)
+}
+
+/// Parse an ELF-64 object whose bytes live in the arena at `backing` (a `Mmap`
+/// or `Owned` slot). `base_off` is the object's byte offset within that backing
+/// buffer (0 for a bare object / a member at the start of its buffer); section
+/// offsets are made absolute (`base_off + file_range`) so they index the whole
+/// backing buffer directly. No section bytes are copied for the `Mmap` case.
+fn parse_backed(
+    arena: &mut InputArena,
+    backing: DataSrc,
+    base_off: u64,
+    path: String,
+    data: &[u8],
+) -> Result<InputObject> {
     let elf: ElfFile64<Endianness> = ElfFile64::parse(data).map_err(|e| ObjectError::Parse {
         path: path.clone(),
         source: e,
@@ -238,17 +411,54 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
             _ => 0,
         };
         let kind = classify_section(&name, sh_flags);
-        let mut raw_data = if is_debug {
-            section
+
+        // Determine the section's byte handle WITHOUT copying. The common case
+        // (uncompressed) is a slice of the backing mmap at its file range. Only
+        // a *compressed* debug section needs owned (decompressed) bytes.
+        let (file_off, file_len) = section.file_range().unwrap_or((0, 0));
+        let is_compressed = matches!(
+            section.compressed_file_range(),
+            Ok(r) if r.format != object::CompressionFormat::None
+        );
+
+        let mut data_handle: SectionData;
+        let mut owned_len: Option<u64> = None;
+        if is_debug && is_compressed {
+            // Rare: decompress into the arena's owned store (transformed bytes).
+            let bytes = section
                 .uncompressed_data()
                 .map_err(|e| ObjectError::Parse {
                     path: path.clone(),
                     source: e,
                 })?
-                .into_owned()
+                .into_owned();
+            let len = bytes.len();
+            assert!(len <= u32::MAX as usize, "section too large for u32 len");
+            let oid = arena.push_owned(bytes);
+            owned_len = Some(len as u64);
+            data_handle = SectionData {
+                src: DataSrc::Owned(oid),
+                off: 0,
+                len: len as u32,
+            };
+        } else if sh_type == elf::SHT_NOBITS || file_len == 0 {
+            // BSS / empty: no backing bytes.
+            data_handle = SectionData::EMPTY;
         } else {
-            section.data().unwrap_or(&[]).to_vec()
-        };
+            // Zero-copy (Mmap) / shared-buffer (Owned archive): a slice into the
+            // backing buffer at the absolute offset. No bytes copied.
+            let abs_off = base_off + file_off;
+            assert!(
+                abs_off + file_len <= u32::MAX as u64,
+                "section offset+len {} exceeds u32 (archive/object > 4GiB not supported)",
+                abs_off + file_len
+            );
+            data_handle = SectionData {
+                src: backing,
+                off: abs_off as u32,
+                len: file_len as u32,
+            };
+        }
         let relocs = collect_relocs(&section);
 
         // Strip the trailing 4-byte zero CIE terminator from each input
@@ -257,11 +467,14 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
         // (`_Unwind_Find_FDE`) to stop at the first one. The linker emits a
         // single terminator for the merged section (handled at emit time).
         let mut size = if is_debug {
-            raw_data.len() as u64
+            owned_len.unwrap_or(file_len)
         } else {
             section.size()
         };
         if kind == SectionKind::EhFrame {
+            // The section bytes live in the backing buffer; read them via the
+            // handle just computed (no copy — `arena.bytes` is a slice).
+            let raw_data = arena.bytes(data_handle);
             // Determine whether the section *ends* with a genuine 4-byte zero
             // terminator by walking records to the end. A trailing run of zero
             // bytes that is reached at a record boundary is the terminator; zeros
@@ -269,11 +482,11 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
             // stripped. `scan_eh_frame` reports `leftover` = unparsed trailing
             // bytes; a clean section has leftover 0 and may end in a terminator
             // record that the scan counts via `terms`.
-            let (cies, fdes, terms, leftover) = scan_eh_frame(&raw_data);
+            let (cies, fdes, terms, leftover) = scan_eh_frame(raw_data);
             // The terminator (if any) is exactly the final 4 bytes AND the parse
             // must consume the whole section (leftover == 0) reaching it as a
             // record. We detect it by checking the byte position the scan ends.
-            let ends_with_terminator = ends_with_eh_terminator(&raw_data);
+            let ends_with_terminator = ends_with_eh_terminator(raw_data);
             tracing::trace!(
                 obj = %path,
                 input_size = raw_data.len(),
@@ -286,7 +499,10 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
                 "parse .eh_frame contribution"
             );
             if ends_with_terminator {
-                raw_data.truncate(raw_data.len() - 4);
+                // Zero-copy strip: expose a 4-byte-shorter slice instead of
+                // truncating an owned Vec. The terminator stays in the mmap but
+                // is excluded from this section's contribution.
+                data_handle.len = data_handle.len.saturating_sub(4);
                 size = size.saturating_sub(4);
             }
         }
@@ -296,7 +512,7 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
             name,
             kind,
             sh_type,
-            data: raw_data,
+            data: data_handle,
             align: section.align(),
             size,
             flags: sh_flags,
@@ -762,6 +978,13 @@ impl MappedInput {
     #[inline]
     pub fn bytes(&self) -> &[u8] {
         &self._mmap
+    }
+
+    /// Consume the wrapper and yield the underlying map, e.g. to move it into an
+    /// [`InputArena`] so sections can borrow from it for the whole link.
+    #[inline]
+    pub fn into_mmap(self) -> Mmap {
+        self._mmap
     }
 }
 

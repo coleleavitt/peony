@@ -176,3 +176,46 @@ ripgrep = `ff8e621e…`. This is the byte-compare gate for subsequent phases.
 | reloc-scan      |  2.94ms  |  2.3% |
 
 Next target: parse+resolve (32%) and the newly-surfaced reloc-postproc (16.4%).
+
+---
+
+# Phase-3 result — zero-copy section data (SHIPPED)
+
+Replaced `InputSection.data: Vec<u8>` (a per-section copy out of the mmap) with
+`SectionData { src, off, len }` — a `Copy+Send+'static` index into a link-wide
+`InputArena { mmaps, owned }`. Bare objects (the bulk of a link) now borrow their
+section bytes straight from the input `mmap`; only compressed `.debug_*` is owned.
+`.eh_frame` terminator-strip is a `len -= 4` slice (no copy). Archives copy the
+member blob into the arena's owned store once (not zero-copy from the `.a`, a
+small non-hot cost). ICF `FoldKey` holds a 128-bit content digest (no byte clone)
++ a verify-on-collision byte compare (sound). Design per two council rounds:
+central arena, no lifetime parameter, atomic type-flip, parallelization deferred
+to separate commits.
+
+## Measured on ripgrep (threads=0)
+
+| metric          | before (p2) | after (p3) | delta            |
+|-----------------|------------:|-----------:|------------------|
+| parse+resolve   | ~41ms       | 27.4ms     | the 17MB copy gone |
+| emit            | ~25ms       | 12.5ms     | blit straight from mmap |
+| **TOTAL link**  | ~120ms      | **83ms**   | **~30% faster**  |
+| **peak RSS**    | ~225MB      | **140MB**  | **−38%**         |
+
+Parse is still SERIAL (council rule: never combine data-model change with
+concurrency); the win here is removing the copy + RSS, not parse threading.
+Parallel parse is a separate follow-up now unblocked by `Send`-able indices.
+
+## Gates (all pass)
+
+- **Byte-identical:** all 4 corpora sha256 unchanged vs the p2-buildid baseline.
+- **Determinism:** ripgrep links identically at threads=0 and threads=1.
+- **Correctness:** linked ripgrep runs (`ripgrep 15.1.0`, exit 0); `--icf` link
+  runs correctly with the new digest FoldKey.
+- **Tests:** full `cargo test --workspace` green (same counts as baseline).
+
+## Cumulative vs mold (ripgrep)
+
+3.3× (start) → 2.0× (build-id) → with the link now at 83ms vs mold ~8ms the
+wall-clock ratio is re-measured in the next bench pass. The two shipped phases
+(build-id + zero-copy) together cut peony's own cold-link time ~177ms → ~83ms
+(−53%) and RSS 225MB → 140MB.

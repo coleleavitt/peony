@@ -17,7 +17,7 @@ use std::path::Path;
 
 use memmap2::MmapMut;
 use peony_layout::{Layout, SecSource};
-use peony_object::{InputObject, elf};
+use peony_object::{InputArena, InputObject, elf};
 use peony_reloc::ApplyCtx;
 use peony_symbols::SymbolTable;
 use thiserror::Error;
@@ -99,6 +99,7 @@ fn open_output_map(
 
 pub fn emit_full(
     output_path: &Path,
+    arena: &InputArena,
     objects: &[InputObject],
     symbols: &SymbolTable,
     layout: &Layout,
@@ -138,7 +139,7 @@ pub fn emit_full(
     // Uses ws-deque's Chase-Lev work-stealing deque for load-balanced dispatch.
     {
         let _t = peony_prof::trace("emit:section-data");
-        write_section_data_parallel(&mut mmap, objects, symbols, layout, output_path)?;
+        write_section_data_parallel(&mut mmap, arena, objects, symbols, layout, output_path)?;
     }
 
     // Shared-object TLS GOT static slots (DTPOFF in GD/LDM pair slot1) — written
@@ -389,6 +390,7 @@ fn write_headers(buf: &mut [u8], layout: &Layout) {
 /// Called from worker threads; `buf_ptr` + `buf_len` describe the mmap'd output.
 fn process_item(
     item: (usize, usize, u64, usize, usize),
+    arena: &InputArena,
     objects: &[peony_object::InputObject],
     buf_ptr: usize,
     buf_len: usize,
@@ -415,7 +417,9 @@ fn process_item(
     let sec_buf: &mut [u8] =
         unsafe { std::slice::from_raw_parts_mut((buf_ptr + file_off) as *mut u8, data_len) };
 
-    sec_buf.copy_from_slice(&isec.data);
+    // Zero-copy source: blit straight from the input mmap (via the arena) into
+    // the output buffer — no intermediate per-section Vec.
+    sec_buf.copy_from_slice(arena.bytes(isec.data));
 
     if !isec.relocs.is_empty() {
         for reloc in &isec.relocs {
@@ -436,6 +440,7 @@ fn process_item(
 /// to a worker thread without any synchronization.
 fn write_section_data_parallel(
     buf: &mut [u8],
+    arena: &InputArena,
     objects: &[InputObject],
     symbols: &SymbolTable,
     layout: &Layout,
@@ -522,7 +527,15 @@ fn write_section_data_parallel(
     };
     let work_items = collect_input_work_items(layout);
     let _t = peony_prof::trace("emit:section-copy-dispatch");
-    dispatch_parallel(work_items, objects, buf_ptr, buf_len, ctx, output_path)
+    dispatch_parallel(
+        work_items,
+        arena,
+        objects,
+        buf_ptr,
+        buf_len,
+        ctx,
+        output_path,
+    )
 }
 
 /// Collect (file_offset, _, section_va, object_id, section_index) for all input sections.
@@ -554,6 +567,7 @@ fn collect_input_work_items(layout: &Layout) -> Vec<WorkItem> {
 /// exits when `idle_count == num_threads` (all threads simultaneously idle).
 fn dispatch_parallel(
     work_items: Vec<WorkItem>,
+    arena: &InputArena,
     objects: &[InputObject],
     buf_ptr: usize,
     buf_len: usize,
@@ -578,7 +592,7 @@ fn dispatch_parallel(
         let error_slot = std::sync::Mutex::new(None);
         let ctx_ref = &ctx;
         for item in work_items {
-            process_item(item, objects, buf_ptr, buf_len, ctx_ref, &error_slot);
+            process_item(item, arena, objects, buf_ptr, buf_len, ctx_ref, &error_slot);
             if let Some(e) = error_slot.lock().unwrap().take() {
                 tracing::error!(output = %output_path.display(), %e, "relocation error");
                 return Err(EmitError::Reloc(e));
@@ -607,7 +621,7 @@ fn dispatch_parallel(
         // Errors are rare (a malformed reloc); record the first and let the rest
         // drain. We do not early-abort the schedule — the surviving sections are
         // still written to disjoint regions, and the error is returned below.
-        process_item(item, objects, buf_ptr, buf_len, &ctx, &error_slot);
+        process_item(item, arena, objects, buf_ptr, buf_len, &ctx, &error_slot);
     });
 
     if let Some(e) = error_slot.into_inner().ok().flatten() {

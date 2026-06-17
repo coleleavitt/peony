@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use peony_object::{InputObject, SectionKind, elf};
+use peony_object::{InputArena, InputObject, SectionKind, elf};
 use peony_symbols::{SymbolId, SymbolTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
@@ -501,7 +501,7 @@ impl Layout {
     ///
     /// `objects` supplies the input `.eh_frame` bytes; `self` supplies the
     /// output addresses of each `.eh_frame` contribution.
-    pub fn build_eh_frame_hdr(&mut self, objects: &[InputObject]) {
+    pub fn build_eh_frame_hdr(&mut self, arena: &InputArena, objects: &[InputObject]) {
         let Some(hdr_va) = self
             .output_sections
             .iter()
@@ -528,7 +528,7 @@ impl Layout {
                 continue;
             };
             let contrib_va = eh_va + c.offset;
-            for (fde_off, pcbegin_off, rel) in peony_object::iter_fdes(&isec.data) {
+            for (fde_off, pcbegin_off, rel) in peony_object::iter_fdes(arena.bytes(isec.data)) {
                 // PC begin is pcrel to its own field location.
                 let pcbegin_va = contrib_va + pcbegin_off as u64;
                 let func_pc = (pcbegin_va as i64).wrapping_add(rel);
@@ -720,6 +720,7 @@ fn elf_sysv_hash(name: &[u8]) -> u32 {
 /// Run the full layout pass. `got_syms` is the ordered list of symbols that need
 /// a GOT slot (extracted from the relocation scan by the caller).
 pub fn compute_layout(
+    arena: &InputArena,
     objects: &[InputObject],
     symbols: &SymbolTable,
     got_syms: &[SymbolId],
@@ -730,7 +731,7 @@ pub fn compute_layout(
     tls: &TlsGotInfo,
 ) -> Result<Layout> {
     compute_layout_icf(
-        objects, symbols, got_syms, plt_syms, live, dynamic, config, tls, None,
+        arena, objects, symbols, got_syms, plt_syms, live, dynamic, config, tls, None,
     )
 }
 
@@ -740,6 +741,7 @@ pub fn compute_layout(
 /// the surviving copy.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_layout_icf(
+    arena: &InputArena,
     objects: &[InputObject],
     symbols: &SymbolTable,
     got_syms: &[SymbolId],
@@ -1215,7 +1217,7 @@ pub fn compute_layout_icf(
     // Synthesise the single merged `.note.gnu.property` (RO) from all inputs.
     // The generic loop skips raw `.note.gnu.property` (see `is_allocatable`), so
     // this is the only place it is produced — exactly one well-formed note.
-    let gnu_property_note = merge_gnu_property_notes(objects).unwrap_or_default();
+    let gnu_property_note = merge_gnu_property_notes(arena, objects).unwrap_or_default();
     if !gnu_property_note.is_empty() {
         ro.push(Builder {
             name: ".note.gnu.property".to_string(),
@@ -1252,7 +1254,7 @@ pub fn compute_layout_icf(
         .iter()
         .flat_map(|o| o.sections.iter())
         .filter(|s| s.kind == SectionKind::EhFrame)
-        .map(|s| peony_object::count_fdes(&s.data))
+        .map(|s| peony_object::count_fdes(arena.bytes(s.data)))
         .sum();
     tracing::debug!(
         n_fdes,
@@ -3261,7 +3263,7 @@ fn parse_property_descriptor(desc: &[u8]) -> Vec<GnuProp> {
 /// present in every contributing object). ISA_1_USED is OR-merged. This matches
 /// `ld`/`lld`/`mold`; the AND semantics are why a single program-wide note is
 /// mandatory rather than a concatenation.
-fn merge_gnu_property_notes(objects: &[InputObject]) -> Option<Vec<u8>> {
+fn merge_gnu_property_notes(arena: &InputArena, objects: &[InputObject]) -> Option<Vec<u8>> {
     use rustc_hash::FxHashMap;
     let mut seen = false;
     // pr_type → (merged value, is_first_for_and).
@@ -3276,7 +3278,7 @@ fn merge_gnu_property_notes(objects: &[InputObject]) -> Option<Vec<u8>> {
             }
             seen = true;
             // Walk the notes in this section.
-            let d = &sec.data;
+            let d = arena.bytes(sec.data);
             let mut o = 0usize;
             while o + 12 <= d.len() {
                 let namesz = u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;

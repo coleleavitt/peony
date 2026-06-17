@@ -41,10 +41,16 @@ use peony_layout::{
     check_undefined,
     finalize_symbols,
 };
-use peony_object::{Binding, InputObject, iter_archive_members, parse_bytes, parse_object};
+use peony_object::{
+    Binding,
+    InputObject,
+    iter_archive_members,
+    parse_bytes_into,
+    parse_object,
+    parse_owned_member,
+};
 use peony_reloc::scan_relocations;
 use peony_symbols::SymbolTable;
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing_subscriber::EnvFilter;
 
@@ -361,6 +367,7 @@ fn main() -> Result<()> {
     init_thread_pool(args.threads, inputs.len())?;
 
     let Resolved {
+        arena,
         objects,
         mut symbols,
         comdat_excluded,
@@ -569,7 +576,7 @@ fn main() -> Result<()> {
     tracing::info!("computing layout");
     // --icf: fold byte+reloc-identical, non-address-significant .text sections.
     let fold_map = if args.icf {
-        let fm = peony_layout::icf::compute_fold_map(&objects);
+        let fm = peony_layout::icf::compute_fold_map(&arena, &objects);
         if !fm.is_empty() {
             tracing::info!(folded = fm.len(), "ICF: folded identical sections");
         }
@@ -580,6 +587,7 @@ fn main() -> Result<()> {
     drop(_postscan);
     let layout_span = peony_prof::phase("layout");
     let mut layout = peony_layout::compute_layout_icf(
+        &arena,
         &objects,
         &symbols,
         &got_syms,
@@ -669,6 +677,7 @@ fn main() -> Result<()> {
     let _emit_span = peony_prof::phase("emit");
     emit_full(
         &args.output,
+        &arena,
         &objects,
         &symbols,
         &layout,
@@ -792,37 +801,42 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // link showed 85% of syscall time in futex+sched_yield from the pool, for
     // work that runs faster serially). Only fan out for links big enough that
     // the parse time dominates the thread-management cost.
-    const PARALLEL_PARSE_THRESHOLD: usize = 256;
-    // Parse from the already-mapped bytes (no second open). `mmap_cache` is
-    // read-only here and `MappedInput` is `Sync`, so this is safe under rayon.
-    let parse_one = |p: &&PathBuf| {
-        let label = p.display().to_string();
-        match mmap_cache.get(p.as_path()).and_then(|m| m.as_ref()) {
-            Some(m) => parse_bytes(label, m.bytes())
-                .with_context(|| format!("failed to parse `{}`", p.display())),
-            // Unmappable input: fall back to the open+mmap path.
-            None => parse_object(p).with_context(|| format!("failed to parse `{}`", p.display())),
-        }
-    };
+    // Zero-copy parse: each bare object's mmap is moved into the arena and its
+    // sections borrow slices of that map (no per-section copy). Parse is SERIAL
+    // in this commit — `parse_object`/`parse_bytes_into` need `&mut arena` to
+    // push the map, so a parallel parse needs a different arena strategy
+    // (per-thread bump arenas), which is a separate follow-up. The big win here
+    // is removing the 17MB section-byte memcpy + the matching RSS, not parse
+    // concurrency (measured: build-id, not parse, was the dominant cost).
     let parsed: Vec<InputObject> = {
         let _t = peony_prof::trace("parse-bare");
         peony_prof::event(
             "parse",
-            format!(
-                "{} bare objects, {}",
-                bare.len(),
-                if bare.len() >= PARALLEL_PARSE_THRESHOLD {
-                    "parallel"
-                } else {
-                    "serial"
-                }
-            ),
+            format!("{} bare objects, serial zero-copy", bare.len()),
         );
-        if bare.len() >= PARALLEL_PARSE_THRESHOLD {
-            bare.par_iter().map(parse_one).collect::<Result<_>>()?
-        } else {
-            bare.iter().map(parse_one).collect::<Result<_>>()?
+        let mut parsed = Vec::with_capacity(bare.len());
+        for p in &bare {
+            let label = p.display().to_string();
+            // Reuse the classification mmap if present (it already mapped the
+            // file); otherwise open+map via parse_object. Either way the map
+            // lands in the arena and sections borrow from it.
+            let obj = match mmap_cache.remove(p.as_path()).flatten() {
+                Some(m) => {
+                    let file_id = r.arena.push_mmap(m.into_mmap());
+                    // SAFETY: the byte slice borrows arena.mmaps[file_id], stable
+                    // for the arena's life; parse copies nothing out of it.
+                    let bytes = r.arena.mmap_bytes(file_id);
+                    let bytes: &[u8] =
+                        unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+                    parse_bytes_into(&mut r.arena, file_id, label, bytes)
+                        .with_context(|| format!("failed to parse `{}`", p.display()))?
+                }
+                None => parse_object(&mut r.arena, p)
+                    .with_context(|| format!("failed to parse `{}`", p.display()))?,
+            };
+            parsed.push(obj);
         }
+        parsed
     };
     // Now that the objects are parsed we know roughly how many distinct symbols
     // the link will define; pre-size the resolution map to avoid repeated
@@ -874,6 +888,7 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
         "symbol table built"
     );
     Ok(Resolved {
+        arena: r.arena,
         objects: r.objects,
         symbols: r.symbols,
         comdat_excluded: r.excluded,
@@ -883,6 +898,9 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
 
 /// Result of loading + resolving the inputs.
 struct Resolved {
+    /// Backing store for all section bytes (input mmaps). Sections borrow into
+    /// this; it must outlive layout + emit, so it travels with the objects.
+    arena: peony_object::InputArena,
     objects: Vec<InputObject>,
     symbols: SymbolTable,
     /// `(object_id, section_index)` of sections discarded by COMDAT dedup.
@@ -895,6 +913,8 @@ struct Resolved {
 /// the order they are added (object index == `ObjectId`).
 #[derive(Default)]
 struct Resolver {
+    /// All input mmaps; section bytes are borrowed from here (zero-copy).
+    arena: peony_object::InputArena,
     objects: Vec<InputObject>,
     symbols: SymbolTable,
     seen_comdat: FxHashSet<Vec<u8>>,
@@ -964,8 +984,17 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
             .with_context(|| format!("reading archive `{}`", ar.display()))?
         {
             let label = format!("{}({})", ar.display(), m.name);
-            // Skip members that are not ELF objects (e.g. rustc metadata).
-            let Ok(obj) = parse_bytes(label, &m.data) else {
+            // Archive members are parsed from a buffer copied into the arena's
+            // owned store (archives are not zero-copy from the `.a`, a small
+            // non-hot cost; bare objects — the bulk — are zero-copy from mmap).
+            let owned_id = r.arena.push_owned(m.data);
+            // SAFETY: the buffer borrows arena.owned[owned_id], stable for the
+            // arena's life; parse copies nothing out of it.
+            let data: &[u8] = {
+                let b = r.arena.owned_bytes(owned_id);
+                unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
+            };
+            let Ok(obj) = parse_owned_member(&mut r.arena, owned_id, label, data) else {
                 continue;
             };
             let defines = obj
