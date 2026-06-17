@@ -1255,7 +1255,66 @@ pub fn compute_layout(
         });
     }
 
-    let shstrtab_off = foff;
+    // ── Non-alloc passthrough metadata sections (`.rustc`, `.comment`) ────────
+    // These carry no SHF_ALLOC flag, so they are not loaded — but rustc embeds
+    // crate metadata in `.rustc` and reads it back (proc-macro / rlib loading),
+    // so dropping it breaks `cargo build` of any proc-macro crate. Concatenate
+    // each such section's input contributions into a file-only output section
+    // (sh_addr = 0) placed after `.symtab`/`.strtab`. They have no relocations,
+    // so `SecSource::Input` simply copies their bytes at emit time.
+    for passthrough in [".rustc", ".comment"] {
+        let mut contributions: Vec<SectionContribution> = Vec::new();
+        let mut off = 0u64;
+        let mut max_align = 1u64;
+        for (obj_idx, obj) in objects.iter().enumerate() {
+            for sec in &obj.sections {
+                if sec.name != passthrough.as_bytes() || sec.data.is_empty() {
+                    continue;
+                }
+                if let Some(live) = live {
+                    // `.comment` is often local/unreferenced; keep it regardless,
+                    // but honour GC exclusion for anything explicitly dropped.
+                    let _ = live;
+                }
+                let align = sec.align.max(1);
+                max_align = max_align.max(align);
+                off = align_up(off, align);
+                contributions.push(SectionContribution {
+                    object_id: obj_idx,
+                    section_index: sec.index.0,
+                    offset: off,
+                    size: sec.data.len() as u64,
+                });
+                off += sec.data.len() as u64;
+            }
+        }
+        if contributions.is_empty() {
+            continue;
+        }
+        foff = align_up(foff, max_align);
+        // `.comment` is conventionally MERGE|STRINGS; a plain PROGBITS copy is
+        // valid and accepted by readelf/eu-elflint.
+        sections.push(OutputSection {
+            name: passthrough.to_string(),
+            kind: SectionKind::Other,
+            sh_type: elf::SHT_PROGBITS,
+            sh_flags: 0,
+            sh_addr: 0,
+            sh_offset: foff,
+            sh_size: off,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: max_align,
+            sh_entsize: 0,
+            sh_name: 0,
+            shndx: 0,
+            contributions,
+            source: SecSource::Input,
+        });
+        foff += off;
+    }
+
+    let shstrtab_off = align_up(foff, 1);
     let shstrtab_pos = sections.len();
     sections.push(OutputSection {
         name: ".shstrtab".to_string(),

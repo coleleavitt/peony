@@ -2704,3 +2704,47 @@
 {"at_ms":1781671242730,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\ncargo test --workspace 2>&1 | grep -E 'test result' | python3 -c \"\nimport sys,re; tp=t...","change_id":null,"task_id":null,"session_id":null}
 {"at_ms":1781671245152,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
 {"at_ms":1781671262628,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\ngit add -A && git commit -q -m \"feat(linker): -shared / ET_DYN shared objects (cdylib,...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671264425,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671274172,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671285762,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\n# t30's verification: dltest takes the .so as an ARGUMENT (it dlopens argv[1])\n/tmp/dl...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671287288,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671299998,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671311336,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671319987,"kind":"ToolCall","subject":"Bash","detail":"cd ~\ncp ~/.cargo/config.toml ~/.cargo/config.toml.bak-peony-$(date +%Y%m%d-%H%M%S)\necho \"backed up to: $(ls -t ~/.car...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671321536,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671348273,"kind":"ToolCall","subject":"Edit","detail":"/home/cole/.cargo/config.toml","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671349798,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671357079,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/bar\ncargo clean 2>/dev/null\ncargo +nightly build 2>&1 | tail -5\necho \"=== run ===\"; ./target...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671358794,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671369115,"kind":"ToolCall","subject":"Bash","detail":"cd /tmp\necho \"=== cdylib via GLOBAL config (no explicit linker flags) ===\"\nrustc --crate-type=cdylib --edition 2021 /...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671370996,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671388329,"kind":"ToolCall","subject":"Bash","detail":"cd /tmp/pmcrate/user\necho \"=== does peony's proc-macro .so have .rustc? ===\"\nreadelf -SW target/debug/deps/libpmtest-...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671390096,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671401787,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\necho \"=== is_allocatable / non-alloc section handling ===\"\ngrep -n 'fn is_allocatable\\...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671403327,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671410598,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671422365,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\necho \"=== how SecSource passthrough sections get their data at emit ===\"\ngrep -n 'SecS...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671423897,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671435014,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\necho \"=== where symtab/strtab (non-alloc) get placed in file layout ===\"\ngrep -n 'symt...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671436545,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671442214,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671454658,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671463087,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671469214,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671476184,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671486725,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671501309,"kind":"ToolCall","subject":"Edit","detail":"/home/cole/RustProjects/active/peony/peony-layout/src/lib.rs","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671502863,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671511919,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony && cargo build --release 2>&1 | grep -E '^error' | head; echo \"built ${PIPESTATUS[0]}\"...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671526110,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671532991,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony && cargo build --release 2>&1 | grep -B2 -A6 'error\\[' | head -40","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671534882,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671544227,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\n# Build peony itself with the SYSTEM linker (bypass the global peony config) so\n# the ...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671550065,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671557979,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\n# Temporarily restore the original (mold) config to build a correct peony.\nPEONYCFG=$(...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671566273,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671572005,"kind":"ToolCall","subject":"Bash","detail":"cd /tmp/pmcrate/user\ncargo clean 2>/dev/null\ncargo +nightly build 2>&1 | tail -6\necho \"=== .rustc + .comment in peony...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671573908,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671586045,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\necho \"=== build debug peony (tests use CARGO_BIN_EXE) with system linker to be safe ==...","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671591591,"kind":"ProviderCall","subject":"claude-opus-4-8","detail":"","change_id":null,"task_id":null,"session_id":null}
+{"at_ms":1781671599456,"kind":"ToolCall","subject":"Bash","detail":"cd ~/RustProjects/active/peony\ngit add -A && git commit -q -m \"feat(linker): pass through non-alloc .rustc/.comment m...","change_id":null,"task_id":null,"session_id":null}
