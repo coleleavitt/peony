@@ -982,4 +982,40 @@ mod dyn_probe {
             }
         }
     }
+
+    /// `is_shared_object` reads only the 20-byte ELF header. Exercise its
+    /// fast-path edge cases (the auto-review flagged them as untested): a
+    /// too-short file, a non-ELF file, and a relocatable object (ET_REL) must all
+    /// classify as NOT shared; only ET_DYN is shared.
+    #[test]
+    fn is_shared_object_edge_cases() {
+        let dir = std::env::temp_dir().join(format!("peony-isso-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let short = dir.join("short");
+        std::fs::write(&short, b"\x7fELF").unwrap(); // < 20 bytes → false
+        assert!(!super::is_shared_object(&short));
+
+        let nonelf = dir.join("nonelf");
+        std::fs::write(&nonelf, vec![0u8; 64]).unwrap(); // bad magic → false
+        assert!(!super::is_shared_object(&nonelf));
+
+        // A minimal 20-byte header with ELF magic and e_type = ET_REL (1).
+        let mut rel = vec![0u8; 20];
+        rel[0..4].copy_from_slice(b"\x7fELF");
+        rel[16] = 1; // e_type = ET_REL
+        let relp = dir.join("rel");
+        std::fs::write(&relp, &rel).unwrap();
+        assert!(!super::is_shared_object(&relp), "ET_REL is not shared");
+
+        rel[16] = 3; // e_type = ET_DYN
+        let dynp = dir.join("dyn");
+        std::fs::write(&dynp, &rel).unwrap();
+        assert!(super::is_shared_object(&dynp), "ET_DYN is shared");
+
+        let missing = dir.join("nope");
+        assert!(!super::is_shared_object(&missing), "missing file → false");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

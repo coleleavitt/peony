@@ -329,8 +329,12 @@ fn main() -> Result<()> {
     // handful of stat()s, not a full link (the whole point of beating mold on
     // the edit–rebuild loop). The thread pool is only initialised once we know a
     // real link is needed.
+    // Hash of the full argv: any change to output-affecting flags (-pie,
+    // -shared, -soname, …) must invalidate the cached output. Hashing the whole
+    // argv is conservative — a benign flag difference just forces a full relink.
+    let args_hash = peony_cache::hash_args(&args.raw_args);
     if args.incremental
-        && peony_cache::try_reuse(&args.output, &inputs).context("incremental cache")?
+        && peony_cache::try_reuse(&args.output, &inputs, args_hash).context("incremental cache")?
     {
         tracing::info!(output = %args.output.display(), "incremental: inputs unchanged, reused cached output");
         return Ok(());
@@ -636,7 +640,8 @@ fn main() -> Result<()> {
 
     if args.incremental {
         let sections = section_records(&args.output, &layout).unwrap_or_default();
-        peony_cache::record_link_with_sections(&args.output, &inputs, &sections, &[])
+        let args_hash = peony_cache::hash_args(&args.raw_args);
+        peony_cache::record_link_with_sections(&args.output, &inputs, args_hash, &sections, &[])
             .context("incremental cache record")?;
     }
 

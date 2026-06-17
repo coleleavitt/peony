@@ -104,16 +104,19 @@ Definition uses_P_workers (P : nat) (workers : list workload) : Prop :=
     preserved (Σ buckets = Σ w), not that each bucket is literally a sub-multiset
     of w. The lower bounds S1/S2 hold for ANY work-conserving schedule, which is
     the weaker hypothesis (a real task partition is a special case). [respects_tasks]
-    is the stronger validity predicate used where we need per-task bounds (S1 via
-    [respects_tasks_caps_makespan] below); it is the formal statement that a
-    schedule only places real tasks. *)
+    is the stronger validity predicate — the formal statement that a schedule
+    only places real tasks (each ≤ span w). It is NOT a hypothesis of S1 (which
+    is proved more generally, from `In t bucket` directly); rather,
+    [respects_tasks_caps_makespan] below records, as a standalone fact, that a
+    task-respecting schedule's tasks are all ≤ span, which is what makes the
+    general S1 floor meaningful for genuine task partitions. *)
 Definition respects_tasks (w : workload) (workers : list workload) : Prop :=
   Forall (fun bucket => Forall (fun t => t <= span w) bucket) workers.
 
-(** A task-respecting schedule never places a task larger than the global span —
-    this is the partition-validity fact that makes the span lower bound (S1)
-    bind: every scheduled task is ≤ span, and (S1) shows span ≤ makespan, so the
-    span is genuinely a floor for valid schedules. *)
+(** A task-respecting schedule never places a task larger than the global span.
+    This is a standalone partition-validity fact (S1 itself does not depend on
+    it): combined with S1 (span ≤ makespan) it confirms the span is a genuine
+    floor for any schedule that only places real tasks. *)
 Lemma respects_tasks_caps_makespan :
   forall w workers bucket t,
     respects_tasks w workers ->

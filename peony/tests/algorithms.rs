@@ -321,7 +321,7 @@ fn red_green_all_green_when_nothing_changes() {
         },
     ];
 
-    record_link_with_sections(&fake_output, &[], &sections, &[]).unwrap();
+    record_link_with_sections(&fake_output, &[], 0, &sections, &[]).unwrap();
 
     // Same fingerprints, no moved symbols → all green.
     use peony_cache::RelocReverseIndex;
@@ -370,7 +370,7 @@ fn red_green_changed_section_is_red() {
         capacity: 0x140,
         virtual_address: 0x401000,
     }];
-    record_link_with_sections(&fake_output, &[], &sections, &[]).unwrap();
+    record_link_with_sections(&fake_output, &[], 0, &sections, &[]).unwrap();
 
     // Different fingerprint → Red.
     use peony_cache::RelocReverseIndex;
@@ -506,5 +506,43 @@ fn incremental_cache_invalidates_on_input_change() {
         fs::read(&out).unwrap(),
         b_after,
         "no-change relink after invalidation must be byte-identical"
+    );
+}
+
+/// Incremental cache must invalidate when OUTPUT-AFFECTING FLAGS change, even
+/// with identical inputs. A relink of the same `.o` with a different flag
+/// (`--build-id`) must NOT reuse the stale binary — the epoch key folds the args
+/// hash, so the gate recomputes and rejects it. Without this, a `-pie`→`-shared`
+/// relink would silently serve the wrong output.
+#[test]
+fn incremental_cache_invalidates_on_flag_change() {
+    let dir = workdir("incr_flags");
+    let out = dir.join("incr.out");
+    let obj = assemble(
+        &dir,
+        "incr",
+        ".text\n.globl _start\n_start:\n    mov $60, %rax\n    mov $7, %rdi\n    syscall\n",
+    );
+
+    // Prime the cache WITHOUT --build-id.
+    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    let no_build_id = fs::read(&out).unwrap();
+
+    // Relink the SAME input WITH --build-id (an output-affecting flag). The cache
+    // must NOT reuse: the output must now contain a build-id note and differ.
+    link(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", "--build-id"],
+    );
+    let with_build_id = fs::read(&out).unwrap();
+    assert_ne!(
+        no_build_id, with_build_id,
+        "a flag change (--build-id) must invalidate the incremental cache, not reuse the stale binary"
+    );
+    assert_eq!(
+        run(&out),
+        7,
+        "the re-linked binary must still run correctly"
     );
 }

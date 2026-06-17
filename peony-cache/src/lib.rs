@@ -50,7 +50,7 @@ pub enum CacheError {
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 /// Bump when the manifest format changes incompatibly.
-pub const CACHE_VERSION: u32 = 3;
+pub const CACHE_VERSION: u32 = 4;
 
 /// Sentinel for "no next entry" in the relocation reverse index.
 pub const NO_ENTRY: u32 = u32::MAX;
@@ -98,7 +98,12 @@ impl Fingerprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FastFingerprint {
     pub len: u64,
-    pub mtime_ns: u64,
+    /// mtime seconds + nanoseconds kept SEPARATE. Folding them into one u64
+    /// (`sec*1e9 + nsec`) wraps for large/negative seconds and is non-injective —
+    /// distinct timestamps could collapse to one value and falsely report
+    /// "unchanged". Two fields compared with derived `Eq` are exact.
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
     pub inode: u64,
 }
 
@@ -111,10 +116,8 @@ impl FastFingerprint {
         })?;
         Ok(FastFingerprint {
             len: m.len(),
-            // nanosecond mtime; falls back to 0 if the platform lacks it.
-            mtime_ns: (m.mtime() as u64)
-                .wrapping_mul(1_000_000_000)
-                .wrapping_add(m.mtime_nsec() as u64),
+            mtime_sec: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
             inode: m.ino(),
         })
     }
@@ -334,7 +337,13 @@ fn manifest_path(output: &Path) -> PathBuf {
 ///
 /// Fast path: compare the epoch key. If it matches, skip reading any input file.
 /// Slow path: verify each input fingerprint and the output fingerprint.
-pub fn try_reuse(output: &Path, inputs: &[PathBuf]) -> Result<bool> {
+/// Decide whether the cached output can be reused unchanged. `args_hash` is the
+/// hash of the output-affecting command-line arguments (from [`hash_args`]): a
+/// relink of the SAME inputs with DIFFERENT flags (e.g. `-pie` → `-shared`) must
+/// NOT reuse the stale binary, so the recorded epoch key (which folds the args
+/// hash) is recomputed and compared. Without this check a flag change would
+/// silently serve the wrong output.
+pub fn try_reuse(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<bool> {
     let path = manifest_path(output);
     if !path.exists() || !output.exists() {
         return Ok(false);
@@ -349,6 +358,13 @@ pub fn try_reuse(output: &Path, inputs: &[PathBuf]) -> Result<bool> {
             Err(_) => return Ok(false),
         };
     if manifest.version != CACHE_VERSION {
+        return Ok(false);
+    }
+
+    // Output-affecting flags must match: the epoch key folds the args hash, so a
+    // relink with different flags (same inputs) has a different epoch key and
+    // must fall through to a full link rather than reuse the stale binary.
+    if manifest.epoch_key != compute_epoch_key(inputs, args_hash) {
         return Ok(false);
     }
 
@@ -375,9 +391,11 @@ pub fn try_reuse(output: &Path, inputs: &[PathBuf]) -> Result<bool> {
     }
 }
 
-/// Record fingerprints after a successful full link.
-pub fn record_link(output: &Path, inputs: &[PathBuf]) -> Result<()> {
-    record_link_with_sections(output, inputs, &[], &[])
+/// Record fingerprints after a successful full link. `args_hash` is the hash of
+/// the output-affecting flags ([`hash_args`]); it is folded into the stored
+/// epoch key so [`try_reuse`] can reject a relink with changed flags.
+pub fn record_link(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<()> {
+    record_link_with_sections(output, inputs, args_hash, &[], &[])
 }
 
 /// Record fingerprints + section records + symbol cache after a successful link.
@@ -387,6 +405,7 @@ pub fn record_link(output: &Path, inputs: &[PathBuf]) -> Result<()> {
 pub fn record_link_with_sections(
     output: &Path,
     inputs: &[PathBuf],
+    args_hash: u64,
     sections: &[SectionRecord],
     symbols: &[CachedSymbolEntry],
 ) -> Result<()> {
@@ -420,7 +439,7 @@ pub fn record_link_with_sections(
         Fingerprint::of_file(output)?
     };
 
-    let epoch_key = compute_epoch_key(inputs, 0);
+    let epoch_key = compute_epoch_key(inputs, args_hash);
     let manifest = Manifest {
         version: CACHE_VERSION,
         epoch_key,
@@ -686,7 +705,7 @@ mod tests {
                 virtual_address: 0x2000,
             },
         ];
-        record_link_with_sections(&out, &[inp], &secs, &[]).unwrap();
+        record_link_with_sections(&out, &[inp], 0, &secs, &[]).unwrap();
 
         // Read the manifest back and confirm the records survived intact.
         let bytes = std::fs::read(manifest_path(&out)).unwrap();
