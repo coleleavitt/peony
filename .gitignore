@@ -15,3 +15,11 @@ jfc-transcript.md
 .lia.cache
 .jfc/
 .codegraph/
+
+# core dumps
+core
+core.*
+
+# benchmark corpora inputs (large, reproducible via bench/capture.sh) + generated results
+bench/corpora/*/inputs/
+bench/results/

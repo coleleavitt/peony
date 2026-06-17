@@ -124,6 +124,9 @@ pub struct SymbolResolution {
     pub common: Option<(u64, u64)>,
     /// Defined by a shared library (resolved at runtime via the GOT).
     pub import: bool,
+    /// This import is backed by executable-owned storage and an `R_X86_64_COPY`
+    /// relocation because the executable directly references DSO data.
+    pub copy_reloc: bool,
     /// Index assigned in `.dynsym` (for imports); 0 = unassigned.
     pub dynsym_index: u32,
     /// Virtual address assigned during layout (zero until `finalize_symbols`).
@@ -321,6 +324,7 @@ impl SymbolTable {
                     size: sym.size,
                     common: None,
                     import: false,
+                    copy_reloc: false,
                     dynsym_index: 0,
                     virtual_address: 0,
                     got_address: 0,
@@ -382,6 +386,7 @@ impl SymbolTable {
                         size,
                         common: Some((size, align)),
                         import: false,
+                        copy_reloc: false,
                         dynsym_index: 0,
                         virtual_address: 0,
                         got_address: 0,
@@ -409,6 +414,7 @@ impl SymbolTable {
             size: 0,
             common: None,
             import: false,
+            copy_reloc: false,
             dynsym_index: 0,
             virtual_address: 0,
             got_address: 0,
@@ -464,12 +470,53 @@ impl SymbolTable {
             let ver = versions.get(i).cloned().flatten();
             let r = self.resolutions.get_mut(name).unwrap();
             r.import = true;
+            r.copy_reloc = false;
             r.id = id;
             r.version = ver;
             r.soname = Some(soname.to_string());
             n += 1;
         }
         n
+    }
+
+    /// Mark undefined references satisfied by shared-library export records, also
+    /// preserving size/type metadata needed for `R_X86_64_COPY` decisions.
+    pub fn register_shared_export_symbols(
+        &mut self,
+        exports: &[peony_object::SharedExport],
+        soname: &str,
+    ) -> usize {
+        let mut n = 0;
+        for ex in exports {
+            let satisfy = matches!(
+                self.resolutions.get(&ex.name),
+                Some(r) if r.defined_in.is_none() && !r.import
+            );
+            if !satisfy {
+                continue;
+            }
+            let id = SymbolId(self.names.len() as u32);
+            self.names.push(ex.name.clone());
+            let r = self.resolutions.get_mut(&ex.name).unwrap();
+            r.import = true;
+            r.copy_reloc = false;
+            r.id = id;
+            r.version = ex.version.clone();
+            r.soname = Some(soname.to_string());
+            r.size = ex.size;
+            r.st_type = ex.st_type;
+            n += 1;
+        }
+        n
+    }
+
+    /// Mark an import as requiring an executable copy relocation.
+    pub fn mark_copy_reloc(&mut self, name: &[u8]) {
+        if let Some(r) = self.resolutions.get_mut(name) {
+            if r.import {
+                r.copy_reloc = true;
+            }
+        }
     }
 
     /// Whether any symbol is a dynamic import (→ a dynamic executable is needed).

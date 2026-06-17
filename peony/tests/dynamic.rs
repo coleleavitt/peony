@@ -26,6 +26,39 @@ fn dynamic_data_import() {
     assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
 }
 
+/// A direct reference to DSO data uses executable-owned copy storage plus
+/// `R_X86_64_COPY`, not a GOT `GLOB_DAT` import.
+#[test]
+fn dynamic_copy_relocation_for_direct_data_import() {
+    let dir = workdir("dyn_copy");
+    compile_shared(&dir, "copy", "int shared_value = 42;\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n movl shared_value(%rip), %edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(&exe, &[m], &["-L", dir_str, "-l", "copy"]);
+
+    let relocs = readelf(&exe, &["-rW"]);
+    assert!(
+        relocs.contains("R_X86_64_COPY") && relocs.contains("shared_value"),
+        "missing copy relocation:\n{relocs}"
+    );
+    let syms = readelf(&exe, &["-sW"]);
+    assert!(
+        syms.lines().any(|line| {
+            line.contains("shared_value")
+                && line.contains("OBJECT")
+                && line.contains("GLOBAL")
+                && !line.contains("UND")
+        }),
+        "copy symbol should be executable-defined:\n{syms}"
+    );
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
 /// Import a function from a shared library and call it through the GOT.
 #[test]
 fn dynamic_function_import() {
@@ -89,6 +122,55 @@ fn dynamic_plt_call() {
         "missing PLT tags: {d}"
     );
     assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+/// Shared objects keep GNU2 TLSDESC accesses and emit loader-filled descriptor
+/// relocations.
+#[test]
+fn shared_object_emits_tlsdesc_relocation() {
+    let dir = workdir("tlsdesc");
+    let o = assemble(
+        &dir,
+        "tlsdesc",
+        ".text\n.globl read_tls\nread_tls:\n leaq tls_value@TLSDESC(%rip), %rax\n call *tls_value@TLSCALL(%rax)\n movl (%rax), %eax\n ret\n.section .tdata,\"awT\",@progbits\ntls_value:\n .long 42\n",
+    );
+    let so = dir.join("libtlsdesc.so");
+    link(&so, &[o], &["-shared"]);
+
+    let relocs = readelf(&so, &["-rW"]);
+    assert!(
+        relocs.contains("R_X86_64_TLSDESC"),
+        "missing TLSDESC dynamic relocation:\n{relocs}"
+    );
+    assert!(
+        !relocs.contains("R_X86_64_GOTPC32_TLSDESC"),
+        "static TLSDESC relocation leaked into output:\n{relocs}"
+    );
+}
+
+/// Executables relax TLSDESC to local-exec code and do not carry descriptor
+/// relocations.
+#[test]
+fn executable_relaxes_tlsdesc_to_local_exec() {
+    let dir = workdir("tlsdesc_exe");
+    let o = assemble(
+        &dir,
+        "tlsdesc_exe",
+        ".text\n.globl _start\n_start:\n leaq tls_first@TLSDESC(%rip), %rax\n call *tls_first@TLSCALL(%rax)\n movl $60,%eax\n syscall\n.section .tdata,\"awT\",@progbits\ntls_first:\n .long 11\ntls_second:\n .long 22\n",
+    );
+    let exe = dir.join("a.out");
+    link(&exe, &[o], &[]);
+
+    let relocs = readelf(&exe, &["-rW"]);
+    assert!(
+        !relocs.contains("R_X86_64_TLSDESC"),
+        "executable should not keep TLSDESC relocations:\n{relocs}"
+    );
+    let disasm = objdump(&exe, &["-dr"]);
+    assert!(
+        disasm.contains("mov    $0xfffffffffffffff8,%rax") && disasm.contains("xchg   %ax,%ax"),
+        "TLSDESC sequence was not relaxed like GNU ld:\n{disasm}"
+    );
 }
 
 /// A dynamic executable peony produces runs identically to one from GNU `ld`.

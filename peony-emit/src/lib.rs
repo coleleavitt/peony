@@ -319,8 +319,18 @@ fn write_headers(buf: &mut [u8], layout: &Layout) {
     e[54..56].copy_from_slice(&(elf::PHDR_SIZE as u16).to_le_bytes());
     e[56..58].copy_from_slice(&(layout.phnum as u16).to_le_bytes());
     e[58..60].copy_from_slice(&(elf::SHDR_SIZE as u16).to_le_bytes());
-    e[60..62].copy_from_slice(&(layout.shnum as u16).to_le_bytes());
-    e[62..64].copy_from_slice(&(layout.shstrndx as u16).to_le_bytes());
+    let e_shnum = if layout.shnum >= elf::SHN_LORESERVE as u64 {
+        0
+    } else {
+        layout.shnum as u16
+    };
+    let e_shstrndx = if layout.shstrndx >= elf::SHN_LORESERVE as u64 {
+        elf::SHN_XINDEX
+    } else {
+        layout.shstrndx as u16
+    };
+    e[60..62].copy_from_slice(&e_shnum.to_le_bytes());
+    e[62..64].copy_from_slice(&e_shstrndx.to_le_bytes());
 
     // Program headers.
     let phoff = layout.phoff as usize;
@@ -423,6 +433,7 @@ fn write_section_data_parallel(
                 }
             }
             SecSource::SymTab => write_symtab(buf, symbols, layout, sec.sh_offset),
+            SecSource::SymTabShndx => write_bytes(buf, sec.sh_offset, &layout.symtab_shndx),
             SecSource::StrTab => write_bytes(buf, sec.sh_offset, &layout.strtab),
             SecSource::ShStrTab => write_bytes(buf, sec.sh_offset, &layout.shstrtab),
             SecSource::NoteBuildId => write_build_id(buf, objects, sec.sh_offset),
@@ -442,6 +453,11 @@ fn write_section_data_parallel(
             SecSource::Plt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.plt),
             SecSource::GotPlt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.got_plt),
             SecSource::RelaPlt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.rela_plt),
+            SecSource::RelaEmit(idx) => {
+                if let Some(bytes) = layout.emit_relocs.get(idx) {
+                    write_bytes(buf, sec.sh_offset, bytes);
+                }
+            }
         }
     }
 
@@ -493,6 +509,25 @@ fn dispatch_parallel(
     output_path: &Path,
 ) -> Result<()> {
     if work_items.is_empty() {
+        return Ok(());
+    }
+
+    // Small links (the common `cc`/incremental case) finish faster serially:
+    // the work is a handful of section copies, and spinning up a worker scope
+    // costs far more in `futex`/`sched_yield`/mutex churn than the copies save.
+    // Profiling a hello-world link showed ~74% of syscall time in futex+yield
+    // from the parallel scaffolding alone. Stay serial below this threshold.
+    const PARALLEL_THRESHOLD: usize = 64;
+    if work_items.len() < PARALLEL_THRESHOLD {
+        let error_slot = std::sync::Mutex::new(None);
+        let ctx_ref = &ctx;
+        for item in work_items {
+            process_item(item, objects, buf_ptr, buf_len, ctx_ref, &error_slot);
+            if let Some(e) = error_slot.lock().unwrap().take() {
+                tracing::error!(output = %output_path.display(), %e, "relocation error");
+                return Err(EmitError::Reloc(e));
+            }
+        }
         return Ok(());
     }
 
@@ -685,7 +720,12 @@ fn write_symtab(buf: &mut [u8], symbols: &SymbolTable, layout: &Layout, base_off
         s[0..4].copy_from_slice(&ent.name_off.to_le_bytes());
         s[4] = ent.info;
         s[5] = elf::STV_DEFAULT;
-        s[6..8].copy_from_slice(&ent.shndx.to_le_bytes());
+        let shndx = if ent.shndx >= elf::SHN_LORESERVE as u32 {
+            elf::SHN_XINDEX
+        } else {
+            ent.shndx as u16
+        };
+        s[6..8].copy_from_slice(&shndx.to_le_bytes());
         s[8..16].copy_from_slice(&value.to_le_bytes());
         s[16..24].copy_from_slice(&size.to_le_bytes());
     }
@@ -703,7 +743,17 @@ fn write_bytes(buf: &mut [u8], off: u64, data: &[u8]) {
 
 fn write_section_headers(buf: &mut [u8], layout: &Layout) {
     let shoff = layout.shoff as usize;
-    // Index 0: the null section header (already zeroed by truncation).
+    // Index 0: the null section header. For oversized section tables, ELF stores
+    // the true section count in sh_size and the true shstrndx in sh_link.
+    if shoff + 64 <= buf.len() {
+        let null = &mut buf[shoff..shoff + 64];
+        if layout.shnum >= elf::SHN_LORESERVE as u64 {
+            null[32..40].copy_from_slice(&layout.shnum.to_le_bytes());
+        }
+        if layout.shstrndx >= elf::SHN_LORESERVE as u64 {
+            null[40..44].copy_from_slice(&(layout.shstrndx as u32).to_le_bytes());
+        }
+    }
     for sec in &layout.output_sections {
         let o = shoff + (sec.shndx as usize) * elf::SHDR_SIZE as usize;
         if o + 64 > buf.len() {

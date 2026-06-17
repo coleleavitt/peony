@@ -73,6 +73,9 @@ pub mod r_x86_64 {
     pub const GOTPC32: u32 = 26;
     pub const SIZE32: u32 = 32;
     pub const SIZE64: u32 = 33;
+    pub const GOTPC32_TLSDESC: u32 = 34;
+    pub const TLSDESC_CALL: u32 = 35;
+    pub const TLSDESC: u32 = 36;
     pub const GOTPCRELX: u32 = 41;
     pub const REX_GOTPCRELX: u32 = 42;
 }
@@ -88,6 +91,9 @@ fn is_tls(r_type: u32) -> bool {
             | r_x86_64::TLSGD
             | r_x86_64::TLSLD
             | r_x86_64::GOTTPOFF
+            | r_x86_64::GOTPC32_TLSDESC
+            | r_x86_64::TLSDESC_CALL
+            | r_x86_64::TLSDESC
     )
 }
 
@@ -96,6 +102,24 @@ fn needs_got(r_type: u32) -> bool {
     matches!(
         r_type,
         r_x86_64::GOT32 | r_x86_64::GOTPCREL | r_x86_64::GOTPCRELX | r_x86_64::REX_GOTPCRELX
+    )
+}
+
+/// True for relocation types that directly encode an imported symbol's address
+/// into executable-owned storage/code. Imported data with these relocations needs
+/// a copy relocation; GOT/PLT/TLS/SIZE relocs have their own mechanisms.
+fn may_need_copy_reloc(r_type: u32) -> bool {
+    matches!(
+        r_type,
+        r_x86_64::R64
+            | r_x86_64::PC64
+            | r_x86_64::R32
+            | r_x86_64::R32S
+            | r_x86_64::PC32
+            | r_x86_64::R16
+            | r_x86_64::PC16
+            | r_x86_64::R8
+            | r_x86_64::PC8
     )
 }
 
@@ -114,6 +138,8 @@ pub enum SyntheticSlot {
     TlsIe(TlsRef),
     /// The module's single Local-Dynamic (LDM) TLS GOT pair (DTPMOD64 + 0).
     TlsLdm,
+    /// TLSDESC GOT pair for GNU2 TLS descriptors in a shared object.
+    TlsDesc(TlsRef),
 }
 
 /// Result of the relocation scan: the GOT/PLT slots required, in stable order.
@@ -188,6 +214,17 @@ impl RelocScanResult {
             .iter()
             .any(|s| matches!(s, SyntheticSlot::TlsLdm))
     }
+
+    /// TLS refs needing TLSDESC GOT pairs, in slot order.
+    pub fn tls_desc_refs(&self) -> Vec<TlsRef> {
+        self.slots
+            .iter()
+            .filter_map(|s| match s {
+                SyntheticSlot::TlsDesc(r) => Some(*r),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl Default for RelocScanResult {
@@ -225,6 +262,89 @@ pub fn assign_weak_got_ids(objects: &[InputObject], symbols: &mut SymbolTable) {
     }
 }
 
+/// Imported DSO data symbols that need executable-owned storage plus
+/// `R_X86_64_COPY` because an allocated input section directly references them.
+pub fn copy_reloc_symbols(objects: &[InputObject], symbols: &SymbolTable) -> Vec<SymbolId> {
+    let mut out = FxHashMap::<SymbolId, Vec<u8>>::default();
+    for obj in objects {
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            // A COPY reloc is only needed when the reference lives in a section
+            // the loader CANNOT relocate at runtime — i.e. a read-only allocated
+            // section (`.text`, `.rodata`). A reference from a WRITABLE section
+            // (`.data`, `.data.rel.*`) is resolved by a symbolic dynamic
+            // relocation instead (see `collect_symbolic_data_relocs`); making it
+            // a COPY would wrongly duplicate the DSO object (e.g. a C++ typeinfo),
+            // breaking address-identity comparisons during exception unwinding.
+            if sec.flags & peony_object::elf::SHF_WRITE != 0 {
+                continue;
+            }
+            for reloc in &sec.relocs {
+                if !may_need_copy_reloc(reloc.r_type) {
+                    continue;
+                }
+                let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                else {
+                    continue;
+                };
+                if sym.binding == Binding::Local {
+                    continue;
+                }
+                // Never emit COPY relocs for C++ vtables (`_ZTV*`), VTT
+                // (`_ZTT*`), or typeinfo-name (`_ZTS*`) symbols. Vtables are
+                // referenced indirectly (GOT/relative) — copying them into the
+                // executable would create a duplicate that breaks the program-
+                // wide identity those objects rely on.
+                //
+                // Note: typeinfo objects (`_ZTI*`) are deliberately NOT skipped.
+                // When `.text` takes a PC-relative reference to a DSO typeinfo
+                // object (`R_X86_64_PC32`), a COPY reloc is the only ABI-correct
+                // resolution (it binds the executable and the DSO to one copy),
+                // matching what mold/bfd/gold emit. Skipping it would leave the
+                // reference resolving to address 0.
+                if sym.name.starts_with(b"_ZTV")
+                    || sym.name.starts_with(b"_ZTT")
+                    || sym.name.starts_with(b"_ZTS")
+                {
+                    continue;
+                }
+                let Some(res) = symbols.lookup(&sym.name) else {
+                    continue;
+                };
+                if !res.import {
+                    continue;
+                }
+                // Protected/hidden definitions cannot be preempted by a COPY
+                // reloc in the executable, so they are never copy-reloc eligible.
+                if res.visibility == peony_object::elf::STV_HIDDEN
+                    || res.visibility == peony_object::elf::STV_PROTECTED
+                {
+                    continue;
+                }
+                // COPY relocations are for DSO data objects. Avoid turning direct
+                // function calls into copy relocations if an assembler emitted PC32.
+                if res.st_type == peony_object::elf::STT_FUNC
+                    || res.st_type == peony_object::elf::STT_GNU_IFUNC
+                    || res.st_type == peony_object::elf::STT_TLS
+                {
+                    continue;
+                }
+                if res.size == 0 && res.st_type != peony_object::elf::STT_OBJECT {
+                    continue;
+                }
+                out.entry(res.id).or_insert_with(|| sym.name.clone());
+            }
+        }
+    }
+    let mut out: Vec<(SymbolId, Vec<u8>)> = out.into_iter().collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.into_iter().map(|(id, _)| id).collect()
+}
+
 // ── Scan phase (parallel) ────────────────────────────────────────────────────
 
 /// Scan all relocations to determine the required GOT and PLT slots. `shared`
@@ -235,11 +355,23 @@ pub fn scan_relocations(
     symbols: &SymbolTable,
     shared: bool,
 ) -> RelocScanResult {
-    let per_object: Vec<Vec<SyntheticSlot>> = objects
-        .par_iter()
-        .enumerate()
-        .map(|(obj_id, obj)| scan_object(obj, obj_id, symbols, shared))
-        .collect();
+    // Small links scan faster serially: spinning up rayon's global pool for a
+    // few objects costs more in thread management (`sched_yield`/`futex`) than
+    // the scan itself. Fan out only once there are enough objects to amortize.
+    const PARALLEL_SCAN_THRESHOLD: usize = 16;
+    let per_object: Vec<Vec<SyntheticSlot>> = if objects.len() >= PARALLEL_SCAN_THRESHOLD {
+        objects
+            .par_iter()
+            .enumerate()
+            .map(|(obj_id, obj)| scan_object(obj, obj_id, symbols, shared))
+            .collect()
+    } else {
+        objects
+            .iter()
+            .enumerate()
+            .map(|(obj_id, obj)| scan_object(obj, obj_id, symbols, shared))
+            .collect()
+    };
 
     let mut result = RelocScanResult::new();
     for slots in per_object {
@@ -292,6 +424,10 @@ fn scan_object(
                     r_x86_64::TLSLD => slots.push(SyntheticSlot::TlsLdm),
                     _ => unreachable!(),
                 }
+                continue;
+            }
+            if shared && reloc.r_type == r_x86_64::GOTPC32_TLSDESC {
+                slots.push(SyntheticSlot::TlsDesc(tls_ref(sym)));
                 continue;
             }
 
@@ -350,7 +486,7 @@ pub fn count_relative(objects: &[InputObject], symbols: &SymbolTable) -> usize {
                 } else {
                     symbols
                         .lookup(&sym.name)
-                        .is_some_and(|r| r.is_defined() && !r.import)
+                        .is_some_and(|r| r.is_defined() && (!r.import || r.copy_reloc))
                 };
                 if counts {
                     n += 1;
@@ -359,6 +495,93 @@ pub fn count_relative(objects: &[InputObject], symbols: &SymbolTable) -> usize {
         }
     }
     n
+}
+
+/// Count the symbolic `R_X86_64_64` dynamic relocations needed for `R64` sites
+/// in allocated, writable data that reference an *imported* symbol (one defined
+/// only in a shared library, with no COPY reloc of its own). The loader writes
+/// `*site = sym_address + addend`. These are exactly the R64 sites that
+/// [`count_relative`]/[`collect_dynamic_data_relocs`] deliberately skip (they
+/// only handle in-image targets). gcc emits these for `.data.rel.local.DW.ref.*`
+/// EH "personality / typeinfo reference" slots. Used to size `.rela.dyn` before
+/// layout, so it must agree with [`collect_symbolic_data_relocs`].
+pub fn count_symbolic_data_relocs(objects: &[InputObject], symbols: &SymbolTable) -> usize {
+    let mut n = 0;
+    for obj in objects {
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            for reloc in &sec.relocs {
+                if reloc.r_type != r_x86_64::R64 {
+                    continue;
+                }
+                let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                else {
+                    continue;
+                };
+                if sym.binding == Binding::Local {
+                    continue;
+                }
+                // Imported (DSO-defined) symbol with no copy reloc → needs a
+                // symbolic R64; an in-image / copy-reloc target is RELATIVE.
+                if symbols
+                    .lookup(&sym.name)
+                    .is_some_and(|r| r.import && !r.copy_reloc)
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Collect the symbolic `R_X86_64_64` dynamic relocations (see
+/// [`count_symbolic_data_relocs`]). Returns `(site_vaddr, dynsym_index, addend)`
+/// for each `R64` site referencing an imported symbol. Must run after layout so
+/// section VAs and `dynsym_index` are final.
+pub fn collect_symbolic_data_relocs(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+) -> Vec<(u64, u32, i64)> {
+    let mut out = Vec::new();
+    for (obj_id, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            for reloc in &sec.relocs {
+                if reloc.r_type != r_x86_64::R64 {
+                    continue;
+                }
+                let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                else {
+                    continue;
+                };
+                if sym.binding == Binding::Local {
+                    continue;
+                }
+                let Some(res) = symbols.lookup(&sym.name) else {
+                    continue;
+                };
+                if !res.import || res.copy_reloc || res.dynsym_index == 0 {
+                    continue;
+                }
+                let Some(site_va) = layout.address_of(obj_id, sec.index.0) else {
+                    continue;
+                };
+                out.push((site_va + reloc.offset, res.dynsym_index, reloc.addend));
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 // ── Dynamic-base (RELATIVE) relocation collection ────────────────────────────
@@ -417,8 +640,12 @@ pub fn collect_dynamic_data_relocs(
                     }
                 } else {
                     match symbols.lookup(&sym.name) {
-                        // Imports are handled by GLOB_DAT, not RELATIVE.
-                        Some(r) if r.is_defined() && !r.import => (r.virtual_address, r.is_ifunc),
+                        // Normal imports are handled by GLOB_DAT, not RELATIVE.
+                        // COPY imports have executable-owned storage and therefore
+                        // behave like output-defined data for base-bias purposes.
+                        Some(r) if r.is_defined() && (!r.import || r.copy_reloc) => {
+                            (r.virtual_address, r.is_ifunc)
+                        }
                         _ => continue,
                     }
                 };
@@ -452,7 +679,7 @@ pub fn collect_dynamic_data_relocs(
         let Some(res) = symbols.lookup(name) else {
             continue;
         };
-        if res.import || !res.is_defined() {
+        if (res.import && !res.copy_reloc) || !res.is_defined() {
             continue;
         }
         let site = layout.got_base + (i as u64) * 8;
@@ -547,6 +774,21 @@ pub fn collect_tls_got(
                 c.static_writes.push((pair + 8, offset));
             }
         }
+        // TLSDESC pairs: one dynamic relocation fills the two-word descriptor.
+        for tref in &tls.desc {
+            let Some(&pair) = layout.tls_desc_addr.get(tref) else {
+                continue;
+            };
+            let (offset, imported) =
+                tls_ref_offset(*tref, objects, symbols, layout).unwrap_or((0, true));
+            let dynidx = if imported {
+                tls_ref_dynidx(*tref, symbols)
+            } else {
+                0
+            };
+            let addend = if imported { 0 } else { offset as i64 };
+            c.relocs.push((pair, r_x86_64::TLSDESC, dynidx, addend));
+        }
         // Module Local-Dynamic pair: slot0 = DTPMOD64, slot1 = 0 (static).
         if let Some(ldm) = layout.tls_ldm_addr {
             c.relocs.push((ldm, r_x86_64::DTPMOD64, 0, 0));
@@ -592,7 +834,7 @@ fn tls_ref_dynidx(tref: TlsRef, symbols: &SymbolTable) -> u32 {
 
 /// Count the TLS dynamic relocations a shared object's TLS GOT will need, to
 /// size `.rela.dyn` before layout. Each GD pair contributes 1 (local) or 2
-/// (imported), the LDM pair 1, each IE slot 1.
+/// (imported), each TLSDESC pair 1, the LDM pair 1, each IE slot 1.
 pub fn count_tls_relocs(
     objects: &[InputObject],
     symbols: &SymbolTable,
@@ -610,9 +852,10 @@ pub fn count_tls_relocs(
     };
     let _ = objects;
     let gd: usize = tls.gd.iter().map(|t| if imported(t) { 2 } else { 1 }).sum();
+    let desc = tls.desc.len();
     let ie = tls.ie.len();
     let ldm = usize::from(tls.ldm);
-    gd + ie + ldm
+    gd + desc + ie + ldm
 }
 
 /// Count GOT slots that will need an `R_X86_64_RELATIVE` (defined non-import
@@ -627,7 +870,7 @@ pub fn count_got_relative(got_syms: &[SymbolId], symbols: &SymbolTable) -> usize
             symbols
                 .name_by_id(**id)
                 .and_then(|n| symbols.lookup(n))
-                .is_some_and(|r| !r.import && r.is_defined())
+                .is_some_and(|r| (!r.import || r.copy_reloc) && r.is_defined())
         })
         .count()
 }
@@ -709,10 +952,11 @@ struct RelocAddrs {
     tls: u64,      // symbol's offset within the static TLS block
     tls_size: u64, // total static TLS block size
     offset: usize,
-    shared: bool, // producing a shared object (GD/LD/IE TLS, no LE relax)
-    tls_gd: u64,  // GD GOT pair base VA for this symbol (shared); 0 if none
-    tls_ie: u64,  // IE GOT slot VA for this symbol (shared); 0 if none
-    tls_ldm: u64, // module LDM GOT pair base VA (shared); 0 if none
+    shared: bool,  // producing a shared object (GD/LD/IE TLS, no LE relax)
+    tls_gd: u64,   // GD GOT pair base VA for this symbol (shared); 0 if none
+    tls_ie: u64,   // IE GOT slot VA for this symbol (shared); 0 if none
+    tls_desc: u64, // TLSDESC GOT pair base VA for this symbol (shared); 0 if none
+    tls_ldm: u64,  // module LDM GOT pair base VA (shared); 0 if none
 }
 
 /// Apply a single relocation, patching `buf` (the relocated section's bytes).
@@ -799,7 +1043,7 @@ pub fn apply_reloc(
     // TLS GOT addresses for this reference, keyed by `TlsRef` exactly as the
     // scan allocated them. IE (GOTTPOFF) slots exist in BOTH exe and shared
     // outputs; GD/LDM pairs only in a shared object.
-    let (tls_gd, tls_ie) = {
+    let (tls_gd, tls_ie, tls_desc) = {
         let sym_pos = obj.symbol_map.get(&reloc.symbol.0).copied();
         let tref = match sym_pos {
             Some(pos) if sym.binding == Binding::Local => Some(TlsRef::Local(obj_id, pos)),
@@ -815,7 +1059,10 @@ pub fn apply_reloc(
         let ie = tref
             .and_then(|t| ctx.layout.tls_ie_addr.get(&t).copied())
             .unwrap_or(0);
-        (gd, ie)
+        let desc = tref
+            .and_then(|t| ctx.layout.tls_desc_addr.get(&t).copied())
+            .unwrap_or(0);
+        (gd, ie, desc)
     };
 
     let addrs = RelocAddrs {
@@ -832,6 +1079,7 @@ pub fn apply_reloc(
         shared: ctx.shared,
         tls_gd,
         tls_ie,
+        tls_desc,
         tls_ldm: ctx.layout.tls_ldm_addr.unwrap_or(0),
     };
 
@@ -1003,9 +1251,14 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
             //   48 8d 80 <tpoff32>           lea x@tpoff(%rax),%rax
             let start = off.wrapping_sub(4);
             if start + 16 <= buf.len() {
+                // R_X86_64_TLSGD is encoded as a PC-relative LEA displacement,
+                // so assemblers commonly give it addend -4. The relaxed LE
+                // immediate is no longer PC-relative; compensate for that
+                // displacement addend just like lld's relaxTlsGdToLe.
                 let le_off = (a.tls as i64)
                     .wrapping_add(a.a)
-                    .wrapping_sub(a.tls_size as i64) as i32;
+                    .wrapping_sub(a.tls_size as i64)
+                    .wrapping_add(4) as i32;
                 tracing::trace!(
                     off,
                     start,
@@ -1106,6 +1359,73 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
             );
             write_i32(buf, off, v, r_type, object, off as u64)?
         }
+        GOTPC32_TLSDESC if a.shared => {
+            let v = (a.tls_desc as i64).wrapping_add(a.a).wrapping_sub(p);
+            tracing::trace!(
+                off,
+                tlsdesc_pair = format_args!("{:#x}", a.tls_desc),
+                disp = v,
+                "GOTPC32_TLSDESC (shared, kept)"
+            );
+            write_i32(buf, off, v, r_type, object, off as u64)?
+        }
+        GOTPC32_TLSDESC => {
+            // TLSDESC→LE relaxation for executables. The canonical input is:
+            //   48 8d 05 <disp32>    lea x@tlsdesc(%rip),%rax
+            //   ff 10                call *x@tlscall(%rax)
+            // GNU ld rewrites the 9-byte pair to:
+            //   48 c7 c0 <tpoff32>   mov $x@tpoff,%rax
+            //   66 90                xchg %ax,%ax
+            // The reloc points at <disp32>, so the LEA starts at off-3.
+            let start = off.wrapping_sub(3);
+            if start + 7 <= buf.len() {
+                let le_off = (a.tls as i64)
+                    .wrapping_add(a.a)
+                    .wrapping_add(4)
+                    .wrapping_sub(a.tls_size as i64);
+                tracing::trace!(
+                    off,
+                    start,
+                    orig = format_args!("{:02x?}", &buf[start..start + 7]),
+                    tls_block_off = a.tls,
+                    tls_size = a.tls_size,
+                    le_off,
+                    "TLSDESC→LE relaxation"
+                );
+                if buf[start] != 0x48 || buf[start + 1] != 0x8d {
+                    tracing::warn!(
+                        start,
+                        got = format_args!("{:02x?}", &buf[start..start + 3]),
+                        "TLSDESC: unexpected prologue, skipping relaxation"
+                    );
+                } else {
+                    buf[start..start + 7].copy_from_slice(&[0x48, 0xc7, 0xc0, 0, 0, 0, 0]);
+                    write_i32(buf, off, le_off, r_type, object, off as u64)?;
+                }
+            } else {
+                tracing::warn!(
+                    off,
+                    buf_len = buf.len(),
+                    "TLSDESC relaxation skipped: out of bounds"
+                );
+            }
+        }
+        TLSDESC_CALL => {
+            // Marker relocation for `call *x@TLSCALL(%reg)`. Shared objects keep
+            // the call; executables pair this with GOTPC32_TLSDESC→LE and turn
+            // the two call bytes into GNU ld's canonical 2-byte NOP.
+            if !a.shared {
+                if off + 2 <= buf.len() {
+                    buf[off..off + 2].copy_from_slice(&[0x66, 0x90]);
+                } else {
+                    tracing::warn!(
+                        off,
+                        buf_len = buf.len(),
+                        "TLSDESC_CALL relaxation skipped: out of bounds"
+                    );
+                }
+            }
+        }
 
         R16 => write_u16(buf, off, s.wrapping_add(a.a), object, off as u64)?,
         PC16 => write_u16(
@@ -1192,5 +1512,94 @@ fn overflow(object: &str, offset: u64, value: i64, r_type: u32) -> RelocError {
         offset,
         value,
         r_type,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tlsgd_to_local_exec_compensates_pc_relative_addend() {
+        let mut buf = [
+            0x66, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0x66, 0x66, 0x48, 0xe8, 0, 0, 0, 0,
+        ];
+        let addrs = RelocAddrs {
+            s: 0,
+            a: -4,
+            p: 4,
+            g: 0,
+            l: 0,
+            z: 0,
+            got_base: 0,
+            tls: 0,
+            tls_size: 0x140,
+            offset: 4,
+            shared: false,
+            tls_gd: 0,
+            tls_ie: 0,
+            tls_desc: 0,
+            tls_ldm: 0,
+        };
+
+        patch_buf(&mut buf, r_x86_64::TLSGD, &addrs, "test.o").unwrap();
+
+        assert_eq!(
+            &buf[0..12],
+            &[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x8d, 0x80]
+        );
+        assert_eq!(i32::from_le_bytes(buf[12..16].try_into().unwrap()), -0x140);
+    }
+
+    #[test]
+    fn tlsdesc_to_local_exec_matches_gnu_ld_sequence() {
+        let mut buf = [
+            0x48, 0x8d, 0x05, 0, 0, 0, 0, // lea x@tlsdesc(%rip),%rax
+            0xff, 0x10, // call *x@tlscall(%rax)
+            0x90,
+        ];
+        let addrs = RelocAddrs {
+            s: 0,
+            a: -4,
+            p: 3,
+            g: 0,
+            l: 0,
+            z: 0,
+            got_base: 0,
+            tls: 4,
+            tls_size: 8,
+            offset: 3,
+            shared: false,
+            tls_gd: 0,
+            tls_ie: 0,
+            tls_desc: 0,
+            tls_ldm: 0,
+        };
+
+        let call_addrs = RelocAddrs {
+            s: 0,
+            a: 0,
+            p: 7,
+            g: 0,
+            l: 0,
+            z: 0,
+            got_base: 0,
+            tls: 4,
+            tls_size: 8,
+            offset: 7,
+            shared: false,
+            tls_gd: 0,
+            tls_ie: 0,
+            tls_desc: 0,
+            tls_ldm: 0,
+        };
+
+        patch_buf(&mut buf, r_x86_64::TLSDESC_CALL, &call_addrs, "test.o").unwrap();
+        patch_buf(&mut buf, r_x86_64::GOTPC32_TLSDESC, &addrs, "test.o").unwrap();
+
+        assert_eq!(&buf[0..3], &[0x48, 0xc7, 0xc0]);
+        assert_eq!(i32::from_le_bytes(buf[3..7].try_into().unwrap()), -4);
+        assert_eq!(&buf[7..9], &[0x66, 0x90]);
+        assert_eq!(buf[9], 0x90);
     }
 }

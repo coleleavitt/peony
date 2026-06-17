@@ -74,6 +74,8 @@ pub enum SecSource {
     Got,
     /// `.symtab` — built by emit from the symbol table + [`Layout::symtab`].
     SymTab,
+    /// `.symtab_shndx` — extended section indices for oversized `.symtab` entries.
+    SymTabShndx,
     /// `.strtab` — verbatim [`Layout::strtab`].
     StrTab,
     /// `.shstrtab` — verbatim [`Layout::shstrtab`].
@@ -99,6 +101,8 @@ pub enum SecSource {
     EhFrameHdr,
     /// `.gnu.hash` — GNU-style dynamic symbol hash table (DT_GNU_HASH).
     GnuHash,
+    /// A non-alloc output relocation section produced by `--emit-relocs`.
+    RelaEmit(usize),
 }
 
 /// Inputs needed to lay out a dynamic executable.
@@ -143,6 +147,14 @@ pub struct DynamicInfo {
     /// Number of TLS dynamic relocations (`R_X86_64_DTPMOD64`/`DTPOFF64`/
     /// `TPOFF64`) the shared-object TLS GOT region needs, to size `.rela.dyn`.
     pub n_tls_reloc: usize,
+    /// Imported DSO data symbols that require executable-owned copy storage and
+    /// `R_X86_64_COPY` dynamic relocations.
+    pub copy_relocs: Vec<SymbolId>,
+    /// Number of symbolic `R_X86_64_64` dynamic relocations to reserve in
+    /// `.rela.dyn` for `R64` data sites that reference an imported symbol (e.g.
+    /// gcc's `.data.rel.local.DW.ref.*` EH slots). Filled post-layout from
+    /// `peony_reloc::collect_symbolic_data_relocs`.
+    pub n_symbolic_data: usize,
 }
 
 /// One exported symbol of a shared object, destined for `.dynsym`.
@@ -175,18 +187,24 @@ pub struct TlsGotInfo {
     pub gd: Vec<TlsRef>,
     /// TLS refs needing an IE slot, in slot order.
     pub ie: Vec<TlsRef>,
+    /// TLS refs needing a TLSDESC pair, in slot order.
+    pub desc: Vec<TlsRef>,
     /// Whether a module-wide LDM pair is needed.
     pub ldm: bool,
 }
 
 impl TlsGotInfo {
-    /// Total bytes the TLS GOT region occupies (GD pairs + LDM pair + IE slots).
+    /// Total bytes the TLS GOT region occupies (GD pairs + TLSDESC pairs + LDM
+    /// pair + IE slots).
     pub fn byte_size(&self) -> u64 {
-        (self.gd.len() as u64) * 16 + if self.ldm { 16 } else { 0 } + (self.ie.len() as u64) * 8
+        (self.gd.len() as u64) * 16
+            + (self.desc.len() as u64) * 16
+            + if self.ldm { 16 } else { 0 }
+            + (self.ie.len() as u64) * 8
     }
 
     pub fn is_empty(&self) -> bool {
-        self.gd.is_empty() && self.ie.is_empty() && !self.ldm
+        self.gd.is_empty() && self.ie.is_empty() && self.desc.is_empty() && !self.ldm
     }
 }
 
@@ -210,6 +228,8 @@ pub struct DynBlobs {
     /// GLOB_DAT relocations, assembled into `rela_dyn` after the RELATIVE
     /// entries by `Layout::append_relative_relocs`.
     pub rela_glob_dat: Vec<u8>,
+    /// R_X86_64_COPY relocations for executable-owned copies of DSO data.
+    pub rela_copy: Vec<u8>,
     /// `.eh_frame_hdr` bytes, built post-layout by `Layout::build_eh_frame_hdr`.
     pub eh_frame_hdr: Vec<u8>,
     /// `.gnu.hash` GNU-style dynamic symbol hash table.
@@ -251,16 +271,16 @@ pub struct ProgramHeader {
     pub p_align: u64,
 }
 
-/// A planned `.symtab` entry. For globals, `st_value`/`st_size` are resolved at
-/// emit time from the symbol table (after [`finalize_symbols`]); for locals they
-/// are precomputed here (`local`).
+/// A planned `.symtab` entry. Most globals resolve `st_value`/`st_size` at emit
+/// time from the symbol table (after [`finalize_symbols`]); locals and TLS
+/// entries are precomputed here because TLS `st_value` is module-relative.
 #[derive(Debug, Clone)]
 pub struct SymEntry {
     pub name: Vec<u8>,
     pub name_off: u32,
-    pub shndx: u16,
+    pub shndx: u32,
     pub info: u8,
-    /// `Some((value, size))` for a local symbol; `None` to look up by name.
+    /// `Some((value, size))` for a precomputed symbol; `None` to look up by name.
     pub local: Option<(u64, u64)>,
 }
 
@@ -284,6 +304,7 @@ pub struct Layout {
     pub strtab: Vec<u8>,
     pub shstrtab: Vec<u8>,
     pub symtab: Vec<SymEntry>,
+    pub symtab_shndx: Vec<u8>,
     // Addresses for linker-defined symbols.
     pub image_base: u64,
     pub bss_start: u64,
@@ -291,6 +312,8 @@ pub struct Layout {
     pub end: u64,
     /// Final virtual address of each common symbol (by id).
     pub common: Vec<(SymbolId, u64)>,
+    /// Final virtual address of each copy-relocation symbol (by id).
+    pub copy_relocs: Vec<(SymbolId, u64)>,
     /// Pre-built dynamic-section bytes (empty for a static link).
     pub dyn_blobs: DynBlobs,
     /// PLT stub symbols in slot order, and the `.plt` base address.
@@ -305,6 +328,8 @@ pub struct Layout {
     pub tls_gd_addr: FxHashMap<TlsRef, u64>,
     /// Initial-Exec TLS GOT slot VA per TLS ref (holds the TPOFF64).
     pub tls_ie_addr: FxHashMap<TlsRef, u64>,
+    /// TLSDESC GOT pair base VA per TLS ref.
+    pub tls_desc_addr: FxHashMap<TlsRef, u64>,
     /// Module Local-Dynamic (LDM) GOT pair base VA (slot0 = DTPMOD64), if any.
     pub tls_ldm_addr: Option<u64>,
     /// Producing a shared object: TLS uses GD/LD/IE (not Local-Exec relaxation).
@@ -314,6 +339,8 @@ pub struct Layout {
     /// at link time and written directly (not via a dynamic reloc). Applied by
     /// emit after the scalar GOT slots.
     pub tls_got_writes: Vec<(u64, u64)>,
+    /// Bytes for `SecSource::RelaEmit(i)` sections.
+    pub emit_relocs: Vec<Vec<u8>>,
 }
 
 impl Layout {
@@ -342,28 +369,32 @@ impl Layout {
     }
 
     pub fn append_dynamic_relocs(&mut self, relative: &[(u64, u64)], irelative: &[(u64, u64)]) {
-        self.append_all_dynamic_relocs(relative, irelative, &[]);
+        self.append_all_dynamic_relocs(relative, irelative, &[], &[]);
     }
 
     /// Assemble `.rela.dyn`: `R_X86_64_RELATIVE` entries first (covered by
     /// `DT_RELACOUNT`), then `R_X86_64_IRELATIVE` IFUNC entries, then TLS
     /// (`DTPMOD64`/`DTPOFF64`/`TPOFF64`) entries, then the stashed
-    /// `R_X86_64_GLOB_DAT` imports — with no type-0 gap anywhere (BFD/eu-elflint
-    /// reject `NONE` records). `irelative` is `(got_slot_va, resolver_va)`; `tls`
-    /// is `(site_va, r_type, dynsym_index, addend)`.
+    /// `R_X86_64_GLOB_DAT` and `R_X86_64_COPY` imports — with no type-0 gap
+    /// anywhere (BFD/eu-elflint reject `NONE` records). `irelative` is
+    /// `(got_slot_va, resolver_va)`; `tls` is `(site_va, r_type, dynsym_index,
+    /// addend)`.
     pub fn append_all_dynamic_relocs(
         &mut self,
         relative: &[(u64, u64)],
         irelative: &[(u64, u64)],
         tls: &[(u64, u32, u32, i64)],
+        symbolic: &[(u64, u32, i64)],
     ) {
         let cap = self.rela_dyn_section_size() as usize;
         let glob_len = self.dyn_blobs.rela_glob_dat.len();
+        let copy_len = self.dyn_blobs.rela_copy.len();
+        let suffix_len = glob_len + copy_len;
         let mut bytes = Vec::with_capacity(cap);
         let mut written = 0u64;
         for &(site, target) in relative {
-            if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
-                break; // never crowd out the IRELATIVE/TLS/GLOB_DAT suffixes
+            if bytes.len() + elf::RELA_SIZE as usize > cap - suffix_len {
+                break; // never crowd out the IRELATIVE/TLS/GLOB_DAT/COPY suffixes
             }
             let r_info = elf::R_X86_64_RELATIVE as u64; // symbol index 0
             bytes.extend_from_slice(&site.to_le_bytes());
@@ -374,7 +405,7 @@ impl Layout {
         // IRELATIVE: IFUNC GOT slots resolved by running the resolver at startup.
         let mut written_irel = 0usize;
         for &(site, resolver) in irelative {
-            if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
+            if bytes.len() + elf::RELA_SIZE as usize > cap - suffix_len {
                 break;
             }
             let r_info = elf::R_X86_64_IRELATIVE as u64; // symbol index 0
@@ -394,7 +425,7 @@ impl Layout {
         // TLS: DTPMOD64 / DTPOFF64 / TPOFF64 GOT-pair relocations (shared object).
         let mut written_tls = 0usize;
         for &(site, r_type, dynidx, addend) in tls {
-            if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
+            if bytes.len() + elf::RELA_SIZE as usize > cap - suffix_len {
                 break;
             }
             let r_info = ((dynidx as u64) << 32) | (r_type as u64);
@@ -411,8 +442,36 @@ impl Layout {
             );
             debug_assert_eq!(written_tls, tls.len(), "TLS dyn relocs dropped");
         }
+        // Symbolic R_X86_64_64: data sites referencing an imported symbol (e.g.
+        // gcc's `.data.rel.local.DW.ref.*` EH personality/typeinfo slots). The
+        // loader writes `*site = sym_address + addend`.
+        let mut written_sym = 0usize;
+        for &(site, dynidx, addend) in symbolic {
+            if bytes.len() + elf::RELA_SIZE as usize > cap - suffix_len {
+                break;
+            }
+            let r_info = ((dynidx as u64) << 32) | (elf::R_X86_64_64 as u64);
+            bytes.extend_from_slice(&site.to_le_bytes());
+            bytes.extend_from_slice(&r_info.to_le_bytes());
+            bytes.extend_from_slice(&addend.to_le_bytes());
+            written_sym += 1;
+        }
+        if written_sym != symbolic.len() {
+            tracing::error!(
+                wrote = written_sym,
+                wanted = symbolic.len(),
+                "BUG: .rela.dyn too small for all symbolic R64 entries"
+            );
+            debug_assert_eq!(
+                written_sym,
+                symbolic.len(),
+                "symbolic R64 dyn relocs dropped"
+            );
+        }
         let glob = std::mem::take(&mut self.dyn_blobs.rela_glob_dat);
         bytes.extend_from_slice(&glob);
+        let copy = std::mem::take(&mut self.dyn_blobs.rela_copy);
+        bytes.extend_from_slice(&copy);
         let actual_sz = bytes.len() as u64;
         self.dyn_blobs.rela_dyn = bytes;
         // Correct DT_RELACOUNT (leading relatives) and DT_RELASZ (actual bytes),
@@ -542,11 +601,17 @@ pub struct LayoutConfig {
     pub build_id: bool,
     /// Omit `.symtab`/`.strtab` from the output (`-s`).
     pub strip: bool,
+    /// Omit non-alloc debug sections from the output (`-S` or `-s`).
+    pub strip_debug: bool,
     /// Produce a position-independent executable (`ET_DYN`, base 0); the kernel
     /// applies a load bias, so only PC-relative code/data is valid.
     pub pie: bool,
     /// Produce a shared object (`ET_DYN`, no `PT_INTERP`, no entry requirement).
     pub shared: bool,
+    /// Emit non-alloc `.rela.*` sections for output sections.
+    pub emit_relocs: bool,
+    /// Optional placement hints parsed from GNU linker `SECTIONS` scripts.
+    pub script: Option<ScriptLayout>,
 }
 
 impl Default for LayoutConfig {
@@ -557,9 +622,41 @@ impl Default for LayoutConfig {
             entry_symbol: "_start".to_string(),
             build_id: false,
             strip: false,
+            strip_debug: false,
             pie: false,
             shared: false,
+            emit_relocs: false,
+            script: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScriptLayout {
+    pub output_sections: Vec<ScriptOutputSection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptOutputSection {
+    pub name: String,
+    pub patterns: Vec<String>,
+}
+
+impl ScriptLayout {
+    pub fn output_for_input(&self, input_name: &[u8]) -> Option<&str> {
+        let name = std::str::from_utf8(input_name).ok()?;
+        self.output_sections
+            .iter()
+            .find(|out| {
+                out.patterns
+                    .iter()
+                    .any(|pat| script_pattern_matches(pat, name))
+            })
+            .map(|out| out.name.as_str())
+    }
+
+    pub fn order_of(&self, name: &str) -> Option<usize> {
+        self.output_sections.iter().position(|out| out.name == name)
     }
 }
 
@@ -631,9 +728,17 @@ pub fn compute_layout(
     // For a shared object: (export name, byte offset of its `.dynsym` entry) so
     // its `st_value`/`st_shndx` can be patched once addresses are final.
     let mut export_patch: Vec<(Vec<u8>, usize)> = Vec::new();
+    // Copy-reloc imports are initially emitted with placeholder value/shndx, then
+    // patched to their executable-owned copy slot once layout is final.
+    let mut copy_patch: Vec<(SymbolId, usize)> = Vec::new();
     // `DT_SONAME` string offset in `.dynstr` (shared only).
     let mut soname_dt_off: Option<u32> = None;
     if let Some(dynj) = dynamic {
+        let copy_imports: FxHashSet<Vec<u8>> = dynj
+            .copy_relocs
+            .iter()
+            .filter_map(|id| symbols.name_by_id(*id).map(|n| n.to_vec()))
+            .collect();
         let mut dynstr = vec![0u8];
         let mut import_name_off = Vec::with_capacity(dynj.imports.len());
         for (i, name) in dynj.imports.iter().enumerate() {
@@ -653,11 +758,20 @@ pub fn compute_layout(
         // come before globals; imports are UND globals, exports are defined
         // globals — both are non-local, so `sh_info` = 1 (first global = index 1).
         let mut dynsym = vec![0u8; 24]; // null symbol
-        for &off in &import_name_off {
+        for (i, &off) in import_name_off.iter().enumerate() {
+            let name = &dynj.imports[i];
+            let res = symbols.lookup(name);
             let mut e = [0u8; 24];
             e[0..4].copy_from_slice(&off.to_le_bytes()); // st_name
-            e[4] = elf::st_info(elf::STB_GLOBAL, elf::STT_NOTYPE); // st_info
-            // st_other = 0, st_shndx = SHN_UNDEF (0), st_value/st_size = 0
+            let st_type = res.map(|r| r.st_type).unwrap_or(elf::STT_NOTYPE);
+            e[4] = elf::st_info(elf::STB_GLOBAL, st_type); // st_info
+            if copy_imports.contains(name) {
+                if let Some(r) = res {
+                    e[16..24].copy_from_slice(&r.size.to_le_bytes());
+                    copy_patch.push((r.id, dynsym.len()));
+                }
+            }
+            // st_other = 0, st_shndx/st_value are 0 for normal undefined imports.
             dynsym.extend_from_slice(&e);
         }
         // Exported defined symbols (shared object). `st_value`/`st_shndx` are
@@ -843,7 +957,7 @@ pub fn compute_layout(
             symbols
                 .name_by_id(**id)
                 .and_then(|n| symbols.lookup(n))
-                .is_some_and(|r| r.import)
+                .is_some_and(|r| r.import && !r.copy_reloc)
         })
         .count();
 
@@ -874,7 +988,12 @@ pub fn compute_layout(
                 });
             }
 
-            let out_name = output_section_name(&sec.name);
+            let out_name = config
+                .script
+                .as_ref()
+                .and_then(|script| script.output_for_input(&sec.name))
+                .map(str::to_string)
+                .unwrap_or_else(|| output_section_name(&sec.name));
             let is_nobits = matches!(sec.kind, SectionKind::Bss | SectionKind::Tbss);
             let b = builders.entry(out_name.clone()).or_insert_with(|| {
                 // Preserve the meaningful section flags, including SHF_TLS so the
@@ -889,6 +1008,9 @@ pub fn compute_layout(
                         ".init_array" => elf::SHT_INIT_ARRAY,
                         ".fini_array" => elf::SHT_FINI_ARRAY,
                         ".preinit_array" => elf::SHT_PREINIT_ARRAY,
+                        name if name.starts_with(".note") || sec.sh_type == elf::SHT_NOTE => {
+                            elf::SHT_NOTE
+                        }
                         _ => elf::SHT_PROGBITS,
                     }
                 };
@@ -956,14 +1078,17 @@ pub fn compute_layout(
         });
     }
 
-    // Allocate tentative (common) symbols into a synthetic `.bss` (no input
-    // contributions — that lets us find it again after placement).
+    // Allocate tentative (common) symbols and COPY-reloc slots into a synthetic
+    // `.bss` (no input contributions — that lets us find it again after
+    // placement).
     let mut common_syms: Vec<(SymbolId, u64, u64)> = symbols
         .iter()
         .filter_map(|(_, r)| r.common.map(|(s, a)| (r.id, s, a)))
         .collect();
     common_syms.sort_by_key(|c| c.0.0);
+    let copy_syms: Vec<SymbolId> = dynamic.map(|d| d.copy_relocs.clone()).unwrap_or_default();
     let mut common_offsets: Vec<(SymbolId, u64)> = Vec::new();
+    let mut copy_offsets: Vec<(SymbolId, u64)> = Vec::new();
     let mut common_size = 0u64;
     let mut common_align = 1u64;
     for (id, sz, al) in &common_syms {
@@ -972,6 +1097,20 @@ pub fn compute_layout(
         let off = align_up(common_size, al);
         common_offsets.push((*id, off));
         common_size = off + *sz;
+    }
+    for id in &copy_syms {
+        let Some(name) = symbols.name_by_id(*id) else {
+            continue;
+        };
+        let Some(res) = symbols.lookup(name) else {
+            continue;
+        };
+        let sz = res.size.max(1);
+        let al = copy_reloc_align(sz);
+        common_align = common_align.max(al);
+        let off = align_up(common_size, al);
+        copy_offsets.push((*id, off));
+        common_size = off + sz;
     }
     if common_size > 0 {
         rw_bss.push(Builder {
@@ -1064,7 +1203,12 @@ pub fn compute_layout(
                 ".rela.dyn",
                 elf::SHT_RELA,
                 8,
-                ((n_glob_dat + dynj.n_relative + dynj.n_tls_reloc) as u64) * elf::RELA_SIZE,
+                ((n_glob_dat
+                    + dynj.n_relative
+                    + dynj.n_tls_reloc
+                    + dynj.copy_relocs.len()
+                    + dynj.n_symbolic_data) as u64)
+                    * elf::RELA_SIZE,
             ),
         ];
         for (name, sh_type, align, size) in ro_dyn {
@@ -1127,7 +1271,12 @@ pub fn compute_layout(
             .iter()
             .filter(|b| b.name == ".init_array" || b.name == ".fini_array")
             .count();
-        let has_rela = n_glob_dat + dynj.n_relative + dynj.n_tls_reloc > 0;
+        let has_rela = n_glob_dat
+            + dynj.n_relative
+            + dynj.n_tls_reloc
+            + dynj.copy_relocs.len()
+            + dynj.n_symbolic_data
+            > 0;
         // FLAGS entries: PIE or shared → DT_FLAGS + DT_FLAGS_1 (2; both eager-bind
         // ET_DYN, though shared omits DF_1_PIE); else PLT-only → DT_FLAGS (1).
         let n_flags = if dynj.pie || dynj.shared {
@@ -1168,6 +1317,13 @@ pub fn compute_layout(
         });
     }
 
+    // Apply linker-script ordering to all output sections that fit Peony's fixed
+    // RO/RX/RW segment model. Unlisted sections keep deterministic name order.
+    sort_builders_by_script(&mut ro, config.script.as_ref());
+    sort_builders_by_script(&mut rx, config.script.as_ref());
+    sort_builders_by_script(&mut rw_pb, config.script.as_ref());
+    sort_builders_by_script(&mut rw_bss, config.script.as_ref());
+
     // ── Determine segment count (needed before we reserve header space) ──────
     let has_rx = !rx.is_empty();
     let has_rw = !rw_pb.is_empty() || !rw_bss.is_empty();
@@ -1179,6 +1335,7 @@ pub fn compute_layout(
     // PT_PHDR + PT_NOTE? + (PT_INTERP + PT_DYNAMIC)? + PT_TLS? + PT_GNU_EH_FRAME?
     //   + loads + PT_GNU_RELRO? + PT_GNU_STACK
     let has_eh_frame_hdr = n_fdes > 0;
+    let has_gnu_property = ro.iter().any(|b| b.name == ".note.gnu.property");
     // RELRO is emitted for exactly the dynamic links. This single boolean is the
     // ONLY gate used both here (header count) and at the push site below, so the
     // count can never disagree with what is emitted. A dynamic link always has a
@@ -1197,6 +1354,7 @@ pub fn compute_layout(
         + n_dyn_segs
         + usize::from(has_tls)
         + usize::from(has_eh_frame_hdr)
+        + usize::from(has_gnu_property)
         + usize::from(has_relro)
         + num_load
         + 1) as u64;
@@ -1308,7 +1466,20 @@ pub fn compute_layout(
     // ── Symbol table plan (.symtab / .strtab) ────────────────────────────────
     // `shndx == position + 1` for every alloc section (the null header is 0 and
     // meta sections are appended later), so it is final even before assignment.
-    let (symtab, strtab, num_locals) = build_symtab_plan(symbols, objects, &addresses, &sec_to_out);
+    let tls_base_va = sections
+        .iter()
+        .filter(|s| s.sh_flags & elf::SHF_TLS != 0)
+        .min_by_key(|s| {
+            let rank = match s.kind {
+                SectionKind::Tdata => 0,
+                SectionKind::Tbss => 1,
+                _ => 2,
+            };
+            (rank, s.sh_addr)
+        })
+        .map(|s| s.sh_addr);
+    let (symtab, strtab, num_locals) =
+        build_symtab_plan(symbols, objects, &addresses, &sec_to_out, tls_base_va);
 
     // ── Place non-allocatable meta sections ──────────────────────────────────
     // `.symtab`/`.strtab` are omitted under `--strip-all`; `.shstrtab` is always
@@ -1322,6 +1493,8 @@ pub fn compute_layout(
 
     let mut symtab_pos = None;
     let mut strtab_pos = None;
+    let mut symtab_shndx_pos = None;
+    let mut symtab_shndx = Vec::new();
     if symtab_emitted {
         let symtab_off = foff;
         let symtab_size = ((symtab.len() + 1) as u64) * elf::SYM_SIZE;
@@ -1329,6 +1502,7 @@ pub fn compute_layout(
         let strtab_off = foff;
         let strtab_size = strtab.len() as u64;
         foff += strtab_size;
+        symtab_shndx = build_symtab_shndx(&symtab);
 
         symtab_pos = Some(sections.len());
         sections.push(OutputSection {
@@ -1366,22 +1540,123 @@ pub fn compute_layout(
             contributions: Vec::new(),
             source: SecSource::StrTab,
         });
+        if !symtab_shndx.is_empty() {
+            foff = align_up(foff, 4);
+            let symtab_shndx_off = foff;
+            let symtab_shndx_size = symtab_shndx.len() as u64;
+            foff += symtab_shndx_size;
+            symtab_shndx_pos = Some(sections.len());
+            sections.push(OutputSection {
+                name: ".symtab_shndx".to_string(),
+                kind: SectionKind::Other,
+                sh_type: elf::SHT_SYMTAB_SHNDX,
+                sh_flags: 0,
+                sh_addr: 0,
+                sh_offset: symtab_shndx_off,
+                sh_size: symtab_shndx_size,
+                sh_link: 0, // -> symtab shndx, set below
+                sh_info: 0,
+                sh_addralign: 4,
+                sh_entsize: 4,
+                sh_name: 0,
+                shndx: 0,
+                contributions: Vec::new(),
+                source: SecSource::SymTabShndx,
+            });
+        }
     }
 
-    // ── Non-alloc passthrough metadata sections (`.rustc`, `.comment`) ────────
-    // These carry no SHF_ALLOC flag, so they are not loaded — but rustc embeds
-    // crate metadata in `.rustc` and reads it back (proc-macro / rlib loading),
-    // so dropping it breaks `cargo build` of any proc-macro crate. Concatenate
-    // each such section's input contributions into a file-only output section
-    // (sh_addr = 0) placed after `.symtab`/`.strtab`. They have no relocations,
-    // so `SecSource::Input` simply copies their bytes at emit time.
-    for passthrough in [".rustc", ".comment"] {
+    let mut emit_relocs: Vec<Vec<u8>> = Vec::new();
+    if config.emit_relocs && symtab_emitted {
+        let mut sym_index: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
+        for (i, ent) in symtab.iter().enumerate() {
+            if !ent.name.is_empty() {
+                sym_index.entry(ent.name.clone()).or_insert((i + 1) as u32);
+            }
+        }
+        let target_count = sections.len();
+        for target_idx in 0..target_count {
+            let target = sections[target_idx].clone();
+            if target.source != SecSource::Input || target.sh_flags & elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            let mut rela = Vec::new();
+            for c in &target.contributions {
+                let Some(obj) = objects.get(c.object_id) else {
+                    continue;
+                };
+                let Some(&sec_pos) = obj.section_map.get(&c.section_index) else {
+                    continue;
+                };
+                let Some(sec) = obj.sections.get(sec_pos) else {
+                    continue;
+                };
+                for reloc in &sec.relocs {
+                    let sym_idx = obj
+                        .symbols
+                        .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                        .and_then(|sym| sym_index.get(&sym.name).copied())
+                        .unwrap_or(0);
+                    let r_offset = c.offset + reloc.offset;
+                    let r_info = ((sym_idx as u64) << 32) | reloc.r_type as u64;
+                    rela.extend_from_slice(&r_offset.to_le_bytes());
+                    rela.extend_from_slice(&r_info.to_le_bytes());
+                    rela.extend_from_slice(&reloc.addend.to_le_bytes());
+                }
+            }
+            if rela.is_empty() {
+                continue;
+            }
+            foff = align_up(foff, 8);
+            let blob_idx = emit_relocs.len();
+            let reloc_off = foff;
+            let reloc_size = rela.len() as u64;
+            emit_relocs.push(rela);
+            sections.push(OutputSection {
+                name: format!(".rela{}", target.name),
+                kind: SectionKind::Other,
+                sh_type: elf::SHT_RELA,
+                sh_flags: 0,
+                sh_addr: 0,
+                sh_offset: reloc_off,
+                sh_size: reloc_size,
+                sh_link: 0,
+                sh_info: (target_idx + 1) as u32,
+                sh_addralign: 8,
+                sh_entsize: elf::RELA_SIZE,
+                sh_name: 0,
+                shndx: 0,
+                contributions: Vec::new(),
+                source: SecSource::RelaEmit(blob_idx),
+            });
+            foff += reloc_size;
+        }
+    }
+
+    // ── Non-alloc passthrough metadata sections ──────────────────────────────
+    // These carry no SHF_ALLOC flag, so they are not loaded. rustc embeds crate
+    // metadata in `.rustc`, and debug builds carry DWARF in `.debug_*`/
+    // `.zdebug_*`. Concatenate each matching input section by exact name into a
+    // file-only output section (sh_addr = 0) placed after `.symtab`/`.strtab`.
+    // `SecSource::Input` keeps them on the normal copy + relocation path.
+    let mut passthrough_names: Vec<Vec<u8>> = Vec::new();
+    for obj in objects {
+        for sec in &obj.sections {
+            if should_passthrough_non_alloc(sec, config.strip_debug)
+                && !passthrough_names.iter().any(|name| name == &sec.name)
+            {
+                passthrough_names.push(sec.name.clone());
+            }
+        }
+    }
+
+    for passthrough in passthrough_names {
         let mut contributions: Vec<SectionContribution> = Vec::new();
         let mut off = 0u64;
         let mut max_align = 1u64;
         for (obj_idx, obj) in objects.iter().enumerate() {
             for sec in &obj.sections {
-                if sec.name != passthrough.as_bytes() || sec.data.is_empty() {
+                if sec.name.as_slice() != passthrough.as_slice() || sec.data.is_empty() {
                     continue;
                 }
                 if let Some(live) = live {
@@ -1405,10 +1680,11 @@ pub fn compute_layout(
             continue;
         }
         foff = align_up(foff, max_align);
-        // `.comment` is conventionally MERGE|STRINGS; a plain PROGBITS copy is
-        // valid and accepted by readelf/eu-elflint.
+        // `.comment`/`.debug_str` may be MERGE|STRINGS in inputs; a plain
+        // PROGBITS copy is valid and accepted by readelf/eu-elflint.
+        let name = String::from_utf8_lossy(&passthrough).into_owned();
         sections.push(OutputSection {
-            name: passthrough.to_string(),
+            name,
             kind: SectionKind::Other,
             sh_type: elf::SHT_PROGBITS,
             sh_flags: 0,
@@ -1453,6 +1729,17 @@ pub fn compute_layout(
     }
     if let (Some(sp), Some(tp)) = (symtab_pos, strtab_pos) {
         sections[sp].sh_link = sections[tp].shndx;
+    }
+    if let (Some(xp), Some(sp)) = (symtab_shndx_pos, symtab_pos) {
+        sections[xp].sh_link = sections[sp].shndx;
+    }
+    if let Some(sp) = symtab_pos {
+        let symtab_shndx = sections[sp].shndx;
+        for s in sections.iter_mut() {
+            if matches!(s.source, SecSource::RelaEmit(_)) {
+                s.sh_link = symtab_shndx;
+            }
+        }
     }
     // Dynamic-section header links (so readelf/tools parse them; `ld.so` uses the
     // DT_* tags at runtime).
@@ -1510,16 +1797,38 @@ pub fn compute_layout(
         .map(|s| s.sh_addr)
         .unwrap_or(0);
 
+    // Final VAs for synthetic `.bss` allocations (commons + COPY reloc slots).
+    let synthetic_bss = sections
+        .iter()
+        .find(|s| s.source == SecSource::Bss && s.contributions.is_empty());
+    let common_base = synthetic_bss.map(|s| s.sh_addr).unwrap_or(0);
+    let synthetic_bss_shndx = synthetic_bss
+        .map(|s| s.shndx as u16)
+        .unwrap_or(elf::SHN_ABS);
+    let common: Vec<(SymbolId, u64)> = common_offsets
+        .iter()
+        .map(|(id, off)| (*id, common_base + off))
+        .collect();
+    let copy_relocs: Vec<(SymbolId, u64)> = copy_offsets
+        .iter()
+        .map(|(id, off)| (*id, common_base + off))
+        .collect();
+
     // ── TLS GOT region (shared object) ───────────────────────────────────────
-    // Laid out after the scalar GOT: GD pairs, the LDM pair, then IE slots.
+    // Laid out after the scalar GOT: GD pairs, TLSDESC pairs, the LDM pair, then IE slots.
     let mut tls_gd_addr: FxHashMap<TlsRef, u64> = FxHashMap::default();
     let mut tls_ie_addr: FxHashMap<TlsRef, u64> = FxHashMap::default();
+    let mut tls_desc_addr: FxHashMap<TlsRef, u64> = FxHashMap::default();
     let mut tls_ldm_addr: Option<u64> = None;
     {
         let mut cur = got_base + scalar_got_bytes;
         for r in &tls.gd {
             tls_gd_addr.insert(*r, cur);
             cur += 16; // DTPMOD64 + DTPOFF
+        }
+        for r in &tls.desc {
+            tls_desc_addr.insert(*r, cur);
+            cur += 16; // TLSDESC resolver + argument pair
         }
         if tls.ldm {
             tls_ldm_addr = Some(cur);
@@ -1532,6 +1841,7 @@ pub fn compute_layout(
         if !tls.is_empty() {
             tracing::debug!(
                 gd = tls.gd.len(),
+                desc = tls.desc.len(),
                 ie = tls.ie.len(),
                 ldm = tls.ldm,
                 tls_got_base = format_args!("{:#x}", got_base + scalar_got_bytes),
@@ -1617,7 +1927,9 @@ pub fn compute_layout(
             let Some(name) = symbols.name_by_id(*id) else {
                 continue;
             };
-            let is_import = symbols.lookup(name).is_some_and(|r| r.import);
+            let is_import = symbols
+                .lookup(name)
+                .is_some_and(|r| r.import && !r.copy_reloc);
             if !is_import {
                 continue;
             }
@@ -1628,10 +1940,21 @@ pub fn compute_layout(
             glob.extend_from_slice(&r_info.to_le_bytes());
             glob.extend_from_slice(&0i64.to_le_bytes()); // r_addend
         }
-        // Stash the GLOB_DATs; `append_dynamic_relocs` assembles the full
-        // `.rela.dyn` (relatives + irelatives + these) post-layout. The section
-        // is sized for `(n_relative + n_glob_dat)` entries in the RO table above.
+        // Stash the GLOB_DAT/COPY suffix; `append_dynamic_relocs` assembles the
+        // full `.rela.dyn` (relatives + irelatives + TLS + these) post-layout.
         dyn_blobs.rela_glob_dat = glob;
+        let mut copy = Vec::with_capacity(copy_relocs.len() * elf::RELA_SIZE as usize);
+        for &(id, copy_va) in &copy_relocs {
+            let Some(name) = symbols.name_by_id(id) else {
+                continue;
+            };
+            let dynidx = *import_dynsym.get(name).unwrap_or(&0);
+            let r_info = ((dynidx as u64) << 32) | (elf::R_X86_64_COPY as u64);
+            copy.extend_from_slice(&copy_va.to_le_bytes());
+            copy.extend_from_slice(&r_info.to_le_bytes());
+            copy.extend_from_slice(&0i64.to_le_bytes());
+        }
+        dyn_blobs.rela_copy = copy;
         dyn_blobs.rela_dyn = Vec::new();
 
         // PLT: `jmp *slot(%rip)` stubs, `.got.plt` slots, JUMP_SLOT relocs.
@@ -1694,10 +2017,15 @@ pub fn compute_layout(
         push_dyn(elf::DT_SYMTAB, va_of(SecSource::DynSym));
         push_dyn(elf::DT_STRSZ, dyn_blobs.dynstr.len() as u64);
         push_dyn(elf::DT_SYMENT, 24);
-        // RELA group covers GLOB_DAT (imports) + RELATIVE (ET_DYN base) + TLS
+        // RELA group covers GLOB_DAT (imports) + COPY + RELATIVE (ET_DYN base) + TLS
         // (DTPMOD64/DTPOFF64/TPOFF64) entries. The exact assembled size is
         // corrected post-layout by `append_dynamic_relocs`.
-        let total_rela = (n_glob_dat + dynj.n_relative + dynj.n_tls_reloc) as u64 * elf::RELA_SIZE;
+        let total_rela = (n_glob_dat
+            + dynj.n_relative
+            + dynj.n_tls_reloc
+            + dynj.copy_relocs.len()
+            + dynj.n_symbolic_data) as u64
+            * elf::RELA_SIZE;
         if total_rela > 0 {
             push_dyn(elf::DT_RELA, va_of(SecSource::RelaDyn));
             push_dyn(elf::DT_RELASZ, total_rela);
@@ -1782,6 +2110,21 @@ pub fn compute_layout(
             e[8..16].copy_from_slice(&value.to_le_bytes());
             e[16..24].copy_from_slice(&res.size.to_le_bytes());
         }
+        for &(id, off) in &copy_patch {
+            let Some(name) = symbols.name_by_id(id) else {
+                continue;
+            };
+            let Some(res) = symbols.lookup(name) else {
+                continue;
+            };
+            let Some((_, value)) = copy_relocs.iter().find(|(copy_id, _)| *copy_id == id) else {
+                continue;
+            };
+            let e = &mut dyn_blobs.dynsym[off..off + 24];
+            e[6..8].copy_from_slice(&synthetic_bss_shndx.to_le_bytes());
+            e[8..16].copy_from_slice(&value.to_le_bytes());
+            e[16..24].copy_from_slice(&res.size.to_le_bytes());
+        }
     }
 
     // ── Program headers ──────────────────────────────────────────────────────
@@ -1847,6 +2190,22 @@ pub fn compute_layout(
                     p_align: 4,
                 },
             );
+        }
+    }
+    // PT_GNU_PROPERTY points at `.note.gnu.property` so the loader sees x86
+    // feature notes (IBT/SHSTK/etc.).
+    if has_gnu_property {
+        if let Some(s) = sections.iter().find(|s| s.name == ".note.gnu.property") {
+            segments.push(ProgramHeader {
+                p_type: elf::PT_GNU_PROPERTY,
+                p_flags: elf::PF_R,
+                p_offset: s.sh_offset,
+                p_vaddr: s.sh_addr,
+                p_paddr: s.sh_addr,
+                p_filesz: s.sh_size,
+                p_memsz: s.sh_size,
+                p_align: s.sh_addralign.max(1),
+            });
         }
     }
     // PT_INTERP (early) and PT_DYNAMIC for a dynamic executable.
@@ -2042,17 +2401,6 @@ pub fn compute_layout(
     }
     let bss_start = bss_lo.unwrap_or(edata);
 
-    // Final VAs for common symbols (the synthetic `.bss` with no contributions).
-    let common_base = sections
-        .iter()
-        .find(|s| s.source == SecSource::Bss && s.contributions.is_empty())
-        .map(|s| s.sh_addr)
-        .unwrap_or(0);
-    let common: Vec<(SymbolId, u64)> = common_offsets
-        .iter()
-        .map(|(id, off)| (*id, common_base + off))
-        .collect();
-
     Ok(Layout {
         output_sections: sections,
         addresses,
@@ -2074,11 +2422,13 @@ pub fn compute_layout(
         strtab,
         shstrtab,
         symtab,
+        symtab_shndx,
         image_base: base,
         bss_start,
         edata,
         end: image_end,
         common,
+        copy_relocs,
         dyn_blobs,
         plt_slots: plt_syms.to_vec(),
         plt_base,
@@ -2086,9 +2436,11 @@ pub fn compute_layout(
         tls_offsets,
         tls_gd_addr,
         tls_ie_addr,
+        tls_desc_addr,
         tls_ldm_addr,
         shared: config.shared,
         tls_got_writes: Vec::new(), // filled post-layout by the driver
+        emit_relocs,
     })
 }
 
@@ -2442,6 +2794,7 @@ fn build_symtab_plan(
     objects: &[InputObject],
     addresses: &FxHashMap<(usize, usize), u64>,
     sec_to_out: &FxHashMap<(usize, usize), usize>,
+    tls_base_va: Option<u64>,
 ) -> (Vec<SymEntry>, Vec<u8>, usize) {
     use peony_object::Binding;
 
@@ -2464,15 +2817,25 @@ fn build_symtab_plan(
             let Some(&sec_va) = addresses.get(&(obj_id, si.0)) else {
                 continue;
             };
+            let is_tls = objects
+                .get(obj_id)
+                .and_then(|o| o.sections.get(si.0))
+                .is_some_and(|s| s.flags & elf::SHF_TLS != 0);
+            let typ = if is_tls { elf::STT_TLS } else { sym.st_type };
+            let value = if is_tls {
+                sec_va.saturating_sub(tls_base_va.unwrap_or(sec_va)) + sym.value
+            } else {
+                sec_va + sym.value
+            };
             let name_off = strtab.len() as u32;
             strtab.extend_from_slice(&sym.name);
             strtab.push(0);
             locals.push(SymEntry {
                 name: sym.name.clone(),
                 name_off,
-                shndx: (idx + 1) as u16,
-                info: elf::st_info(elf::STB_LOCAL, elf::STT_NOTYPE),
-                local: Some((sec_va + sym.value, sym.size)),
+                shndx: (idx + 1) as u32,
+                info: elf::st_info(elf::STB_LOCAL, typ),
+                local: Some((value, sym.size)),
             });
         }
     }
@@ -2489,15 +2852,34 @@ fn build_symtab_plan(
     let mut plan = locals;
     for (name, res) in defined {
         let shndx = match res.section_index {
-            None => elf::SHN_ABS,
+            None => elf::SHN_ABS as u32,
             Some(si) => match sec_to_out.get(&(res.defined_in.unwrap().0 as usize, si)) {
-                Some(&idx) => (idx + 1) as u16, // shndx = position + 1
+                Some(&idx) => (idx + 1) as u32, // shndx = position + 1
                 None => continue,               // defined in a dropped (non-allocatable) section
             },
         };
         let bind = match res.binding {
             Binding::Weak => elf::STB_WEAK,
             _ => elf::STB_GLOBAL,
+        };
+        let is_tls = res.section_index.is_some_and(|si| {
+            res.defined_in
+                .and_then(|obj| objects.get(obj.0 as usize))
+                .and_then(|o| o.sections.get(si))
+                .is_some_and(|s| s.flags & elf::SHF_TLS != 0)
+        });
+        let typ = if is_tls { elf::STT_TLS } else { res.st_type };
+        let local = if is_tls {
+            let obj_id = res.defined_in.unwrap().0 as usize;
+            let si = res.section_index.unwrap();
+            addresses.get(&(obj_id, si)).map(|sec_va| {
+                (
+                    sec_va.saturating_sub(tls_base_va.unwrap_or(*sec_va)) + res.value,
+                    res.size,
+                )
+            })
+        } else {
+            None
         };
         let name_off = strtab.len() as u32;
         strtab.extend_from_slice(name);
@@ -2506,11 +2888,32 @@ fn build_symtab_plan(
             name: name.to_vec(),
             name_off,
             shndx,
-            info: elf::st_info(bind, elf::STT_NOTYPE),
-            local: None,
+            info: elf::st_info(bind, typ),
+            local,
         });
     }
     (plan, strtab, num_locals)
+}
+
+fn build_symtab_shndx(symtab: &[SymEntry]) -> Vec<u8> {
+    if !symtab
+        .iter()
+        .any(|ent| ent.shndx >= elf::SHN_LORESERVE as u32)
+    {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity((symtab.len() + 1) * 4);
+    out.extend_from_slice(&0u32.to_le_bytes()); // null symbol
+    for ent in symtab {
+        let xindex = if ent.shndx >= elf::SHN_LORESERVE as u32 {
+            ent.shndx
+        } else {
+            0
+        };
+        out.extend_from_slice(&xindex.to_le_bytes());
+    }
+    out
 }
 
 fn resolve_entry(
@@ -2559,6 +2962,17 @@ pub fn finalize_symbols(symbols: &mut SymbolTable, layout: &Layout) {
         .filter_map(|&(id, va)| symbols.name_by_id(id).map(|n| (n.to_vec(), va)))
         .collect();
     for (name, va) in common_updates {
+        if let Some(r) = symbols.lookup_mut(&name) {
+            r.virtual_address = va;
+        }
+    }
+
+    let copy_updates: Vec<(Vec<u8>, u64)> = layout
+        .copy_relocs
+        .iter()
+        .filter_map(|&(id, va)| symbols.name_by_id(id).map(|n| (n.to_vec(), va)))
+        .collect();
+    for (name, va) in copy_updates {
         if let Some(r) = symbols.lookup_mut(&name) {
             r.virtual_address = va;
         }
@@ -2621,13 +3035,29 @@ fn is_allocatable(name: &[u8], kind: SectionKind, flags: u64) -> bool {
     if kind == SectionKind::Debug {
         return false;
     }
-    // `.note` needs synthetic handling we don't do yet; skip it. `.eh_frame` is
-    // kept (passed through) so the unwinder can find FDEs; `.eh_frame_hdr` is
-    // synthesised separately.
-    if name.starts_with(b".note") {
+    // Most `.note` sections need merge/synthetic handling. Preserve GNU property
+    // notes explicitly because the loader consumes them through PT_GNU_PROPERTY.
+    if name.starts_with(b".note") && name != b".note.gnu.property" {
         return false;
     }
     true
+}
+
+fn should_passthrough_non_alloc(sec: &peony_object::InputSection, strip_debug: bool) -> bool {
+    if sec.flags & elf::SHF_ALLOC != 0 || sec.data.is_empty() {
+        return false;
+    }
+    match sec.name.as_slice() {
+        b".rustc" | b".comment" | b".gnu_debugaltlink" => true,
+        name if !strip_debug => {
+            sec.kind == SectionKind::Debug
+                || name == b".debug"
+                || name.starts_with(b".debug_")
+                || name.starts_with(b".zdebug_")
+                || name.starts_with(b".gnu.debuglto_")
+        }
+        _ => false,
+    }
 }
 
 fn perm_of(flags: u64) -> Perm {
@@ -2640,10 +3070,26 @@ fn perm_of(flags: u64) -> Perm {
     }
 }
 
+fn sort_builders_by_script(builders: &mut [Builder], script: Option<&ScriptLayout>) {
+    builders.sort_by(|a, b| {
+        let ak = script.and_then(|s| s.order_of(&a.name));
+        let bk = script.and_then(|s| s.order_of(&b.name));
+        match (ak, bk) {
+            (Some(a_idx), Some(b_idx)) => a_idx.cmp(&b_idx).then_with(|| a.name.cmp(&b.name)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        }
+    });
+}
+
 /// Map an input section name to its output section name
 /// (`.text._ZN…` → `.text`, `.rodata..L__unnamed` → `.rodata`).
 fn output_section_name(name: &[u8]) -> String {
     let s = std::str::from_utf8(name).unwrap_or(".unknown");
+    if s.starts_with(".note.") {
+        return s.to_string();
+    }
     if let Some(dot2) = s.get(1..).and_then(|rest| rest.find('.')) {
         s[..dot2 + 1].to_string()
     } else {
@@ -2651,8 +3097,103 @@ fn output_section_name(name: &[u8]) -> String {
     }
 }
 
+fn script_pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut rest = name;
+    let mut parts = pattern.split('*').peekable();
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+
+    if let Some(first) = parts.next() {
+        if !first.is_empty() {
+            if anchored_start {
+                let Some(stripped) = rest.strip_prefix(first) else {
+                    return false;
+                };
+                rest = stripped;
+            } else if let Some(pos) = rest.find(first) {
+                rest = &rest[pos + first.len()..];
+            } else {
+                return false;
+            }
+        }
+    }
+
+    let mut last_non_empty = "";
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        last_non_empty = part;
+        let Some(pos) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[pos + part.len()..];
+    }
+
+    !anchored_end || pattern.ends_with(last_non_empty) && rest.is_empty()
+}
+
+fn copy_reloc_align(size: u64) -> u64 {
+    size.next_power_of_two().min(16).max(1)
+}
+
 #[inline]
 fn align_up(val: u64, align: u64) -> u64 {
     let align = align.max(1);
     (val + align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sym(shndx: u32) -> SymEntry {
+        SymEntry {
+            name: Vec::new(),
+            name_off: 0,
+            shndx,
+            info: 0,
+            local: None,
+        }
+    }
+
+    #[test]
+    fn symtab_shndx_is_only_emitted_for_overflow_entries() {
+        assert!(build_symtab_shndx(&[sym(1), sym(elf::SHN_LORESERVE as u32 - 1)]).is_empty());
+
+        let blob = build_symtab_shndx(&[
+            sym(1),
+            sym(elf::SHN_LORESERVE as u32),
+            sym(elf::SHN_XINDEX as u32 + 7),
+        ]);
+        let words: Vec<u32> = blob
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+
+        assert_eq!(
+            words,
+            vec![0, 0, elf::SHN_LORESERVE as u32, elf::SHN_XINDEX as u32 + 7,]
+        );
+    }
+
+    #[test]
+    fn script_patterns_match_common_linker_wildcards() {
+        assert!(script_pattern_matches(".text*", ".text.startup"));
+        assert!(script_pattern_matches("*.init_array", ".rela.init_array"));
+        assert!(script_pattern_matches(".rodata", ".rodata"));
+        assert!(!script_pattern_matches(".data", ".data.rel.ro"));
+
+        let script = ScriptLayout {
+            output_sections: vec![ScriptOutputSection {
+                name: ".fast".to_string(),
+                patterns: vec![".text.hot*".to_string(), ".init".to_string()],
+            }],
+        };
+        assert_eq!(script.output_for_input(b".text.hot.foo"), Some(".fast"));
+        assert_eq!(script.output_for_input(b".text.cold.foo"), None);
+    }
 }

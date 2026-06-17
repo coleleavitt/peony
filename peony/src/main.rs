@@ -27,7 +27,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use peony_emit::{EmitConfig, emit_full};
-use peony_layout::{LayoutConfig, check_undefined, compute_layout, finalize_symbols};
+use peony_layout::{
+    LayoutConfig,
+    ScriptLayout,
+    ScriptOutputSection,
+    check_undefined,
+    compute_layout,
+    finalize_symbols,
+};
 use peony_object::{Binding, InputObject, iter_archive_members, parse_bytes, parse_object};
 use peony_reloc::scan_relocations;
 use peony_symbols::SymbolTable;
@@ -43,6 +50,7 @@ use tracing_subscriber::EnvFilter;
 /// act on, rather than erroring.
 #[derive(Debug)]
 struct Args {
+    raw_args: Vec<String>,
     inputs: Vec<PathBuf>,
     library_paths: Vec<PathBuf>,
     libraries: Vec<String>,
@@ -50,11 +58,17 @@ struct Args {
     incremental: bool,
     threads: usize,
     base_address: String,
+    base_address_explicit: bool,
     entry: String,
+    entry_explicit: bool,
     gc_sections: bool,
     defsym: Vec<String>,
+    linker_scripts: Vec<PathBuf>,
+    plugin: Option<PathBuf>,
     build_id: bool,
-    strip: bool,
+    strip_all: bool,
+    strip_debug: bool,
+    emit_relocs: bool,
     pie: bool,
     /// Produce a shared object (`-shared`): ET_DYN with exported `.dynsym`, no
     /// crt startup objects, no `PT_INTERP`, no mandatory entry point.
@@ -70,6 +84,7 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
+            raw_args: Vec::new(),
             inputs: Vec::new(),
             library_paths: Vec::new(),
             libraries: Vec::new(),
@@ -77,11 +92,17 @@ impl Default for Args {
             incremental: false,
             threads: 0,
             base_address: "0x400000".to_string(),
+            base_address_explicit: false,
             entry: "_start".to_string(),
+            entry_explicit: false,
             gc_sections: false,
             defsym: Vec::new(),
+            linker_scripts: Vec::new(),
+            plugin: None,
             build_id: false,
-            strip: false,
+            strip_all: false,
+            strip_debug: false,
+            emit_relocs: false,
             pie: false,
             shared: false,
             soname: None,
@@ -102,7 +123,6 @@ fn parse_args() -> Result<Args> {
         "-plugin-opt",
         "-rpath",
         "-rpath-link",
-        "-T",
         "-y",
         "-Y",
         "-R",
@@ -122,25 +142,41 @@ fn parse_args() -> Result<Args> {
     }
     let mut a = Args::default();
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    a.raw_args = argv.clone();
     let mut i = 0;
     while i < argv.len() {
         let arg = argv[i].clone();
         let arg = arg.as_str();
         match arg {
             "-o" | "--output" => a.output = PathBuf::from(take(&argv, &mut i, arg)?),
-            "-e" | "--entry" => a.entry = take(&argv, &mut i, arg)?,
+            "-e" | "--entry" => {
+                a.entry = take(&argv, &mut i, arg)?;
+                a.entry_explicit = true;
+            }
             "-L" | "--library-path" => a
                 .library_paths
                 .push(PathBuf::from(take(&argv, &mut i, arg)?)),
+            "-T" | "--script" => a
+                .linker_scripts
+                .push(PathBuf::from(take(&argv, &mut i, arg)?)),
             "-l" | "--library" => a.libraries.push(take(&argv, &mut i, arg)?),
             "--defsym" => a.defsym.push(take(&argv, &mut i, arg)?),
+            "-plugin" | "--plugin" => a.plugin = Some(PathBuf::from(take(&argv, &mut i, arg)?)),
             "--threads" => a.threads = take(&argv, &mut i, arg)?.parse().unwrap_or(0),
-            "--base-address" => a.base_address = take(&argv, &mut i, arg)?,
+            "--base-address" => {
+                a.base_address = take(&argv, &mut i, arg)?;
+                a.base_address_explicit = true;
+            }
             "--gc-sections" => a.gc_sections = true,
             "--no-gc-sections" => a.gc_sections = false,
             "--build-id" => a.build_id = true,
             "--incremental" => a.incremental = true,
-            "-s" | "-S" | "--strip-all" | "--strip-debug" => a.strip = true,
+            "-s" | "--strip-all" => {
+                a.strip_all = true;
+                a.strip_debug = true;
+            }
+            "-S" | "--strip-debug" => a.strip_debug = true,
+            "--emit-relocs" | "-q" => a.emit_relocs = true,
             "-pie" | "--pie" => a.pie = true,
             "-no-pie" | "--no-pie" => a.pie = false,
             "-shared" | "--shared" | "-Bshareable" => a.shared = true,
@@ -149,10 +185,22 @@ fn parse_args() -> Result<Args> {
             _ if IGNORE_WITH_VALUE.contains(&arg) => {
                 let _ = take(&argv, &mut i, arg); // consume and ignore the value
             }
-            _ if arg.starts_with("--entry=") => a.entry = arg[8..].to_string(),
+            _ if arg.starts_with("--entry=") => {
+                a.entry = arg[8..].to_string();
+                a.entry_explicit = true;
+            }
             _ if arg.starts_with("--defsym=") => a.defsym.push(arg[9..].to_string()),
+            _ if arg.starts_with("--plugin=") => {
+                a.plugin = Some(PathBuf::from(&arg["--plugin=".len()..]))
+            }
             _ if arg.starts_with("--threads=") => a.threads = arg[10..].parse().unwrap_or(0),
-            _ if arg.starts_with("--base-address=") => a.base_address = arg[15..].to_string(),
+            _ if arg.starts_with("--base-address=") => {
+                a.base_address = arg[15..].to_string();
+                a.base_address_explicit = true;
+            }
+            _ if arg.starts_with("--script=") => a
+                .linker_scripts
+                .push(PathBuf::from(&arg["--script=".len()..])),
             _ if arg.starts_with("--build-id") => a.build_id = true, // --build-id=<style>
             _ if arg.starts_with("--version-script=") => {
                 a.version_script = Some(PathBuf::from(&arg["--version-script=".len()..]))
@@ -161,8 +209,15 @@ fn parse_args() -> Result<Args> {
             _ if arg.starts_with("-h") && arg.len() > 2 => a.soname = Some(arg[2..].to_string()),
             _ if arg.starts_with("-o") => a.output = PathBuf::from(&arg[2..]),
             _ if arg.starts_with("-L") => a.library_paths.push(PathBuf::from(&arg[2..])),
+            _ if arg.starts_with("-T") && arg.len() > 2 => {
+                a.linker_scripts.push(PathBuf::from(&arg[2..]))
+            }
+            _ if arg.starts_with("-plugin=") => a.plugin = Some(PathBuf::from(&arg[8..])),
             _ if arg.starts_with("-l") => a.libraries.push(arg[2..].to_string()),
-            _ if arg.starts_with("-e") => a.entry = arg[2..].to_string(),
+            _ if arg.starts_with("-e") => {
+                a.entry = arg[2..].to_string();
+                a.entry_explicit = true;
+            }
             _ if arg.starts_with('-') => {} // unknown ld flag → ignore
             _ => a.inputs.push(PathBuf::from(arg)), // positional input file
         }
@@ -171,16 +226,60 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
+/// `cc`/`g++`/`rustc` always pass `-plugin .../liblto_plugin.so` even for a
+/// plain (non-LTO) link, so handing the whole link off to `ld.bfd` whenever a
+/// plugin is present meant peony was silently never doing the link. Instead we
+/// strip the plugin args (already kept out of `inputs` by the parser) and link
+/// the objects ourselves — they are real ELF `.o` files, not LTO IR. Any actual
+/// LTO IR object simply fails `parse_object` and is skipped as non-ELF.
+///
+/// Kept as a no-op returning `Ok(false)` so the call site and `args.plugin`
+/// (used for logging/LTO detection) are preserved.
+fn maybe_handoff_lto_plugin(args: &Args) -> Result<bool> {
+    if let Some(plugin) = &args.plugin {
+        tracing::info!(
+            plugin = %plugin.display(),
+            "ignoring LTO plugin; linking objects directly (no bfd handoff)"
+        );
+    }
+    Ok(false)
+}
+
+#[allow(dead_code)] // retained for diagnostics; no longer used for LTO handoff
+fn system_gnu_linker() -> Option<PathBuf> {
+    ["/usr/bin/ld.bfd", "/usr/bin/ld"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .with_writer(std::io::stderr) // diagnostics on stderr, like a real linker
-        .init();
+    if let Ok(filter) = std::env::var("PEONY_LOG") {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(filter))
+            .with_target(false)
+            .with_writer(std::io::stderr) // diagnostics on stderr, like a real linker
+            .try_init()
+            .ok();
+    }
 
     let mut args = parse_args()?;
+    if maybe_handoff_lto_plugin(&args)? {
+        return Ok(());
+    }
+    let script_controls = parse_linker_script_controls(&args.linker_scripts)?;
+    if !args.entry_explicit {
+        if let Some(entry) = &script_controls.entry {
+            args.entry = entry.clone();
+        }
+    }
+    if !args.base_address_explicit {
+        if let Some(base) = &script_controls.base_address {
+            args.base_address = base.clone();
+        }
+    }
     // `-shared` wins over `-pie`: a shared object is ET_DYN but is not a PIE
     // (no DF_1_PIE, no PT_INTERP, no entry). Some drivers pass both.
     if args.shared {
@@ -238,14 +337,29 @@ fn main() -> Result<()> {
     let tls_got = peony_layout::TlsGotInfo {
         gd: scan.tls_gd_refs(),
         ie: scan.tls_ie_refs(),
+        desc: scan.tls_desc_refs(),
         ldm: scan.needs_tls_ldm(),
     };
+    let copy_relocs = if args.shared {
+        Vec::new()
+    } else {
+        peony_reloc::copy_reloc_symbols(&objects, &symbols)
+    };
+    let copy_names: Vec<Vec<u8>> = copy_relocs
+        .iter()
+        .filter_map(|id| symbols.name_by_id(*id).map(|n| n.to_vec()))
+        .collect();
+    for name in &copy_names {
+        symbols.mark_copy_reloc(name);
+    }
     tracing::info!(
         got_slots = got_syms.len(),
         plt_slots = plt_syms.len(),
         tls_gd = tls_got.gd.len(),
+        tls_desc = tls_got.desc.len(),
         tls_ie = tls_got.ie.len(),
         tls_ldm = tls_got.ldm,
+        copy_relocs = copy_relocs.len(),
         "relocation scan complete"
     );
 
@@ -279,6 +393,11 @@ fn main() -> Result<()> {
         .iter()
         .map(|n| symbols.lookup(n).and_then(|r| r.soname.clone()))
         .collect();
+    for (i, name) in imports.iter().enumerate() {
+        if let Some(r) = symbols.lookup_mut(name) {
+            r.dynsym_index = (i + 1) as u32;
+        }
+    }
     // A PIE needs R_X86_64_RELATIVE dynamic relocations for absolute pointers,
     // even with no imports. Emit dynamic sections whenever there are imports OR
     // the output is a PIE (rustc/cc default).
@@ -343,6 +462,14 @@ fn main() -> Result<()> {
     } else {
         0
     };
+    // Symbolic R_X86_64_64 dynamic relocs for data sites referencing an imported
+    // symbol (gcc's `.data.rel.local.DW.ref.*` EH slots). Sized here, collected
+    // post-layout. Meaningful for any ET_DYN (PIE or shared).
+    let n_symbolic_data = if et_dyn {
+        peony_reloc::count_symbolic_data_relocs(&objects, &symbols)
+    } else {
+        0
+    };
     // Dynamic sections are needed for any import, any PIE, or a shared object.
     let dynamic = (!imports.is_empty() || et_dyn).then(|| peony_layout::DynamicInfo {
         imports,
@@ -356,6 +483,8 @@ fn main() -> Result<()> {
         soname,
         exports,
         n_tls_reloc,
+        copy_relocs,
+        n_symbolic_data,
     });
     if dynamic.is_some() {
         tracing::info!(
@@ -375,9 +504,13 @@ fn main() -> Result<()> {
         base_address,
         entry_symbol: args.entry.clone(),
         build_id: args.build_id,
-        strip: args.strip,
+        strip: args.strip_all,
+        strip_debug: args.strip_debug || args.strip_all,
         pie: args.pie,
         shared: args.shared,
+        emit_relocs: args.emit_relocs && !args.strip_all,
+        script: (!script_controls.layout.output_sections.is_empty())
+            .then_some(script_controls.layout.clone()),
         ..Default::default()
     };
     tracing::info!("computing layout");
@@ -446,7 +579,19 @@ fn main() -> Result<()> {
         } else {
             tls_dyn = Vec::new();
         }
-        layout.append_all_dynamic_relocs(&relative, &irelative, &tls_dyn);
+        // Symbolic R_X86_64_64 dynamic relocs for imported-symbol data sites.
+        let symbolic = if et_dyn {
+            peony_reloc::collect_symbolic_data_relocs(&objects, &symbols, &layout)
+        } else {
+            Vec::new()
+        };
+        if !symbolic.is_empty() {
+            tracing::info!(
+                symbolic = symbolic.len(),
+                "emitting symbolic R_X86_64_64 dynamic relocations"
+            );
+        }
+        layout.append_all_dynamic_relocs(&relative, &irelative, &tls_dyn, &symbolic);
     }
 
     emit_full(
@@ -482,10 +627,19 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
         .filter(|p| !is_archive(p) && !peony_object::is_shared_object(p))
         .collect();
     tracing::info!(objects = bare.len(), "parsing input objects");
-    let parsed: Vec<InputObject> = bare
-        .par_iter()
-        .map(|p| parse_object(p).with_context(|| format!("failed to parse `{}`", p.display())))
-        .collect::<Result<_>>()?;
+    // Small links (the common `cc`/incremental case) parse faster serially:
+    // touching rayon's global pool spins up a worker per core that then idles
+    // on `sched_yield`/`futex` for longer than the handful of parses take. Only
+    // fan out once there are enough objects to amortize the thread management.
+    const PARALLEL_PARSE_THRESHOLD: usize = 16;
+    let parse_one = |p: &&PathBuf| {
+        parse_object(p).with_context(|| format!("failed to parse `{}`", p.display()))
+    };
+    let parsed: Vec<InputObject> = if bare.len() >= PARALLEL_PARSE_THRESHOLD {
+        bare.par_iter().map(parse_one).collect::<Result<_>>()?
+    } else {
+        bare.iter().map(parse_one).collect::<Result<_>>()?
+    };
     for obj in parsed {
         r.resolve(obj)?;
     }
@@ -501,11 +655,9 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     for so in inputs.iter().filter(|p| peony_object::is_shared_object(p)) {
         let lib = peony_object::parse_shared_object(so)
             .with_context(|| format!("reading shared object `{}`", so.display()))?;
-        if r.symbols.register_shared_exports_versioned(
-            &lib.exports,
-            &lib.export_versions,
-            &lib.soname,
-        ) > 0
+        if r.symbols
+            .register_shared_export_symbols(&lib.export_symbols, &lib.soname)
+            > 0
         {
             needed.push(lib.soname);
         }
@@ -842,7 +994,11 @@ fn is_linker_script(path: &Path) -> bool {
         return false;
     }
     let text = String::from_utf8_lossy(&data);
-    text.contains("GROUP") || text.contains("INPUT")
+    text.contains("GROUP")
+        || text.contains("INPUT")
+        || text.contains("AS_NEEDED")
+        || text.contains("SECTIONS")
+        || text.contains("ENTRY")
 }
 
 /// Extract the file/`-l` references from a linker script (GROUP/INPUT/AS_NEEDED).
@@ -850,17 +1006,264 @@ fn parse_linker_script(path: &Path) -> Result<Vec<String>> {
     let data = std::fs::read(path)
         .with_context(|| format!("reading linker script `{}`", path.display()))?;
     let text = strip_block_comments(&String::from_utf8_lossy(&data));
+    Ok(extract_script_refs(&text))
+}
+
+#[derive(Default)]
+struct ScriptControls {
+    entry: Option<String>,
+    base_address: Option<String>,
+    layout: ScriptLayout,
+}
+
+fn parse_linker_script_controls(paths: &[PathBuf]) -> Result<ScriptControls> {
+    let mut merged = ScriptControls::default();
+    for path in paths {
+        let data = std::fs::read(path)
+            .with_context(|| format!("reading linker script `{}`", path.display()))?;
+        let text = strip_block_comments(&String::from_utf8_lossy(&data));
+        if let Some(entry) = directive_arg(&text, "ENTRY") {
+            merged.entry = Some(entry);
+        }
+        if let Some(base) = script_base_address(&text) {
+            merged.base_address = Some(base);
+        }
+        let layout = parse_sections_layout(&text);
+        merged.layout.output_sections.extend(layout.output_sections);
+    }
+    Ok(merged)
+}
+
+fn extract_script_refs(text: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    for keyword in ["GROUP", "INPUT", "AS_NEEDED"] {
+        let mut pos = 0;
+        while let Some((body, end)) = directive_body(text, keyword, pos) {
+            for r in parse_ref_tokens(body) {
+                if !refs.contains(&r) {
+                    refs.push(r);
+                }
+            }
+            pos = end;
+        }
+    }
+    refs
+}
+
+fn parse_ref_tokens(text: &str) -> Vec<String> {
     let cleaned: String = text
         .chars()
         .map(|c| if "(),".contains(c) { ' ' } else { c })
         .collect();
-    Ok(cleaned
+    cleaned
         .split_whitespace()
+        .map(|t| t.trim_matches('"').trim_matches('\''))
         .filter(|t| {
-            t.starts_with("-l") || t.contains('/') || t.ends_with(".a") || t.contains(".so")
+            *t != "GROUP"
+                && *t != "INPUT"
+                && *t != "AS_NEEDED"
+                && *t != "/DISCARD/"
+                && (t.starts_with("-l")
+                    || t.contains('/')
+                    || t.ends_with(".a")
+                    || t.contains(".so"))
         })
         .map(str::to_string)
-        .collect())
+        .collect()
+}
+
+fn parse_sections_layout(text: &str) -> ScriptLayout {
+    let Some((body, _)) = directive_body(text, "SECTIONS", 0) else {
+        return ScriptLayout::default();
+    };
+    let mut layout = ScriptLayout::default();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b';') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'.' && bytes[i] != b'/' {
+            i += 1;
+            continue;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && !matches!(bytes[i], b':' | b'{' | b';')
+        {
+            i += 1;
+        }
+        let name = body[name_start..i].trim();
+        let j = skip_ws(body, i);
+        if name == "." && j < bytes.len() && bytes[j] == b'=' {
+            i = body[j..].find(';').map_or(bytes.len(), |off| j + off + 1);
+            continue;
+        }
+        let Some(colon) = find_byte_before(body, j, b':', b';') else {
+            i += 1;
+            continue;
+        };
+        let Some(open_rel) = body[colon + 1..].find('{') else {
+            i = colon + 1;
+            continue;
+        };
+        let open = colon + 1 + open_rel;
+        let Some(close) = matching_brace(body, open) else {
+            break;
+        };
+        if !name.is_empty() && name != "/DISCARD/" {
+            let mut patterns = section_patterns(&body[open + 1..close]);
+            if patterns.is_empty() {
+                patterns.push(name.to_string());
+            }
+            layout.output_sections.push(ScriptOutputSection {
+                name: name.to_string(),
+                patterns,
+            });
+        }
+        i = close + 1;
+    }
+    layout
+}
+
+fn section_patterns(body: &str) -> Vec<String> {
+    let cleaned: String = body
+        .chars()
+        .map(|c| if "(){};,\":".contains(c) { ' ' } else { c })
+        .collect();
+    let mut out = Vec::new();
+    for tok in cleaned.split_whitespace() {
+        if tok.starts_with('.') && !out.iter().any(|p| p == tok) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+fn script_base_address(text: &str) -> Option<String> {
+    let (body, _) = directive_body(text, "SECTIONS", 0)?;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'.' {
+            let j = skip_ws(body, i + 1);
+            if j < bytes.len() && bytes[j] == b'=' {
+                let expr_start = skip_ws(body, j + 1);
+                let expr_end = body[expr_start..]
+                    .find(';')
+                    .map_or(bytes.len(), |off| expr_start + off);
+                let expr = body[expr_start..expr_end].trim();
+                if let Some(num) = first_number_token(expr) {
+                    return Some(num.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn first_number_token(expr: &str) -> Option<&str> {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_start = bytes[i].is_ascii_digit();
+        if is_start {
+            let start = i;
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_hexdigit() || matches!(bytes[i], b'x' | b'X'))
+            {
+                i += 1;
+            }
+            return Some(&expr[start..i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn directive_arg(text: &str, keyword: &str) -> Option<String> {
+    directive_body(text, keyword, 0).map(|(body, _)| body.trim().to_string())
+}
+
+fn directive_body<'a>(text: &'a str, keyword: &str, start: usize) -> Option<(&'a str, usize)> {
+    let mut search = start;
+    while let Some(pos) = text[search..].find(keyword) {
+        let kw = search + pos;
+        let before_ok = kw == 0
+            || !text.as_bytes()[kw - 1].is_ascii_alphanumeric() && text.as_bytes()[kw - 1] != b'_';
+        let after = kw + keyword.len();
+        let after_ok = after >= text.len()
+            || !text.as_bytes()[after].is_ascii_alphanumeric() && text.as_bytes()[after] != b'_';
+        if before_ok && after_ok {
+            let open = skip_ws(text, after);
+            if open < text.len() && text.as_bytes()[open] == b'(' {
+                if let Some(close) = matching_paren(text, open) {
+                    return Some((&text[open + 1..close], close + 1));
+                }
+            } else if open < text.len() && text.as_bytes()[open] == b'{' {
+                if let Some(close) = matching_brace(text, open) {
+                    return Some((&text[open + 1..close], close + 1));
+                }
+            }
+        }
+        search = after;
+    }
+    None
+}
+
+fn find_byte_before(text: &str, start: usize, needle: u8, stop: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == needle {
+            return Some(i);
+        }
+        if bytes[i] == stop {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    matching_delim(text, open, b'(', b')')
+}
+
+fn matching_brace(text: &str, open: usize) -> Option<usize> {
+    matching_delim(text, open, b'{', b'}')
+}
+
+fn matching_delim(text: &str, open: usize, left: u8, right: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        if bytes[i] == left {
+            depth += 1;
+        } else if bytes[i] == right {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_ws(text: &str, mut i: usize) -> usize {
+    let bytes = text.as_bytes();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 fn strip_block_comments(s: &str) -> String {
@@ -917,6 +1320,7 @@ fn resolve_script_ref(r: &str, script_dir: Option<&Path>, search: &[PathBuf]) ->
 /// as GNU ld / lld do when driven by `cc`.
 fn resolve_inputs(args: &Args) -> Result<Vec<PathBuf>> {
     let mut inputs = args.inputs.clone();
+    inputs.extend(args.linker_scripts.iter().cloned());
     let search = library_search_paths(&args.library_paths);
     for name in &args.libraries {
         // Search each dir for the shared library first, then the archive.
@@ -1025,7 +1429,7 @@ fn library_search_paths(explicit: &[PathBuf]) -> Vec<PathBuf> {
         }
     };
     for p in gcc_library_dirs() {
-        push(p, &mut out);
+        push(p.clone(), &mut out);
     }
     for p in [
         "/usr/lib/x86_64-linux-gnu",
@@ -1043,29 +1447,40 @@ fn library_search_paths(explicit: &[PathBuf]) -> Vec<PathBuf> {
 /// Parse `gcc -print-search-dirs` and return its `libraries:` entries.
 /// Returns an empty vector if `gcc` is unavailable, so peony still works with
 /// explicit `-L` paths on systems without a C compiler.
-fn gcc_library_dirs() -> Vec<PathBuf> {
-    let output = match std::process::Command::new("gcc")
-        .arg("-print-search-dirs")
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("libraries:") {
-            // Format: "libraries: =/path/a:/path/b:..."; entries are ':'-joined.
-            let rest = rest.trim_start().trim_start_matches('=');
-            return rest
-                .split(':')
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                // Canonicalize to collapse the ../.. segments gcc emits.
-                .map(|p| p.canonicalize().unwrap_or(p))
-                .collect();
+fn gcc_library_dirs() -> &'static [PathBuf] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        // Try known locations before a PATH search to avoid the 40+ failed
+        // `execve()`s the OS performs probing every PATH entry for `gcc`.
+        let gcc = ["/usr/bin/gcc", "/usr/local/bin/gcc", "/usr/bin/cc"]
+            .iter()
+            .find(|p| std::fs::metadata(p).is_ok())
+            .copied()
+            .unwrap_or("gcc");
+        let output = match std::process::Command::new(gcc)
+            .arg("-print-search-dirs")
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("libraries:") {
+                // Format: "libraries: =/path/a:/path/b:..."; entries are ':'-joined.
+                let rest = rest.trim_start().trim_start_matches('=');
+                return rest
+                    .split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    // Canonicalize to collapse the ../.. segments gcc emits.
+                    .map(|p| p.canonicalize().unwrap_or(p))
+                    .collect();
+            }
         }
-    }
-    Vec::new()
+        Vec::new()
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

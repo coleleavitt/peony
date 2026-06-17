@@ -18,7 +18,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # ELF parsing
-object = { version = "0.36", features = ["read_core", "elf"] }
+object = { version = "0.36", features = ["read_core", "elf", "compression"] }
 # Work-stealing scheduler (Chase-Lev deque + lifeline load balancer)
 ws-deque = { git = "https://github.com/coleleavitt/ws-deque.git" }
 # Parallel iteration (kept for crossbeam compat; prefer ws-deque for hot paths)
@@ -38,3 +38,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI (driver only)
 clap = { version = "4", features = ["derive"] }
+
+[profile.dev]
+debug = "full"
+split-debuginfo = "off"
+strip = "none"
+
+[profile.release]
+debug = "full"
+split-debuginfo = "off"
+strip = "none"
+
+[profile.unstripped]
+inherits = "release"
+debug = "full"
+split-debuginfo = "off"
+strip = "none"

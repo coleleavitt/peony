@@ -92,6 +92,8 @@ pub struct InputSection {
     pub name: Vec<u8>,
     /// Coarse classification.
     pub kind: SectionKind,
+    /// Raw ELF section type (`SHT_*`).
+    pub sh_type: u32,
     /// Raw section data (a slice into the mmap'd file).
     pub data: Vec<u8>,
     /// Section alignment (must be a power of two).
@@ -220,16 +222,30 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
 
     let mut sections = Vec::new();
     let mut section_map = FxHashMap::default();
+    let endian = elf.endian();
 
     for section in elf.sections() {
         let idx = section.index();
-        let name = section.name_bytes().unwrap_or(b"").to_vec();
-        let mut raw_data = section.data().unwrap_or(&[]).to_vec();
+        let sh_type = section.elf_section_header().sh_type(endian);
+        let input_name = section.name_bytes().unwrap_or(b"");
+        let is_debug = is_debug_section_name(input_name);
+        let name = normalize_debug_section_name(input_name);
         let sh_flags = match section.flags() {
             object::SectionFlags::Elf { sh_flags } => sh_flags,
             _ => 0,
         };
         let kind = classify_section(&name, sh_flags);
+        let mut raw_data = if is_debug {
+            section
+                .uncompressed_data()
+                .map_err(|e| ObjectError::Parse {
+                    path: path.clone(),
+                    source: e,
+                })?
+                .into_owned()
+        } else {
+            section.data().unwrap_or(&[]).to_vec()
+        };
         let relocs = collect_relocs(&section);
 
         // Strip the trailing 4-byte zero CIE terminator from each input
@@ -237,7 +253,11 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
         // when contributions are concatenated, causing the runtime unwinder
         // (`_Unwind_Find_FDE`) to stop at the first one. The linker emits a
         // single terminator for the merged section (handled at emit time).
-        let mut size = section.size();
+        let mut size = if is_debug {
+            raw_data.len() as u64
+        } else {
+            section.size()
+        };
         if kind == SectionKind::EhFrame {
             // Determine whether the section *ends* with a genuine 4-byte zero
             // terminator by walking records to the end. A trailing run of zero
@@ -272,6 +292,7 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
             index: idx,
             name,
             kind,
+            sh_type,
             data: raw_data,
             align: section.align(),
             size,
@@ -399,7 +420,7 @@ fn classify_section(name: &[u8], flags: u64) -> SectionKind {
         SectionKind::Data
     } else if name.starts_with(b".bss") {
         SectionKind::Bss
-    } else if name.starts_with(b".debug_") {
+    } else if is_debug_section_name(name) {
         SectionKind::Debug
     } else if name == b".eh_frame" {
         SectionKind::EhFrame
@@ -407,6 +428,23 @@ fn classify_section(name: &[u8], flags: u64) -> SectionKind {
         SectionKind::InitArray
     } else {
         SectionKind::Other
+    }
+}
+
+fn is_debug_section_name(name: &[u8]) -> bool {
+    name == b".debug"
+        || name.starts_with(b".debug_")
+        || name.starts_with(b".zdebug_")
+        || name.starts_with(b".gnu.debuglto_")
+}
+
+fn normalize_debug_section_name(name: &[u8]) -> Vec<u8> {
+    if let Some(rest) = name.strip_prefix(b".zdebug_") {
+        let mut normalized = b".debug_".to_vec();
+        normalized.extend_from_slice(rest);
+        normalized
+    } else {
+        name.to_vec()
     }
 }
 
@@ -512,6 +550,17 @@ pub struct SharedObject {
     /// `exports`. Used to synthesise `.gnu.version_r` so the dynamic loader
     /// binds the correct versioned definition.
     pub export_versions: Vec<Option<Vec<u8>>>,
+    /// Full metadata for each dynamic export, parallel to `exports`.
+    pub export_symbols: Vec<SharedExport>,
+}
+
+/// Metadata for one exported dynamic symbol in a shared object.
+#[derive(Debug, Clone)]
+pub struct SharedExport {
+    pub name: Vec<u8>,
+    pub version: Option<Vec<u8>>,
+    pub size: u64,
+    pub st_type: u8,
 }
 
 /// Count the FDE (Frame Description Entry) records in a `.eh_frame` section.
@@ -679,6 +728,7 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
 
     let mut exports = Vec::new();
     let mut export_versions = Vec::new();
+    let mut export_symbols = Vec::new();
     for sym in elf.dynamic_symbols() {
         if sym.is_undefined() || sym.is_local() {
             continue;
@@ -695,7 +745,22 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
                 _ => None,
             }
         });
-        exports.push(name.to_vec());
+        let name = name.to_vec();
+        let st_type = match sym.kind() {
+            object::SymbolKind::Text => elf::STT_FUNC,
+            object::SymbolKind::Data => elf::STT_OBJECT,
+            object::SymbolKind::Tls => elf::STT_TLS,
+            object::SymbolKind::Section => elf::STT_SECTION,
+            object::SymbolKind::File => elf::STT_FILE,
+            _ => elf::STT_NOTYPE,
+        };
+        export_symbols.push(SharedExport {
+            name: name.clone(),
+            version: ver.clone(),
+            size: sym.size(),
+            st_type,
+        });
+        exports.push(name);
         export_versions.push(ver);
     }
 
@@ -710,6 +775,7 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
         soname,
         exports,
         export_versions,
+        export_symbols,
     })
 }
 
@@ -753,6 +819,7 @@ pub mod elf {
     pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
     pub const PT_GNU_STACK: u32 = 0x6474_e551;
     pub const PT_GNU_RELRO: u32 = 0x6474_e552;
+    pub const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 
     // ── p_flags ──
     pub const PF_X: u32 = 0x1;
@@ -777,6 +844,7 @@ pub mod elf {
     pub const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
     pub const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
     pub const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
+    pub const SHT_SYMTAB_SHNDX: u32 = 18;
 
     /// GNU build-id note type.
     pub const NT_GNU_BUILD_ID: u32 = 3;
@@ -816,6 +884,7 @@ pub mod elf {
 
     // ── dynamic relocation types ──
     pub const R_X86_64_64: u32 = 1;
+    pub const R_X86_64_COPY: u32 = 5;
     pub const R_X86_64_GLOB_DAT: u32 = 6;
     pub const R_X86_64_JUMP_SLOT: u32 = 7;
     pub const R_X86_64_RELATIVE: u32 = 8;
@@ -834,8 +903,10 @@ pub mod elf {
 
     // ── special section indices ──
     pub const SHN_UNDEF: u16 = 0;
+    pub const SHN_LORESERVE: u16 = 0xff00;
     pub const SHN_ABS: u16 = 0xfff1;
     pub const SHN_COMMON: u16 = 0xfff2;
+    pub const SHN_XINDEX: u16 = 0xffff;
 
     // ── symbol binding / type / visibility ──
     pub const STB_LOCAL: u8 = 0;

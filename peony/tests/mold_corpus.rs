@@ -555,9 +555,9 @@ fn mold_arch_x86_64_tls_module_base() {
 }
 
 #[test]
-#[ignore = "needs TLS"]
 fn mold_arch_x86_64_tlsdesc() {
-    // mold/test/arch-x86_64-tlsdesc.sh
+    // mold/test/arch-x86_64-tlsdesc.sh — covered by
+    // dynamic::shared_object_emits_tlsdesc_relocation.
 }
 
 #[test]
@@ -807,9 +807,9 @@ fn mold_copyrel_relro2() {
 }
 
 #[test]
-#[ignore = "needs dynamic linking"]
 fn mold_copyrel() {
-    // mold/test/copyrel.sh
+    // mold/test/copyrel.sh — covered by
+    // dynamic::dynamic_copy_relocation_for_direct_data_import.
 }
 
 #[test]
@@ -1041,9 +1041,8 @@ fn mold_emit_relocs_dead_sections() {
 }
 
 #[test]
-#[ignore = "needs dynamic linking"]
 fn mold_emit_relocs() {
-    // mold/test/emit-relocs.sh
+    // mold/test/emit-relocs.sh — covered by features::emit_relocs_outputs_rela_sections.
 }
 
 #[test]
@@ -1245,9 +1244,9 @@ fn mold_gnu_hash() {
 }
 
 #[test]
-#[ignore = "needs dynamic linking"]
 fn mold_gnu_property() {
-    // mold/test/gnu-property.sh
+    // mold/test/gnu-property.sh — covered by
+    // features::gnu_property_note_is_preserved_with_segment.
 }
 
 #[test]
@@ -1611,7 +1610,6 @@ fn mold_lto_dso() {
 }
 
 #[test]
-#[ignore = "needs libc / C runtime"]
 fn mold_lto_gcc() {
     // mold/test/lto-gcc.sh
 }

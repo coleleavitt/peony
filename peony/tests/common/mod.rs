@@ -22,10 +22,16 @@ pub fn workdir(tag: &str) -> PathBuf {
 
 /// Assemble x86-64 source → `.o`; returns its path.
 pub fn assemble(dir: &Path, name: &str, src: &str) -> PathBuf {
+    assemble_with_args(dir, name, src, &[])
+}
+
+/// Assemble x86-64 source with extra assembler flags → `.o`; returns its path.
+pub fn assemble_with_args(dir: &Path, name: &str, src: &str, extra: &[&str]) -> PathBuf {
     let s = dir.join(format!("{name}.s"));
     let o = dir.join(format!("{name}.o"));
     std::fs::write(&s, src).unwrap();
     let st = Command::new("as")
+        .args(extra)
         .args(["--64", "-o"])
         .arg(&o)
         .arg(&s)
@@ -89,7 +95,7 @@ pub fn link_raw(out: &Path, inputs: &[PathBuf], extra: &[&str]) -> Output {
     for i in inputs {
         cmd.arg(i);
     }
-    cmd.env("RUST_LOG", "info").output().expect("run peony")
+    cmd.env("PEONY_LOG", "info").output().expect("run peony")
 }
 
 /// Reference link with GNU `ld` (for differential checks).
@@ -229,5 +235,15 @@ pub fn readelf(path: &Path, args: &[&str]) -> String {
         .arg(path)
         .output()
         .expect("run readelf");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `objdump <args> <path>` stdout as a String.
+pub fn objdump(path: &Path, args: &[&str]) -> String {
+    let out = Command::new("objdump")
+        .args(args)
+        .arg(path)
+        .output()
+        .expect("run objdump");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

@@ -79,7 +79,8 @@ peony -o output input.o [input2.o ...] [-L dir] [-l lib] [flags]
 | `--version-script FILE` | Export/localise symbols per version script |
 | `--defsym SYM=VAL` | Define an absolute symbol |
 | `--threads N` | Worker thread count (0 = auto) |
-| `-s` / `--strip-all` | Strip symbol table |
+| `-s` / `--strip-all` | Strip symbol table and debug sections |
+| `-S` / `--strip-debug` | Strip debug sections but keep `.symtab` |
 
 ### Invoking from rustc
 
