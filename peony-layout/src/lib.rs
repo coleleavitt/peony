@@ -43,6 +43,10 @@ pub enum LayoutError {
     NoEntry(String),
     #[error("undefined symbol `{0}`")]
     Undefined(String),
+    #[error(
+        "internal error: program-header count mismatch (predicted {predicted}, emitted {actual})"
+    )]
+    PhdrCountMismatch { predicted: u64, actual: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, LayoutError>;
@@ -936,8 +940,11 @@ pub fn compute_layout(
     // PT_PHDR + PT_NOTE? + (PT_INTERP + PT_DYNAMIC)? + PT_TLS? + PT_GNU_EH_FRAME?
     //   + loads + PT_GNU_RELRO? + PT_GNU_STACK
     let has_eh_frame_hdr = n_fdes > 0;
-    // RELRO applies to dynamic links that have any of the relro sections. The
-    // exact span is computed later; here we just need to know if one will exist.
+    // RELRO is emitted for exactly the dynamic links. This single boolean is the
+    // ONLY gate used both here (header count) and at the push site below, so the
+    // count can never disagree with what is emitted. A dynamic link always has a
+    // `.dynamic` section, which is itself a RELRO member, so the span is always
+    // non-empty — but the push falls back to `.dynamic` defensively regardless.
     let has_relro = dynamic.is_some();
     let phnum = (1
         + usize::from(config.build_id)
@@ -1490,41 +1497,56 @@ pub fn compute_layout(
     // `.data.rel.ro`, `.dynamic`, `.got`) and can be made read-only afterwards.
     // With BIND_NOW (which peony sets) the whole region is eagerly resolved, so
     // the loader can mprotect it read-only — a standard hardening.
-    let relro_names = [
-        ".init_array",
-        ".fini_array",
-        ".data.rel.ro",
-        ".dynamic",
-        ".got",
-    ];
-    // RELRO is only meaningful for dynamic links (it protects load-time
-    // relocation targets); a static executable has no such region. This guard
-    // must match `has_relro` used for the program-header count.
-    let relro_secs: Vec<&OutputSection> = if dynamic.is_some() {
-        sections
+    //
+    // CRITICAL INVARIANT: this push fires iff `has_relro` is true, the same gate
+    // that reserved a program-header slot above. We therefore push exactly one
+    // RELRO header whenever `has_relro`, computing the span from the relro member
+    // sections and falling back to `.dynamic` (always present in a dynamic link)
+    // so the segment is never silently dropped.
+    if has_relro {
+        const RELRO_NAMES: [&str; 5] = [
+            ".init_array",
+            ".fini_array",
+            ".data.rel.ro",
+            ".dynamic",
+            ".got",
+        ];
+        let relro_secs: Vec<&OutputSection> = sections
             .iter()
-            .filter(|s| relro_names.contains(&s.name.as_str()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if let (Some(lo), Some(hi)) = (
-        relro_secs.iter().map(|s| s.sh_addr).min(),
-        relro_secs.iter().map(|s| s.sh_addr + s.sh_size).max(),
-    ) {
-        let lo_off = relro_secs
+            .filter(|s| RELRO_NAMES.contains(&s.name.as_str()))
+            .collect();
+        let span = relro_secs
             .iter()
-            .min_by_key(|s| s.sh_addr)
-            .map(|s| s.sh_offset)
-            .unwrap_or(0);
-        let size = hi - lo;
+            .map(|s| (s.sh_addr, s.sh_addr + s.sh_size, s.sh_offset))
+            .fold(
+                None,
+                |acc: Option<(u64, u64, u64)>, (lo, hi, off)| match acc {
+                    None => Some((lo, hi, off)),
+                    Some((alo, ahi, aoff)) => {
+                        Some((alo.min(lo), ahi.max(hi), if lo < alo { off } else { aoff }))
+                    }
+                },
+            )
+            .or_else(|| {
+                // Defensive fallback: anchor on `.dynamic`, which a dynamic link
+                // always has. If even that is missing, anchor on the RW segment.
+                sections
+                    .iter()
+                    .find(|s| s.source == SecSource::Dynamic)
+                    .map(|s| (s.sh_addr, s.sh_addr + s.sh_size, s.sh_offset))
+            });
+        let (lo, hi, lo_off) = span.unwrap_or((base, base, 0));
+        let size = hi.saturating_sub(lo);
         tracing::debug!(
             relro_lo = format_args!("{lo:#x}"),
             relro_hi = format_args!("{hi:#x}"),
             size,
-            sections = relro_secs.len(),
+            members = relro_secs.len(),
             "PT_GNU_RELRO span"
         );
+        if size == 0 {
+            tracing::warn!("PT_GNU_RELRO span is empty; emitting a zero-size RELRO header");
+        }
         segments.push(ProgramHeader {
             p_type: elf::PT_GNU_RELRO,
             p_flags: elf::PF_R,
@@ -1559,7 +1581,16 @@ pub fn compute_layout(
         segment_types = ?segments.iter().map(|s| s.p_type).collect::<Vec<_>>(),
         "segment count check"
     );
-    debug_assert_eq!(segments.len() as u64, phnum);
+    // Hard invariant: the reserved program-header count MUST equal the number of
+    // segments emitted, or e_phnum disagrees with the actual headers and the
+    // loader reads garbage. Enforce in all builds (not just debug), since a
+    // mismatch silently corrupts the binary.
+    if segments.len() as u64 != phnum {
+        return Err(LayoutError::PhdrCountMismatch {
+            predicted: phnum,
+            actual: segments.len() as u64,
+        });
+    }
 
     // ── Linker-defined symbol addresses ──────────────────────────────────────
     let mut image_end = base;
