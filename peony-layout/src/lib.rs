@@ -91,6 +91,8 @@ pub enum SecSource {
     GnuVersion,
     /// `.gnu.version_r` — verneed records for the required library versions.
     GnuVersionR,
+    /// `.eh_frame_hdr` — sorted FDE binary-search table (PT_GNU_EH_FRAME).
+    EhFrameHdr,
 }
 
 /// Inputs needed to lay out a dynamic executable.
@@ -138,6 +140,8 @@ pub struct DynBlobs {
     /// GLOB_DAT relocations, assembled into `rela_dyn` after the RELATIVE
     /// entries by `Layout::append_relative_relocs`.
     pub rela_glob_dat: Vec<u8>,
+    /// `.eh_frame_hdr` bytes, built post-layout by `Layout::build_eh_frame_hdr`.
+    pub eh_frame_hdr: Vec<u8>,
 }
 
 /// A merged output section with a full section-header plan.
@@ -273,6 +277,68 @@ impl Layout {
         self.patch_dt_relacount(written);
         self.patch_dt_relasz(actual_sz);
         self.set_rela_dyn_size(actual_sz);
+    }
+
+    /// Build `.eh_frame_hdr`: the version-1 header plus a binary-search table of
+    /// `(initial_location, fde_address)` pairs sorted by PC, both encoded as
+    /// 4-byte signed offsets relative to the start of `.eh_frame_hdr`
+    /// (DW_EH_PE_datarel | sdata4). Must run after layout assigns addresses.
+    ///
+    /// `objects` supplies the input `.eh_frame` bytes; `self` supplies the
+    /// output addresses of each `.eh_frame` contribution.
+    pub fn build_eh_frame_hdr(&mut self, objects: &[InputObject]) {
+        let Some(hdr_va) = self
+            .output_sections
+            .iter()
+            .find(|s| s.source == SecSource::EhFrameHdr)
+            .map(|s| s.sh_addr)
+        else {
+            return;
+        };
+        let Some(eh) = self.output_sections.iter().find(|s| s.name == ".eh_frame") else {
+            return;
+        };
+        let eh_va = eh.sh_addr;
+
+        // Collect (func_pc, fde_va) for every FDE, computing absolute addresses.
+        let mut entries: Vec<(i64, i64)> = Vec::new();
+        for c in &eh.contributions {
+            let Some(obj) = objects.get(c.object_id) else {
+                continue;
+            };
+            let Some(&pos) = obj.section_map.get(&c.section_index) else {
+                continue;
+            };
+            let Some(isec) = obj.sections.get(pos) else {
+                continue;
+            };
+            let contrib_va = eh_va + c.offset;
+            for (fde_off, pcbegin_off, rel) in peony_object::iter_fdes(&isec.data) {
+                // PC begin is pcrel to its own field location.
+                let pcbegin_va = contrib_va + pcbegin_off as u64;
+                let func_pc = (pcbegin_va as i64).wrapping_add(rel);
+                let fde_va = (contrib_va + fde_off as u64) as i64;
+                entries.push((func_pc, fde_va));
+            }
+        }
+        entries.sort_by_key(|&(pc, _)| pc);
+
+        // Header (DW_EH_PE constants): eh_frame_ptr = pcrel|sdata4 (0x1b),
+        // fde_count = udata4 (0x03), table = datarel|sdata4 (0x3b).
+        let mut hdr = Vec::with_capacity(12 + entries.len() * 8);
+        hdr.push(1u8); // version
+        hdr.push(0x1b); // eh_frame_ptr_enc
+        hdr.push(0x03); // fde_count_enc
+        hdr.push(0x3b); // table_enc
+        // eh_frame_ptr: offset to .eh_frame relative to this field (pcrel).
+        let efp_field_va = hdr_va + 4;
+        hdr.extend_from_slice(&((eh_va as i64 - efp_field_va as i64) as i32).to_le_bytes());
+        hdr.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (func_pc, fde_va) in &entries {
+            hdr.extend_from_slice(&((func_pc - hdr_va as i64) as i32).to_le_bytes());
+            hdr.extend_from_slice(&((fde_va - hdr_va as i64) as i32).to_le_bytes());
+        }
+        self.dyn_blobs.eh_frame_hdr = hdr;
     }
 
     /// The reserved `.rela.dyn` section size from layout (full prefix + globs).
@@ -704,6 +770,29 @@ pub fn compute_layout(
         });
     }
 
+    // Synthesise `.eh_frame_hdr` when `.eh_frame` is present: a sorted FDE
+    // binary-search table the unwinder finds via PT_GNU_EH_FRAME. Size is
+    // 12-byte header + 8 bytes per FDE; the contents are filled post-layout.
+    let n_fdes: usize = objects
+        .iter()
+        .flat_map(|o| o.sections.iter())
+        .filter(|s| s.kind == SectionKind::EhFrame)
+        .map(|s| peony_object::count_fdes(&s.data))
+        .sum();
+    if n_fdes > 0 {
+        ro.push(Builder {
+            name: ".eh_frame_hdr".to_string(),
+            kind: SectionKind::Other,
+            sh_flags: elf::SHF_ALLOC,
+            sh_type: elf::SHT_PROGBITS,
+            align: 4,
+            size: 12 + 8 * n_fdes as u64,
+            perm: Perm::Ro,
+            is_nobits: false,
+            contributions: Vec::new(),
+        });
+    }
+
     // Synthesise dynamic-linking sections (RO except .dynamic which is RW).
     let mut dyn_entries = 0usize;
     if let Some(dynj) = dynamic {
@@ -840,11 +929,14 @@ pub fn compute_layout(
         .chain(rw_bss.iter())
         .any(|b| matches!(b.kind, SectionKind::Tdata | SectionKind::Tbss));
     let num_load = 1 + usize::from(has_rx) + usize::from(has_rw); // RO(headers) + RX? + RW?
-    // PT_PHDR + PT_NOTE? + (PT_INTERP + PT_DYNAMIC)? + PT_TLS? + loads + PT_GNU_STACK
+    // PT_PHDR + PT_NOTE? + (PT_INTERP + PT_DYNAMIC)? + PT_TLS? + PT_GNU_EH_FRAME?
+    //   + loads + PT_GNU_STACK
+    let has_eh_frame_hdr = n_fdes > 0;
     let phnum = (1
         + usize::from(config.build_id)
         + if dynamic.is_some() { 2 } else { 0 }
         + usize::from(has_tls)
+        + usize::from(has_eh_frame_hdr)
         + num_load
         + 1) as u64;
     let header_size = elf::EHDR_SIZE + phnum * elf::PHDR_SIZE;
@@ -1363,6 +1455,20 @@ pub fn compute_layout(
             p_align: tls_align,
         });
     }
+    // PT_GNU_EH_FRAME points at `.eh_frame_hdr` so the unwinder can binary-search
+    // FDEs via `dl_iterate_phdr`.
+    if let Some(eh) = sections.iter().find(|s| s.source == SecSource::EhFrameHdr) {
+        segments.push(ProgramHeader {
+            p_type: elf::PT_GNU_EH_FRAME,
+            p_flags: elf::PF_R,
+            p_offset: eh.sh_offset,
+            p_vaddr: eh.sh_addr,
+            p_paddr: eh.sh_addr,
+            p_filesz: eh.sh_size,
+            p_memsz: eh.sh_size,
+            p_align: 4,
+        });
+    }
     // Non-executable stack marker.
     segments.push(ProgramHeader {
         p_type: elf::PT_GNU_STACK,
@@ -1742,6 +1848,7 @@ fn place(
                 ".rela.plt" => SecSource::RelaPlt,
                 ".gnu.version" => SecSource::GnuVersion,
                 ".gnu.version_r" => SecSource::GnuVersionR,
+                ".eh_frame_hdr" => SecSource::EhFrameHdr,
                 _ if b.is_nobits => SecSource::Bss,
                 _ => SecSource::Input,
             },
@@ -1938,8 +2045,10 @@ fn is_allocatable(name: &[u8], kind: SectionKind, flags: u64) -> bool {
     if kind == SectionKind::Debug {
         return false;
     }
-    // .eh_frame / .note need synthetic handling we don't do yet; skip them.
-    if name.starts_with(b".eh_frame") || name.starts_with(b".note") {
+    // `.note` needs synthetic handling we don't do yet; skip it. `.eh_frame` is
+    // kept (passed through) so the unwinder can find FDEs; `.eh_frame_hdr` is
+    // synthesised separately.
+    if name.starts_with(b".note") {
         return false;
     }
     true

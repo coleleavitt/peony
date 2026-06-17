@@ -454,6 +454,67 @@ pub struct SharedObject {
     pub export_versions: Vec<Option<Vec<u8>>>,
 }
 
+/// Count the FDE (Frame Description Entry) records in a `.eh_frame` section.
+///
+/// `.eh_frame` is a sequence of length-prefixed records: a 4-byte length (0
+/// terminates; 0xffffffff introduces a 8-byte extended length), then a 4-byte
+/// CIE pointer that is 0 for a CIE and non-zero for an FDE. We count the FDEs
+/// to size `.eh_frame_hdr`.
+pub fn count_fdes(data: &[u8]) -> usize {
+    let mut pos = 0usize;
+    let mut n = 0usize;
+    while pos + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            break; // terminator
+        }
+        if len == 0xffff_ffff {
+            break; // 64-bit extended length unsupported; stop conservatively
+        }
+        let rec_start = pos + 4;
+        if rec_start + 4 > data.len() || rec_start + len > data.len() {
+            break;
+        }
+        let cie_ptr = u32::from_le_bytes(data[rec_start..rec_start + 4].try_into().unwrap());
+        if cie_ptr != 0 {
+            n += 1; // FDE
+        }
+        pos = rec_start + len;
+    }
+    n
+}
+
+/// Iterate the FDEs in a `.eh_frame`, yielding each FDE record's byte offset
+/// within the section and the `PC begin` field's signed 4-byte value at that
+/// offset+8 (a PC-relative reference to the described function). Returns
+/// `(fde_section_offset, pc_begin_field_offset, pc_begin_rel)` per FDE.
+pub fn iter_fdes(data: &[u8]) -> Vec<(usize, usize, i64)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        if len == 0 || len == 0xffff_ffff {
+            break;
+        }
+        let rec_start = pos + 4;
+        if rec_start + 8 > data.len() || rec_start + len > data.len() {
+            break;
+        }
+        let cie_ptr = u32::from_le_bytes(data[rec_start..rec_start + 4].try_into().unwrap());
+        if cie_ptr != 0 {
+            // FDE: `PC begin` follows the CIE pointer (4 bytes in), encoded
+            // (for the GCC default) as DW_EH_PE_pcrel|sdata4 — a signed 4-byte
+            // offset relative to its own location.
+            let pcbegin_off = rec_start + 4;
+            let rel =
+                i32::from_le_bytes(data[pcbegin_off..pcbegin_off + 4].try_into().unwrap()) as i64;
+            out.push((pos, pcbegin_off, rel));
+        }
+        pos = rec_start + len;
+    }
+    out
+}
+
 /// Read `DT_SONAME` from a parsed shared object, if present.
 fn elf_soname(elf: &ElfFile64<Endianness>, data: &[u8]) -> Option<String> {
     use object::read::elf::Dyn;

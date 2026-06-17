@@ -293,6 +293,9 @@ fn write_section_data_parallel(
             SecSource::GnuVersionR => {
                 write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.gnu_version_r)
             }
+            SecSource::EhFrameHdr => {
+                write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.eh_frame_hdr)
+            }
             SecSource::Dynamic => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.dynamic),
             SecSource::Plt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.plt),
             SecSource::GotPlt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.got_plt),
