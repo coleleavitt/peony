@@ -1555,10 +1555,13 @@ fn inject_crt_objects(inputs: Vec<PathBuf>, args: &Args) -> Vec<PathBuf> {
 /// True if `path` is a relocatable object that defines a global `_start`.
 /// Used to decide whether the C-runtime startup objects are needed.
 fn object_defines_start(path: &Path) -> bool {
-    if is_archive(path) || peony_object::is_shared_object(path) {
+    // Only a bare relocatable object can be the freestanding `_start` provider;
+    // archives/shared objects never suppress crt injection. One header read
+    // (classify_file) instead of the former is_archive + is_shared_object double
+    // open, then a symbol-table-only scan (no full parse) for the bare case.
+    if peony_object::classify_file(path) != peony_object::FileKind::Bare {
         return false;
     }
-    // Symbol-table-only scan (no full parse / reloc scan); see peony-object.
     peony_object::object_defines_global_start(path)
 }
 
@@ -1662,16 +1665,6 @@ fn init_thread_pool(threads: usize, n_inputs: usize) -> Result<()> {
         .build_global()
         .context("failed to configure rayon thread pool")?;
     Ok(())
-}
-
-/// An archive iff the file begins with the `ar` magic.
-fn is_archive(path: &Path) -> bool {
-    use std::io::Read;
-    let mut magic = [0u8; 8];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .map(|_| &magic == b"!<arch>\n")
-        .unwrap_or(false)
 }
 
 fn parse_hex_or_dec(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
