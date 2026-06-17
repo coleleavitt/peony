@@ -6,3 +6,12 @@ rocq-tests/*.vok
 rocq-tests/*.vos
 rocq-tests/*.glob
 rocq-tests/.*.aux
+
+# research materials (large PDFs/HTMLs)
+research/
+
+# jfc / local tooling
+jfc-transcript.md
+.lia.cache
+.jfc/
+.codegraph/

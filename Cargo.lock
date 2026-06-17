@@ -756,6 +756,7 @@ dependencies = [
 [[package]]
 name = "ws-deque"
 version = "0.1.0"
+source = "git+https://github.com/coleleavitt/ws-deque.git#4a277b7221ff962d2e467d0fe251ebbd5b4c6986"
 dependencies = [
  "loom",
 ]

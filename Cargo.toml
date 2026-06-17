@@ -20,7 +20,7 @@ license = "MIT OR Apache-2.0"
 # ELF parsing
 object = { version = "0.36", features = ["read_core", "elf"] }
 # Work-stealing scheduler (Chase-Lev deque + lifeline load balancer)
-ws-deque = { path = "/home/cole/RustProjects/ws-deque" }
+ws-deque = { git = "https://github.com/coleleavitt/ws-deque.git" }
 # Parallel iteration (kept for crossbeam compat; prefer ws-deque for hot paths)
 rayon = "1.10"
 # Fast hashing
