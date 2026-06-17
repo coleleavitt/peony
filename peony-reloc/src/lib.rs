@@ -62,7 +62,10 @@ pub mod r_x86_64 {
     pub const PC8: u32 = 15;
     pub const DTPOFF64: u32 = 17;
     pub const TPOFF64: u32 = 18;
+    pub const TLSGD: u32 = 19; // General-Dynamic: relaxed to Local-Exec in an exe
+    pub const TLSLD: u32 = 20; // Local-Dynamic: relaxed to Local-Exec in an exe
     pub const DTPOFF32: u32 = 21;
+    pub const GOTTPOFF: u32 = 22; // Initial-Exec GOT slot with the TP offset
     pub const TPOFF32: u32 = 23;
     pub const PC64: u32 = 24;
     pub const GOTOFF64: u32 = 25;
@@ -77,7 +80,13 @@ pub mod r_x86_64 {
 fn is_tls(r_type: u32) -> bool {
     matches!(
         r_type,
-        r_x86_64::TPOFF32 | r_x86_64::TPOFF64 | r_x86_64::DTPOFF32 | r_x86_64::DTPOFF64
+        r_x86_64::TPOFF32
+            | r_x86_64::TPOFF64
+            | r_x86_64::DTPOFF32
+            | r_x86_64::DTPOFF64
+            | r_x86_64::TLSGD
+            | r_x86_64::TLSLD
+            | r_x86_64::GOTTPOFF
     )
 }
 
@@ -216,8 +225,11 @@ fn scan_object(obj: &InputObject, symbols: &SymbolTable) -> Vec<SyntheticSlot> {
                 && (res.is_defined() || res.import || res.binding == Binding::Weak)
             {
                 slots.push(SyntheticSlot::Got(res.id));
-            } else if reloc.r_type == r_x86_64::PLT32 && res.import {
-                // A direct `call foo@PLT` to an imported function needs a PLT stub.
+            } else if reloc.r_type == r_x86_64::PLT32 && res.import && sym.name != b"__tls_get_addr"
+            {
+                // A direct `call foo@PLT` to an imported function needs a PLT
+                // stub — except `__tls_get_addr`, whose GD/LD call sites are
+                // relaxed to Local-Exec (the import is dropped entirely).
                 slots.push(SyntheticSlot::Plt(res.id));
             }
         }
@@ -399,6 +411,13 @@ pub fn apply_reloc(
         return Ok(());
     };
 
+    // The `call __tls_get_addr@PLT` that follows a GD/LD `lea` is rewritten by
+    // the TLSGD/TLSLD relaxation; its PLT32/PC32 relocation must not run, or it
+    // would corrupt the relaxed Local-Exec instruction bytes.
+    if matches!(reloc.r_type, r_x86_64::PLT32 | r_x86_64::PC32) && sym.name == b"__tls_get_addr" {
+        return Ok(());
+    }
+
     // Resolve the symbol's address (S), GOT slot (G), PLT (L), size (Z).
     let (s, g, l, z) = if sym.binding == Binding::Local {
         let s = match sym.section {
@@ -561,6 +580,52 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
             off as u64,
         )?,
         DTPOFF64 => write_u64(buf, off, (a.tls as i64).wrapping_add(a.a) as u64),
+
+        // ── TLS access-model relaxation (executable ⇒ Local-Exec) ────────────
+        //
+        // In an executable the static TLS block is fixed, so General-Dynamic and
+        // Local-Dynamic accesses are relaxed to Local-Exec, eliminating the
+        // runtime `__tls_get_addr` call. We rewrite the fixed instruction
+        // sequence the compiler emits and patch the TP-relative offset.
+        TLSGD => {
+            // GD sequence (16 bytes), reloc at the lea displacement (off):
+            //   66 48 8d 3d <disp32>      lea x@tlsgd(%rip),%rdi   [off-4 .. off]
+            //   66 66 48 e8 <pc32>        call __tls_get_addr@plt
+            // → Local-Exec (16 bytes):
+            //   64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax
+            //   48 8d 80 <tpoff32>           lea x@tpoff(%rax),%rax
+            let start = off.wrapping_sub(4);
+            if start + 16 <= buf.len() {
+                let le_off = (a.tls as i64)
+                    .wrapping_add(a.a)
+                    .wrapping_sub(a.tls_size as i64) as i32;
+                buf[start..start + 16].copy_from_slice(&[
+                    0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
+                    0x48, 0x8d, 0x80, 0, 0, 0, 0, // lea off(%rax),%rax
+                ]);
+                buf[start + 12..start + 16].copy_from_slice(&le_off.to_le_bytes());
+            }
+        }
+        TLSLD => {
+            // LD sequence (12 bytes), reloc at the lea displacement (off):
+            //   48 8d 3d <disp32>     lea x@tlsld(%rip),%rdi   [off-4 .. off]
+            //   e8 <pc32>             call __tls_get_addr@plt
+            // → Local-Exec base load (no symbol offset; DTPOFF adds the rest):
+            //   66 66 66 64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax (padded)
+            let start = off.wrapping_sub(4);
+            if start + 12 <= buf.len() {
+                buf[start..start + 12].copy_from_slice(&[
+                    0x66, 0x66, 0x66, // nop padding
+                    0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
+                ]);
+            }
+        }
+        // Initial-Exec: GOT slot holds the TP offset; here we keep the GOT
+        // mechanism and write the slot value as a Local-Exec offset.
+        GOTTPOFF => {
+            let v = (a.g as i64).wrapping_add(a.a).wrapping_sub(p);
+            write_i32(buf, off, v, r_type, object, off as u64)?
+        }
 
         R16 => write_u16(buf, off, s.wrapping_add(a.a), object, off as u64)?,
         PC16 => write_u16(
