@@ -628,10 +628,35 @@ fn main() -> Result<()> {
 fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     let mut r = Resolver::default();
 
+    // Classify each input ONCE by reading only its leading magic bytes. The old
+    // code called `is_archive` + `is_shared_object` in three separate filters,
+    // re-opening (and `is_shared_object` formerly re-reading whole) every input
+    // up to 3× — on a 419-object link that was ~3950 openat calls. One pass.
+    #[derive(PartialEq)]
+    enum Kind {
+        Bare,
+        Archive,
+        Shared,
+    }
+    let kinds: Vec<Kind> = inputs
+        .iter()
+        .map(|p| {
+            if is_archive(p) {
+                Kind::Archive
+            } else if peony_object::is_shared_object(p) {
+                Kind::Shared
+            } else {
+                Kind::Bare
+            }
+        })
+        .collect();
+
     // ── Bare objects: parallel parse, then serial resolve in input order ─────
     let bare: Vec<&PathBuf> = inputs
         .iter()
-        .filter(|p| !is_archive(p) && !peony_object::is_shared_object(p))
+        .zip(&kinds)
+        .filter(|(_, k)| **k == Kind::Bare)
+        .map(|(p, _)| p)
         .collect();
     tracing::info!(objects = bare.len(), "parsing input objects");
     // Small links (the common `cc`/incremental case) parse faster serially:
@@ -658,14 +683,24 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     }
 
     // ── Archives: lazily include members that satisfy undefined references ────
-    let archives: Vec<&PathBuf> = inputs.iter().filter(|p| is_archive(p)).collect();
+    let archives: Vec<&PathBuf> = inputs
+        .iter()
+        .zip(&kinds)
+        .filter(|(_, k)| **k == Kind::Archive)
+        .map(|(p, _)| p)
+        .collect();
     if !archives.is_empty() {
         include_archive_members(&archives, &mut r)?;
     }
 
     // ── Shared objects: their exports satisfy remaining undefined refs ────────
     let mut needed = Vec::new();
-    for so in inputs.iter().filter(|p| peony_object::is_shared_object(p)) {
+    for so in inputs
+        .iter()
+        .zip(&kinds)
+        .filter(|(_, k)| **k == Kind::Shared)
+        .map(|(p, _)| p)
+    {
         let lib = peony_object::parse_shared_object(so)
             .with_context(|| format!("reading shared object `{}`", so.display()))?;
         if r.symbols
@@ -1424,12 +1459,8 @@ fn object_defines_start(path: &Path) -> bool {
     if is_archive(path) || peony_object::is_shared_object(path) {
         return false;
     }
-    match peony_object::parse_object(path) {
-        Ok(obj) => obj.symbols.iter().any(|s| {
-            s.name == b"_start" && !s.is_undefined && s.binding != peony_object::Binding::Local
-        }),
-        Err(_) => false,
-    }
+    // Symbol-table-only scan (no full parse / reloc scan); see peony-object.
+    peony_object::object_defines_global_start(path)
 }
 
 /// The full library search path: explicit `-L` dirs first (highest priority),

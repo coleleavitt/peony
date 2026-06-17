@@ -710,6 +710,26 @@ pub fn is_shared_object(path: &Path) -> bool {
     &hdr[0..4] == b"\x7fELF" && u16::from_le_bytes([hdr[16], hdr[17]]) == 3
 }
 
+/// Does this object define a non-local, defined `_start`? Used by the driver to
+/// decide whether to inject the C runtime. This mmaps and walks ONLY the symbol
+/// table — no section copy, no relocation parse — so it is far cheaper than a
+/// full [`parse_object`] (which the driver formerly ran over every input just to
+/// answer this yes/no question).
+pub fn object_defines_global_start(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // SAFETY: read-only view; we never mutate and drop it before returning.
+    let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
+        return false;
+    };
+    let Ok(elf) = ElfFile64::<Endianness>::parse(&*mmap) else {
+        return false;
+    };
+    elf.symbols()
+        .any(|s| s.name_bytes() == Ok(b"_start") && !s.is_undefined() && s.is_global())
+}
+
 /// Parse a shared object's exported dynamic symbols and its `DT_SONAME`
 /// (falling back to the file's base name).
 pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {

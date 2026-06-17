@@ -1,0 +1,61 @@
+=== ICFSoundness.v Soundness Review ===
+
+README claims (from line 89-95):
+1. "calls are always safe to redirect" — icf_call_preserved ✓
+2. "only observable hazard is address comparison between folded functions" — icf_addr_change_iff_folded ✓
+3. "address-safe side-condition excludes [it]" — address_safe ✓
+4. "Hopcroft partition refinement is valid" — icf_rel_refines_content ✓
+
+KEY DEFINITIONS:
+  1. address_safe: "forall f g, f <> g -> rep F f = rep F g -> 
+                    addr_significant P f = false /\ addr_significant P g = false"
+  
+  2. observably_compared: "addr_significant P f = true \/ addr_significant P g = true"
+  
+  3. icf_sound theorem (line 158-172): 
+     "If address_safe, and (f,g) observably_compared, 
+      then addr_eq_after = addr_eq_before"
+  
+POTENTIAL ISSUE FOUND: Line 150
+  Definition observably_compared (P : program) (f g : fid) : Prop :=
+    addr_significant P f = true \/ addr_significant P g = true.
+  
+  This says "at least one is address-significant"
+  But the README comment says "whose pointer identity is observed"
+  
+  PROBLEM: Just because a function is marked address-significant 
+  doesn't mean the specific comparison (f vs g) is observed in the program!
+  
+  Example:
+    - f is address-significant (used in &f somewhere)
+    - g is address-significant (used in &g somewhere)
+    - But the program never does (f == g) comparison
+    - Then observably_compared(f, g) = true (correct)
+    - But the program doesn't observe the change from folding f and g
+    - This is still safe, but the definition is overapproximating
+  
+  VERDICT: Not broken, but conservative. The proof is sound; the side-condition 
+           is stricter than necessary (which is fine for soundness).
+
+SECOND ISSUE: Line 142-144
+  Definition address_safe (P : program) (F : fold_map P) : Prop :=
+    forall f g, f <> g -> rep F f = rep F g ->
+      addr_significant P f = false /\ addr_significant P g = false.
+  
+  This requires BOTH folded functions to be non-address-significant
+  Mold/lld's --icf=all does the same (excludes all addr-sig symbols)
+  ✓ This is CORRECT (not a bug, matches real linkers)
+
+THIRD: Line 60-64 fold_map definition
+  Record fold_map (P : program) := {
+    rep      : fid -> fid;
+    rep_idem : forall f, rep (rep f) = rep f;
+    rep_sound : forall f, content_eq P f (rep f)
+  }.
+  
+  This enforces:
+  1. Idempotence (rep is a projection)
+  2. Only merges content-equal functions
+  ✓ Both are required and enforced
+  
+VERDICT: ICFSoundness.v is well-formed. No soundness gaps found.

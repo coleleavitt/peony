@@ -1,0 +1,30 @@
+=== IncrementalCostBound.v Analysis ===
+
+1. MODELS AS `nat` (not real objects)
+   - `byte := nat` — fine for syntactic proofs
+   - `section` record — simplified (no alignment, relocs, etc.)
+   - `content := list byte` — captures only content, not structure
+
+2. DEFINITIONS AND THEIR SOUNDNESS:
+   - `is_red` uses decidable content equality on lists — sound
+   - `incremental_cost` counts red sections — correct per definition
+   - `fromscratch_cost = length` — matches statement "mold re-emits all"
+   
+3. KEY THEOREM `incremental_beats_fromscratch`:
+   - States: ∃ old new. length new = S n ∧ incremental_cost old new = 1 ∧ fromscratch_cost new = S n
+   - This is a WITNESS existence proof, not a universal claim
+   - Proof: constructs n green sections (all matching content) then appends 1 red
+   - ✓ This is SOUND (not vacuous) — the witness is concrete and non-trivial
+   
+4. POTENTIAL ISSUE: Non-Length-Matching Builds
+   - Theorem assumes equal-length lists (capacity-stable)
+   - No proof that real rebuilds satisfy this invariant
+   - BUT: capacity_stable_cost_bounded explicitly ties it to the invariant
+   - The claim "peony beats mold" requires capacity-stability (stated correctly)
+   
+5. POTENTIAL ISSUE: Section Pairing
+   - The proofs pair sections by position (nth), not by identity
+   - Real linkers match by section identity, not position
+   - This could violate the reordering case
+   - RISK: if real relink reorders sections, the proof doesn't cover it
+
