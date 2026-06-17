@@ -679,13 +679,3 @@ fn write_section_headers(buf: &mut [u8], layout: &Layout) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn input_section_data(
-    objects: &[InputObject],
-    object_id: usize,
-    section_index: usize,
-) -> Option<&[u8]> {
-    let obj = objects.get(object_id)?;
-    let &pos = obj.section_map.get(&section_index)?;
-    obj.sections.get(pos).map(|s| s.data.as_slice())
-}

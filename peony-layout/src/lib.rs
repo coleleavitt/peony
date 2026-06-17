@@ -124,6 +124,10 @@ pub struct DynamicInfo {
     /// The actual entries are filled post-layout from
     /// `peony_reloc::collect_relative` and emitted by `peony-emit`.
     pub n_relative: usize,
+    /// How many of `n_relative` are `R_X86_64_IRELATIVE` (IFUNC). Used to gate
+    /// `DT_RELACOUNT`, which counts only the leading plain-RELATIVE entries:
+    /// when `n_relative == n_irelative` (IFUNC-only), no DT_RELACOUNT is emitted.
+    pub n_irelative: usize,
 }
 
 /// Pre-built byte blobs for the dynamic-linking sections (filled by layout,
@@ -284,6 +288,7 @@ impl Layout {
             written += 1;
         }
         // IRELATIVE: IFUNC GOT slots resolved by running the resolver at startup.
+        let mut written_irel = 0usize;
         for &(site, resolver) in irelative {
             if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
                 break;
@@ -292,6 +297,17 @@ impl Layout {
             bytes.extend_from_slice(&site.to_le_bytes());
             bytes.extend_from_slice(&r_info.to_le_bytes());
             bytes.extend_from_slice(&(resolver as i64).to_le_bytes());
+            written_irel += 1;
+        }
+        // Dropping an IRELATIVE silently breaks IFUNC resolution; the section is
+        // sized for all of them, so surface a sizing regression loudly.
+        if written_irel != irelative.len() {
+            tracing::error!(
+                wrote = written_irel,
+                wanted = irelative.len(),
+                "BUG: .rela.dyn too small for all IRELATIVE entries — IFUNC resolution broken"
+            );
+            debug_assert_eq!(written_irel, irelative.len(), "IRELATIVE entries dropped");
         }
         let glob = std::mem::take(&mut self.dyn_blobs.rela_glob_dat);
         bytes.extend_from_slice(&glob);
@@ -955,7 +971,7 @@ pub fn compute_layout(
             + 5                                  // HASH,STRTAB,SYMTAB,STRSZ,SYMENT
             + 1                                  // DT_GNU_HASH
             + if has_rela { 3 } else { 0 }       // DT_RELA, DT_RELASZ, DT_RELAENT
-            + if dynj.n_relative > 0 { 1 } else { 0 } // DT_RELACOUNT
+            + if dynj.n_relative > dynj.n_irelative { 1 } else { 0 } // DT_RELACOUNT (plain RELATIVE only)
             + if n_plt > 0 { 4 } else { 0 }      // PLTGOT,PLTRELSZ,PLTREL,JMPREL
             + if has_ver { 3 } else { 0 }        // VERSYM,VERNEED,VERNEEDNUM
             + n_init + n_fini                    // DT_INIT, DT_FINI
@@ -1304,9 +1320,9 @@ pub fn compute_layout(
             glob.extend_from_slice(&r_info.to_le_bytes());
             glob.extend_from_slice(&0i64.to_le_bytes()); // r_addend
         }
-        // Reserve the full section (relatives + glob_dats); the actual content is
-        // assembled post-layout. Section size stays `(n_relative+n_glob_dat)*ent`.
-        let rela_sz = ((dynj.n_relative + n_glob_dat) as u64) * elf::RELA_SIZE;
+        // Stash the GLOB_DATs; `append_dynamic_relocs` assembles the full
+        // `.rela.dyn` (relatives + irelatives + these) post-layout. The section
+        // is sized for `(n_relative + n_glob_dat)` entries in the RO table above.
         dyn_blobs.rela_glob_dat = glob;
         dyn_blobs.rela_dyn = Vec::new();
 
@@ -1369,12 +1385,15 @@ pub fn compute_layout(
             push_dyn(elf::DT_RELASZ, total_rela);
             push_dyn(elf::DT_RELAENT, elf::RELA_SIZE);
         }
-        // DT_RELACOUNT: number of leading R_X86_64_RELATIVE entries. peony emits
-        // GLOB_DAT first then RELATIVE, but glibc only uses RELACOUNT as a fast
-        // path hint; the relatives are still applied in full, so reporting the
-        // count is safe and standard.
-        if dynj.n_relative > 0 {
-            push_dyn(elf::DT_RELACOUNT, dynj.n_relative as u64);
+        // DT_RELACOUNT: number of leading R_X86_64_RELATIVE entries (a fast-path
+        // hint; relatives are applied in full regardless). Counts ONLY plain
+        // RELATIVE, never IRELATIVE, so an IFUNC-only PIE emits none. The exact
+        // value is corrected by `append_dynamic_relocs`.
+        if dynj.n_relative > dynj.n_irelative {
+            push_dyn(
+                elf::DT_RELACOUNT,
+                (dynj.n_relative - dynj.n_irelative) as u64,
+            );
         }
         if !plt_syms.is_empty() {
             push_dyn(elf::DT_PLTGOT, va_of(SecSource::GotPlt));

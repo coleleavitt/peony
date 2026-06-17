@@ -245,11 +245,13 @@ fn main() -> Result<()> {
     // A PIE needs R_X86_64_RELATIVE dynamic relocations for absolute pointers,
     // even with no imports. Emit dynamic sections whenever there are imports OR
     // the output is a PIE (rustc/cc default).
-    let n_relative = if args.pie {
-        peony_reloc::count_relative(&objects, &symbols)
-            + peony_reloc::count_got_relative(&got_syms, &symbols)
+    let (n_relative, n_irelative) = if args.pie {
+        let total = peony_reloc::count_relative(&objects, &symbols)
+            + peony_reloc::count_got_relative(&got_syms, &symbols);
+        let irel = peony_reloc::count_irelative(&objects, &symbols, &got_syms);
+        (total, irel)
     } else {
-        0
+        (0, 0)
     };
     let dynamic = (!imports.is_empty() || args.pie).then(|| peony_layout::DynamicInfo {
         imports,
@@ -258,6 +260,7 @@ fn main() -> Result<()> {
         needed: needed.clone(),
         pie: args.pie,
         n_relative,
+        n_irelative,
     });
     if dynamic.is_some() {
         tracing::info!(needed = needed.len(), n_relative, "dynamic executable");
@@ -810,7 +813,7 @@ fn object_defines_start(path: &Path) -> bool {
 /// then GCC's own library directories, then standard system locations.
 fn library_search_paths(explicit: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = explicit.to_vec();
-    let mut push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+    let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
         if p.is_dir() && !out.contains(&p) {
             out.push(p);
         }

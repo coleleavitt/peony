@@ -280,8 +280,6 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
 
     // Raw ELF symbol table, so we can read `st_type()` (for STT_GNU_IFUNC,
     // which the high-level API folds into SymbolKind::Text).
-    use object::read::elf::Sym as _;
-    let endian = elf.endian();
     let elf_symtab = elf.elf_symbol_table();
 
     for sym in elf.symbols() {

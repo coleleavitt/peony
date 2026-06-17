@@ -237,9 +237,12 @@ fn scan_object(obj: &InputObject, symbols: &SymbolTable) -> Vec<SyntheticSlot> {
     slots
 }
 
-/// Count how many `R_X86_64_RELATIVE` dynamic relocations a PIE will need,
-/// without requiring final addresses. Used to size `.rela.dyn` before layout.
-/// Must match the set produced by [`collect_relative`] exactly.
+/// Count the base-relative R64 data relocations a PIE will need, without
+/// requiring final addresses. Used (with [`count_got_relative`]) to size
+/// `.rela.dyn` before layout. This is the COMBINED count of plain RELATIVE and
+/// IFUNC (IRELATIVE) R64 sites — i.e. it matches the union of the RELATIVE and
+/// IRELATIVE lists returned by [`collect_dynamic_data_relocs`]; use
+/// [`count_irelative`] to recover the IFUNC subset.
 pub fn count_relative(objects: &[InputObject], symbols: &SymbolTable) -> usize {
     let mut n = 0;
     for obj in objects {
@@ -339,10 +342,15 @@ pub fn collect_dynamic_data_relocs(
                     continue;
                 };
                 let site = site_va + reloc.offset;
-                let value = (target as i64).wrapping_add(reloc.addend) as u64;
                 if is_ifunc {
-                    ifunc.push((site, value));
+                    // IRELATIVE r_addend must be the bare resolver address: the
+                    // loader computes `*site = resolver(base + addend)`. Folding
+                    // the input reloc addend in would call into the middle of the
+                    // resolver. (A non-zero addend on an IFUNC R64 is not
+                    // meaningful; ignore it.)
+                    ifunc.push((site, target));
                 } else {
+                    let value = (target as i64).wrapping_add(reloc.addend) as u64;
                     out.push((site, value));
                 }
             }
@@ -379,7 +387,9 @@ pub fn collect_dynamic_data_relocs(
 
 /// Count GOT slots that will need an `R_X86_64_RELATIVE` (defined non-import
 /// symbols referenced through the GOT in a PIE). Added to [`count_relative`] by
-/// the driver since GOT slots are known before layout.
+/// the driver since GOT slots are known before layout. Includes IFUNC GOT slots
+/// (which become IRELATIVE) so `.rela.dyn` is sized for the combined total; use
+/// [`count_irelative`] to find how many of those are IFUNCs.
 pub fn count_got_relative(got_syms: &[SymbolId], symbols: &SymbolTable) -> usize {
     got_syms
         .iter()
@@ -390,6 +400,59 @@ pub fn count_got_relative(got_syms: &[SymbolId], symbols: &SymbolTable) -> usize
                 .is_some_and(|r| !r.import && r.is_defined())
         })
         .count()
+}
+
+/// Count the dynamic relocations that will be `R_X86_64_IRELATIVE` (IFUNC
+/// targets): R64 data references to a defined IFUNC plus IFUNC GOT slots. This
+/// is the subset of [`count_relative`] + [`count_got_relative`] that is NOT
+/// plain RELATIVE, so the driver can gate `DT_RELACOUNT` on the true RELATIVE
+/// count (`total - irelative`).
+pub fn count_irelative(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    got_syms: &[SymbolId],
+) -> usize {
+    let mut n = 0;
+    // R64 data references to a defined IFUNC.
+    for obj in objects {
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            for reloc in &sec.relocs {
+                if reloc.r_type != r_x86_64::R64 {
+                    continue;
+                }
+                let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                else {
+                    continue;
+                };
+                let is_ifunc = if sym.binding == Binding::Local {
+                    sym.section.is_some() && sym.is_ifunc
+                } else {
+                    symbols
+                        .lookup(&sym.name)
+                        .is_some_and(|r| r.is_defined() && !r.import && r.is_ifunc)
+                };
+                if is_ifunc {
+                    n += 1;
+                }
+            }
+        }
+    }
+    // IFUNC GOT slots.
+    n += got_syms
+        .iter()
+        .filter(|id| {
+            symbols
+                .name_by_id(**id)
+                .and_then(|n| symbols.lookup(n))
+                .is_some_and(|r| !r.import && r.is_defined() && r.is_ifunc)
+        })
+        .count();
+    n
 }
 
 // ── Apply phase ──────────────────────────────────────────────────────────────
