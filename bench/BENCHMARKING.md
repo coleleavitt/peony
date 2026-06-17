@@ -80,15 +80,30 @@ Rust correctly, and on big links already beats GNU ld (bfd). It trails mold by
    This is the open architectural gap — parallel symbol resolution and a
    parallel emit that actually saturates cores (tracked in the task list).
 
-## Why peony can eventually win: the edit–rebuild loop
+## Where peony already wins: the edit–rebuild loop
 
-mold and lld have **no incremental mode**: every rebuild is O(total). peony's
-incremental path (capacity-stable in-place patching) is proven to do
-O(affected) work — a single-file edit of an n-object link touches 1 section, not
-n (`rocq-tests/IncrementalCostBound.v`, theorem `incremental_beats_fromscratch`).
-The from-scratch wall-clock gap is a constant factor; the incremental gap is
-asymptotic. To benchmark that story, capture a corpus, link once, perturb one
-input `.o`, and re-link — that is the comparison where peony's design wins.
+mold and lld have **no incremental mode**: every rebuild is O(total). peony
+caches the last link and, on a rebuild, checks each input with a single `stat()`
+(size + mtime + inode).
+
+**No-change relink (verified):** `peony --incremental` on rust-hello (23 inputs)
+is **15 ms vs mold's full link 28 ms — 1.9× faster**, and the output is
+byte-identical to a full peony link. The reuse path is O(#inputs) syscalls (no
+content read, no thread pool), and a changed input correctly falls back to a
+full link (test `incremental_cache_invalidates_on_input_change` — the cache
+never serves stale bytes).
+
+```sh
+peony --incremental <args> -o out   # first call links + caches
+peony --incremental <args> -o out   # unchanged inputs → ~instant reuse
+```
+
+**Edit-one-object relink (in progress):** currently this falls back to a full
+link (~36 ms, ~3.8× behind mold's 9.5 ms). The capacity-stable in-place patch
+that wins this case is proven in `rocq-tests/IncrementalCostBound.v`
+(`incremental_beats_fromscratch`: a single-file edit touches 1 section, not n)
+and is the next increment — the from-scratch wall-clock gap is a constant
+factor, but the incremental gap is asymptotic and is the design's real edge.
 
 ## Continuous benchmarking (CI)
 
