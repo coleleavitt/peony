@@ -127,3 +127,52 @@ fully serial, and it is doing far too much work:**
 4. reloc-postproc 17.8ms — newly surfaced #3 phase.
 5. everything else (parse, layout) — smaller.
 6. sharded resolver — still last/conditional.
+
+---
+
+# Phase-2 result — build-id hash fixed (the 30% win, SHIPPED)
+
+Changed `build_id_hash` to hash the **contiguous output image (~4MB)** in
+parallel 256KB blocks (folded in index order → thread-count-independent),
+instead of a serial byte-at-a-time double-FNV over **all ~18.5MB of scattered
+input** sections. Split `write_build_id` into a header-only write (synthetic
+pass) + `finalize_build_id` run after the whole image is written.
+
+## Measured on ripgrep (threads=0)
+
+| metric              | before   | after    | delta        |
+|---------------------|---------:|---------:|--------------|
+| emit:build-id-hash  | 52.97ms  |  3.08ms  | **17× faster** |
+| emit (total)        | 78.97ms  | ~15-25ms | ~3-5× faster |
+| **TOTAL link**      | 177.54ms | **~120-128ms** | **~30% faster** |
+
+## Gates (all pass)
+
+- **Determinism:** 4 links (threads=0 ×2, threads=1 ×2) → **1 distinct sha256**.
+  The blocked hash folds in index order, so the build-id is identical across
+  thread counts.
+- **Correctness:** the linked ripgrep runs (`ripgrep 15.1.0`, exit 0) with a
+  valid `.note.gnu.build-id`; bench.sh correctness gate passes on all 4 corpora
+  (peony output matches the lld reference).
+- **Tests:** full `cargo test --workspace` green, incl. `features::build_id_note`
+  (determinism + note presence).
+
+## sha256 re-baselined
+
+build-id bytes legitimately changed (peony's custom FNV was never byte-identical
+to ld's anyway). New deterministic baseline: `bench/baselines/p2-buildid/`.
+ripgrep = `ff8e621e…`. This is the byte-compare gate for subsequent phases.
+
+## Post-Phase-2 ripgrep profile (the new target ranking)
+
+| phase           | t=0      | %     |
+|-----------------|---------:|------:|
+| parse+resolve   | 41.31ms  | 32.1% |
+| reloc-postproc  | 21.05ms  | 16.4% |
+| emit            | 25.09ms  | 19.5% |
+| resolve-inputs  | 14.48ms  | 11.3% |
+| layout          | 13.29ms  | 10.3% |
+| finalize-syms   |  5.45ms  |  4.2% |
+| reloc-scan      |  2.94ms  |  2.3% |
+
+Next target: parse+resolve (32%) and the newly-surfaced reloc-postproc (16.4%).
