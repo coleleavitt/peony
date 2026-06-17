@@ -113,6 +113,48 @@ fn static_archive() {
     assert_eq!(run(&exe), 42);
 }
 
+/// Cross-archive cyclic dependency: archive A's member calls a symbol defined in
+/// archive B, and B's member calls back into A. Pulling A's member introduces a
+/// new undefined ref (into B), which must be satisfied in a LATER fixpoint round,
+/// and pulling B's member introduces a ref back into A. This exercises the
+/// incremental-undefined-set archive fixpoint (the O(N²)→O(N) rewrite) across
+/// multiple rounds — if the incremental set tracking drops a newly-introduced
+/// undef, the link fails with an undefined symbol. The program returns
+/// f(g(0)) where f adds 7 (in A) and g adds 35 (in B) → 42.
+#[test]
+fn cross_archive_cyclic_dependency() {
+    let dir = workdir("archive_cycle");
+    // _start calls f (archive A). f calls g (archive B). g calls h (archive A).
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n xor %edi,%edi\n call f@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    // Archive A: f (adds 7 then calls g), h (adds 0). f introduces an undef `g`
+    // that only archive B satisfies → forces a second round.
+    let af = assemble(
+        &dir,
+        "af",
+        ".text\n.globl f\nf:\n addl $7,%edi\n call g@PLT\n ret\n.globl h\nh:\n ret\n",
+    );
+    let a = archive(&dir, "libA", std::slice::from_ref(&af));
+    // Archive B: g (adds 35 then calls h back in A). g introduces undef `h`.
+    let bg = assemble(
+        &dir,
+        "bg",
+        ".text\n.globl g\ng:\n addl $35,%edi\n call h@PLT\n movl %edi,%eax\n ret\n",
+    );
+    let b = archive(&dir, "libB", std::slice::from_ref(&bg));
+    let exe = dir.join("a.out");
+    // Order A then B; the cycle forces the fixpoint to iterate.
+    link(&exe, &[main, a, b], &[]);
+    assert_eq!(
+        run(&exe),
+        42,
+        "cyclic archive deps must resolve across rounds"
+    );
+}
+
 /// Incremental: no-change relink reuses; an input change triggers a correct relink.
 #[test]
 fn incremental_reuse_and_relink() {
