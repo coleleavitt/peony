@@ -89,10 +89,16 @@ declare -a out=()
 i=0
 drop_next=0
 for a in "${raw[@]}"; do
-  if [ "$drop_next" = 1 ]; then drop_next=0; continue; fi   # skip the -o target
+  if [ "$drop_next" = 1 ]; then drop_next=0; continue; fi   # skip the -o target / -plugin path
   case "$a" in
     -fuse-ld=*)        continue ;;             # let -B pick the linker
     -B*gcc-ld*)        continue ;;             # rustc's bundled lld dir
+    -plugin)           drop_next=1; continue ;; # LTO plugin + its path arg: the
+    -plugin-opt=*)     continue ;;             #   corpus objects are plain ELF,
+                                               #   not LTO IR, so the plugin is a
+                                               #   no-op that only mold/lld parse
+                                               #   differently. Strip for an
+                                               #   apples-to-apples link measure.
     -o)                drop_next=1; continue ;; # harness supplies its own -o
     -o*)               continue ;;             # joined -o<file> form
     *.o|*.rlib|*.a)

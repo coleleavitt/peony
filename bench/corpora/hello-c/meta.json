@@ -2,8 +2,8 @@
   "name": "hello-c",
   "mode": "c",
   "driver": "cc",
-  "captured": "2026-06-17T01:47:31-07:00",
+  "captured": "2026-06-17T03:34:16-07:00",
   "n_inputs": 1,
-  "inputs_bytes": 1552,
+  "inputs_bytes": 1544,
   "host": "Linux 7.0.0-08394-g7bd8ef8008b2-dirty x86_64"
 }
