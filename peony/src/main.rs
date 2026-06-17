@@ -678,6 +678,13 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     } else {
         bare.iter().map(parse_one).collect::<Result<_>>()?
     };
+    // Now that the objects are parsed we know roughly how many distinct symbols
+    // the link will define; pre-size the resolution map to avoid repeated
+    // grow+rehash as ~10k+ symbols are inserted on a large link.
+    let est_symbols: usize = parsed.iter().map(|o| o.symbols.len()).sum();
+    if est_symbols > r.symbols.len() {
+        r.symbols.reserve(est_symbols);
+    }
     for obj in parsed {
         r.resolve(obj)?;
     }
@@ -1530,12 +1537,26 @@ fn gcc_library_dirs() -> &'static [PathBuf] {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn init_thread_pool(threads: usize) -> Result<()> {
-    if threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .context("failed to configure rayon thread pool")?;
-    }
+    // `--threads 0` (the default) does NOT mean "all cores": profiling a
+    // 423-object link showed peony's parallel phases stop scaling at ~4 workers
+    // and get SLOWER beyond that (thread-management + allocator contention
+    // outweigh the embarrassingly-parallel parse/scan once the serial layout and
+    // per-reloc symbol lookups dominate — Amdahl). Letting rayon default to all
+    // 24 cores cost ~25% over a 4-worker pool. Cap the default at a modest count;
+    // an explicit `--threads N` still overrides. (Once symbol resolution and the
+    // reloc apply are made to scale, raise this.)
+    let n = if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1)
+            .min(8)
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .context("failed to configure rayon thread pool")?;
     Ok(())
 }
 

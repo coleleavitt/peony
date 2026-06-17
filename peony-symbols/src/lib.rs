@@ -195,6 +195,25 @@ impl SymbolTable {
         }
     }
 
+    /// Pre-size the resolution map for a link expected to define ~`symbols`
+    /// distinct symbols. A large link inserts tens of thousands of symbols; an
+    /// unsized map repeatedly grows and rehashes (profiling a 423-object link
+    /// showed `reserve_rehash` at ~1.7% of self-time). Reserving once removes
+    /// that. Capacity is a hint only — correctness is identical to `new`.
+    pub fn with_capacity(symbols: usize) -> Self {
+        Self {
+            resolutions: FxHashMap::with_capacity_and_hasher(symbols, Default::default()),
+            names: Vec::with_capacity(symbols),
+            object_paths: Vec::new(),
+        }
+    }
+
+    /// Reserve room for ~`additional` more distinct symbols (capacity hint only).
+    pub fn reserve(&mut self, additional: usize) {
+        self.resolutions.reserve(additional);
+        self.names.reserve(additional);
+    }
+
     /// Register an input object and return its [`ObjectId`].
     pub fn add_object(&mut self, path: String) -> ObjectId {
         let id = ObjectId(self.object_paths.len() as u32);
