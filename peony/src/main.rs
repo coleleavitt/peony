@@ -1310,11 +1310,27 @@ fn expand_inputs(inputs: Vec<PathBuf>, search: &[PathBuf]) -> Result<Vec<PathBuf
 }
 
 /// A text file referencing GROUP/INPUT (and not an ELF/archive) is a linker script.
+///
+/// Fast path: peek only the leading magic bytes and reject ELF objects /
+/// archives — the overwhelming majority of inputs — WITHOUT reading the whole
+/// file. The old code `read`-the-entire-file of every input just to magic-check
+/// it (on a 419-object link that re-read ~18MB the parser then mmaps anyway, and
+/// on a 1-object link it was ~50% of the link). Only a genuine non-ELF input
+/// (the rare linker script) is read in full.
 fn is_linker_script(path: &Path) -> bool {
-    let Ok(data) = std::fs::read(path) else {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
-    if data.starts_with(&peony_object::elf::ELFMAG) || data.starts_with(b"!<arch>\n") {
+    let mut magic = [0u8; 8];
+    let n = f.read(&mut magic).unwrap_or(0);
+    let head = &magic[..n];
+    if head.starts_with(&peony_object::elf::ELFMAG) || head.starts_with(b"!<arch>\n") {
+        return false;
+    }
+    // Not ELF/archive: read the rest and scan for linker-script directives.
+    let mut data = magic[..n].to_vec();
+    if f.read_to_end(&mut data).is_err() {
         return false;
     }
     let text = String::from_utf8_lossy(&data);
