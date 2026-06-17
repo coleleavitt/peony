@@ -561,6 +561,13 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
             let v = (a.tls as i64)
                 .wrapping_add(a.a)
                 .wrapping_sub(a.tls_size as i64);
+            tracing::trace!(
+                tls_block_off = a.tls,
+                addend = a.a,
+                tls_size = a.tls_size,
+                tpoff = v,
+                "TPOFF32 (Local-Exec)"
+            );
             write_i32(buf, off, v, r_type, object, off as u64)?
         }
         TPOFF64 => write_u64(
@@ -588,10 +595,11 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
         // runtime `__tls_get_addr` call. We rewrite the fixed instruction
         // sequence the compiler emits and patch the TP-relative offset.
         TLSGD => {
-            // GD sequence (16 bytes), reloc at the lea displacement (off):
-            //   66 48 8d 3d <disp32>      lea x@tlsgd(%rip),%rdi   [off-4 .. off]
-            //   66 66 48 e8 <pc32>        call __tls_get_addr@plt
-            // → Local-Exec (16 bytes):
+            // GD→LE relaxation (x86-64 psABI). The input 16-byte sequence is:
+            //   66 48 8d 3d <disp32>      data16 lea x@tlsgd(%rip),%rdi
+            //   66 66 48 e8 <pc32>        data16 data16 rex.W call __tls_get_addr
+            // The TLSGD reloc points at <disp32> (4 bytes into the lea), so the
+            // sequence starts at off-4. Output (16 bytes):
             //   64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax
             //   48 8d 80 <tpoff32>           lea x@tpoff(%rax),%rax
             let start = off.wrapping_sub(4);
@@ -599,25 +607,63 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
                 let le_off = (a.tls as i64)
                     .wrapping_add(a.a)
                     .wrapping_sub(a.tls_size as i64) as i32;
-                buf[start..start + 16].copy_from_slice(&[
-                    0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
-                    0x48, 0x8d, 0x80, 0, 0, 0, 0, // lea off(%rax),%rax
-                ]);
-                buf[start + 12..start + 16].copy_from_slice(&le_off.to_le_bytes());
+                tracing::trace!(
+                    off,
+                    start,
+                    orig = format_args!("{:02x?}", &buf[start..start + 16]),
+                    tls_block_off = a.tls,
+                    tls_size = a.tls_size,
+                    le_off,
+                    "TLSGD→LE relaxation"
+                );
+                // Verify the input matches the expected GD prologue before
+                // rewriting (guards against a non-canonical sequence).
+                if buf[start] != 0x66 || buf[start + 1] != 0x48 || buf[start + 2] != 0x8d {
+                    tracing::warn!(
+                        start,
+                        got = format_args!("{:02x?}", &buf[start..start + 4]),
+                        "TLSGD: unexpected prologue, skipping relaxation"
+                    );
+                } else {
+                    buf[start..start + 16].copy_from_slice(&[
+                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00,
+                        0x00, // mov %fs:0,%rax
+                        0x48, 0x8d, 0x80, 0, 0, 0, 0, // lea off(%rax),%rax
+                    ]);
+                    buf[start + 12..start + 16].copy_from_slice(&le_off.to_le_bytes());
+                }
+            } else {
+                tracing::warn!(
+                    off,
+                    buf_len = buf.len(),
+                    "TLSGD relaxation skipped: out of bounds"
+                );
             }
         }
         TLSLD => {
-            // LD sequence (12 bytes), reloc at the lea displacement (off):
-            //   48 8d 3d <disp32>     lea x@tlsld(%rip),%rdi   [off-4 .. off]
-            //   e8 <pc32>             call __tls_get_addr@plt
-            // → Local-Exec base load (no symbol offset; DTPOFF adds the rest):
-            //   66 66 66 64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax (padded)
-            let start = off.wrapping_sub(4);
+            // LD→LE relaxation. The input sequence is:
+            //   48 8d 3d <disp32>     lea x@tlsld(%rip),%rdi   (reloc at off, lea at off-3)
+            //   e8 <pc32>             call __tls_get_addr@plt  (at off+4)
+            // GNU ld replaces the whole 12-byte span [off-3 .. off+9] with:
+            //   66 66 66 64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax (3 data16 prefixes pad)
+            let start = off.wrapping_sub(3);
             if start + 12 <= buf.len() {
+                tracing::trace!(
+                    off,
+                    start,
+                    orig = format_args!("{:02x?}", &buf[start..start + 12]),
+                    "TLSLD→LE relaxation"
+                );
                 buf[start..start + 12].copy_from_slice(&[
-                    0x66, 0x66, 0x66, // nop padding
+                    0x66, 0x66, 0x66, // data16 padding
                     0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, // mov %fs:0,%rax
                 ]);
+            } else {
+                tracing::warn!(
+                    off,
+                    buf_len = buf.len(),
+                    "TLSLD relaxation skipped: out of bounds"
+                );
             }
         }
         // Initial-Exec: GOT slot holds the TP offset; here we keep the GOT

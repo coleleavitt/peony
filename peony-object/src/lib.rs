@@ -213,7 +213,7 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
     for section in elf.sections() {
         let idx = section.index();
         let name = section.name_bytes().unwrap_or(b"").to_vec();
-        let raw_data = section.data().unwrap_or(&[]).to_vec();
+        let mut raw_data = section.data().unwrap_or(&[]).to_vec();
         let sh_flags = match section.flags() {
             object::SectionFlags::Elf { sh_flags } => sh_flags,
             _ => 0,
@@ -221,13 +221,49 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
         let kind = classify_section(&name, sh_flags);
         let relocs = collect_relocs(&section);
 
+        // Strip the trailing 4-byte zero CIE terminator from each input
+        // `.eh_frame`: per-object terminators would otherwise appear mid-stream
+        // when contributions are concatenated, causing the runtime unwinder
+        // (`_Unwind_Find_FDE`) to stop at the first one. The linker emits a
+        // single terminator for the merged section (handled at emit time).
+        let mut size = section.size();
+        if kind == SectionKind::EhFrame {
+            // Determine whether the section *ends* with a genuine 4-byte zero
+            // terminator by walking records to the end. A trailing run of zero
+            // bytes that is reached at a record boundary is the terminator; zeros
+            // that are *inside* the last FDE (e.g. CFA padding) must NOT be
+            // stripped. `scan_eh_frame` reports `leftover` = unparsed trailing
+            // bytes; a clean section has leftover 0 and may end in a terminator
+            // record that the scan counts via `terms`.
+            let (cies, fdes, terms, leftover) = scan_eh_frame(&raw_data);
+            // The terminator (if any) is exactly the final 4 bytes AND the parse
+            // must consume the whole section (leftover == 0) reaching it as a
+            // record. We detect it by checking the byte position the scan ends.
+            let ends_with_terminator = ends_with_eh_terminator(&raw_data);
+            tracing::trace!(
+                obj = %path,
+                input_size = raw_data.len(),
+                sh_size = size,
+                cies,
+                fdes,
+                terms,
+                leftover,
+                ends_with_terminator,
+                "parse .eh_frame contribution"
+            );
+            if ends_with_terminator {
+                raw_data.truncate(raw_data.len() - 4);
+                size = size.saturating_sub(4);
+            }
+        }
+
         let isec = InputSection {
             index: idx,
             name,
             kind,
             data: raw_data,
             align: section.align(),
-            size: section.size(),
+            size,
             flags: sh_flags,
             relocs,
         };
@@ -461,27 +497,71 @@ pub struct SharedObject {
 /// CIE pointer that is 0 for a CIE and non-zero for an FDE. We count the FDEs
 /// to size `.eh_frame_hdr`.
 pub fn count_fdes(data: &[u8]) -> usize {
+    let (cies, fdes, terms, leftover) = scan_eh_frame(data);
+    tracing::trace!(
+        len = data.len(),
+        cies,
+        fdes,
+        terms,
+        leftover,
+        "count_fdes: scanned input .eh_frame"
+    );
+    fdes
+}
+
+/// Returns `true` if a `.eh_frame` blob ends with a genuine 4-byte zero
+/// terminator record (reached at a record boundary), as opposed to an FDE whose
+/// final bytes merely happen to be zero. Walks the records to the last one.
+pub fn ends_with_eh_terminator(data: &[u8]) -> bool {
     let mut pos = 0usize;
-    let mut n = 0usize;
     while pos + 4 <= data.len() {
         let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         if len == 0 {
-            break; // terminator
+            // A zero-length record at a boundary: terminator iff it is the very
+            // last 4 bytes of the section.
+            return pos + 4 == data.len();
         }
         if len == 0xffff_ffff {
-            break; // 64-bit extended length unsupported; stop conservatively
+            return false;
+        }
+        let rec_start = pos + 4;
+        if rec_start + len > data.len() {
+            return false; // malformed; don't strip
+        }
+        pos = rec_start + len;
+    }
+    false
+}
+
+/// Scan a `.eh_frame` blob, returning `(cie_count, fde_count, terminators,
+/// leftover_bytes)`. Shared by [`count_fdes`] and diagnostics so both paths use
+/// identical record-walking logic.
+pub fn scan_eh_frame(data: &[u8]) -> (usize, usize, usize, usize) {
+    let mut pos = 0usize;
+    let (mut cies, mut fdes, mut terms) = (0usize, 0usize, 0usize);
+    while pos + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            terms += 1;
+            pos += 4;
+            continue;
+        }
+        if len == 0xffff_ffff {
+            break;
         }
         let rec_start = pos + 4;
         if rec_start + 4 > data.len() || rec_start + len > data.len() {
             break;
         }
         let cie_ptr = u32::from_le_bytes(data[rec_start..rec_start + 4].try_into().unwrap());
-        if cie_ptr != 0 {
-            n += 1; // FDE
+        if cie_ptr == 0 {
+            cies += 1;
+        } else {
+            fdes += 1;
         }
         pos = rec_start + len;
     }
-    n
+    (cies, fdes, terms, data.len().saturating_sub(pos))
 }
 
 /// Iterate the FDEs in a `.eh_frame`, yielding each FDE record's byte offset
@@ -493,7 +573,12 @@ pub fn iter_fdes(data: &[u8]) -> Vec<(usize, usize, i64)> {
     let mut pos = 0usize;
     while pos + 4 <= data.len() {
         let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        if len == 0 || len == 0xffff_ffff {
+        if len == 0 {
+            // CIE terminator between concatenated input `.eh_frame`s; skip it.
+            pos += 4;
+            continue;
+        }
+        if len == 0xffff_ffff {
             break;
         }
         let rec_start = pos + 4;

@@ -779,6 +779,10 @@ pub fn compute_layout(
         .filter(|s| s.kind == SectionKind::EhFrame)
         .map(|s| peony_object::count_fdes(&s.data))
         .sum();
+    tracing::debug!(
+        n_fdes,
+        "eh_frame_hdr: counted FDEs across input .eh_frame sections"
+    );
     if n_fdes > 0 {
         ro.push(Builder {
             name: ".eh_frame_hdr".to_string(),
@@ -1198,6 +1202,14 @@ pub fn compute_layout(
         }
     }
     let tls_size = align_up(tls_off, tls_align);
+    tracing::debug!(
+        tls_size,
+        tls_filesz,
+        tls_align,
+        tls_vaddr = format_args!("{tls_vaddr:#x}"),
+        tls_blocks = tls_offsets.len(),
+        "TLS layout: static block sized"
+    );
 
     // ── Entry point ──────────────────────────────────────────────────────────
     let entry = resolve_entry(symbols, &addresses, &config.entry_symbol)?;

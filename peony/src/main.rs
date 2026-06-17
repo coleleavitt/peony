@@ -299,10 +299,6 @@ fn main() -> Result<()> {
     finalize_symbols(&mut symbols, &layout);
     check_undefined(&symbols).context("unresolved symbols")?;
 
-    // Build `.eh_frame_hdr` (the unwinder's FDE binary-search table) now that
-    // `.eh_frame`'s output address is known.
-    layout.build_eh_frame_hdr(&objects);
-
     // Assemble `.rela.dyn` now that symbol VAs are final: the R_X86_64_RELATIVE
     // entries (PIE only) come first, then the GLOB_DATs. For a non-PIE dynamic
     // executable there are no relatives, so this just materialises the GLOB_DATs.
