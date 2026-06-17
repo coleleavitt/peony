@@ -2964,12 +2964,11 @@ fn build_symtab_plan(
     }
     let num_locals = locals.len();
 
-    // Defined globals, sorted by name.
-    let mut defined: Vec<(&[u8], peony_symbols::SymbolResolution)> = symbols
-        .iter()
-        .filter(|(_, r)| r.is_defined())
-        .map(|(n, r)| (n, r.clone()))
-        .collect();
+    // Defined globals, sorted by name. Borrow the resolutions (the loop below
+    // only reads them) instead of cloning ~200 bytes × every global — on a large
+    // link that clone was ~2 MB of needless copying just to sort by name.
+    let mut defined: Vec<(&[u8], &peony_symbols::SymbolResolution)> =
+        symbols.iter().filter(|(_, r)| r.is_defined()).collect();
     defined.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut plan = locals;
