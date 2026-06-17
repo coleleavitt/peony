@@ -1551,59 +1551,77 @@ pub fn compute_layout(
     // sections and falling back to `.dynamic` (always present in a dynamic link)
     // so the segment is never silently dropped.
     if has_relro {
-        const RELRO_NAMES: [&str; 5] = [
-            ".init_array",
-            ".fini_array",
-            ".data.rel.ro",
-            ".dynamic",
-            ".got",
-        ];
-        let relro_secs: Vec<&OutputSection> = sections
+        // RELRO may ONLY cover sections that are read-only after load-time
+        // relocation AND form a CONTIGUOUS run. We cover `.init_array`,
+        // `.fini_array`, and `.data.rel.ro`. We deliberately EXCLUDE:
+        //   * `.got.plt` / `.data` — written at runtime; protecting them crashes.
+        //   * `.got` — peony does not eagerly bind every GOT slot, so the runtime
+        //     (e.g. the unwinder) may still write to it; mprotecting it read-only
+        //     causes a SIGSEGV during `catch_unwind`/backtrace. (A future full
+        //     BIND_NOW of every GOT slot could extend RELRO to cover `.got`.)
+        // A naive min..max over relro names could also span an interleaved
+        // non-relro section, so we take the maximal contiguous prefix instead.
+        const RELRO_NAMES: [&str; 3] = [".init_array", ".fini_array", ".data.rel.ro"];
+        let is_relro = |s: &OutputSection| RELRO_NAMES.contains(&s.name.as_str());
+
+        // RW allocatable sections in ascending address order.
+        let mut rw: Vec<&OutputSection> = sections
             .iter()
-            .filter(|s| RELRO_NAMES.contains(&s.name.as_str()))
+            .filter(|s| s.sh_flags & elf::SHF_ALLOC != 0 && s.sh_flags & elf::SHF_WRITE != 0)
             .collect();
-        let span = relro_secs
-            .iter()
-            .map(|s| (s.sh_addr, s.sh_addr + s.sh_size, s.sh_offset))
-            .fold(
-                None,
-                |acc: Option<(u64, u64, u64)>, (lo, hi, off)| match acc {
-                    None => Some((lo, hi, off)),
-                    Some((alo, ahi, aoff)) => {
-                        Some((alo.min(lo), ahi.max(hi), if lo < alo { off } else { aoff }))
+        rw.sort_by_key(|s| s.sh_addr);
+
+        // Take the contiguous run of relro sections starting at the first one.
+        let mut span: Option<(u64, u64, u64)> = None; // (lo, hi, file_off)
+        for s in &rw {
+            if is_relro(s) {
+                match span {
+                    None => span = Some((s.sh_addr, s.sh_addr + s.sh_size, s.sh_offset)),
+                    Some((lo, hi, off)) if hi == s.sh_addr => {
+                        // Directly adjacent → extend the run.
+                        span = Some((lo, s.sh_addr + s.sh_size, off));
                     }
-                },
-            )
-            .or_else(|| {
-                // Defensive fallback: anchor on `.dynamic`, which a dynamic link
-                // always has. If even that is missing, anchor on the RW segment.
-                sections
-                    .iter()
-                    .find(|s| s.source == SecSource::Dynamic)
-                    .map(|s| (s.sh_addr, s.sh_addr + s.sh_size, s.sh_offset))
-            });
-        let (lo, hi, lo_off) = span.unwrap_or((base, base, 0));
-        let size = hi.saturating_sub(lo);
-        tracing::debug!(
-            relro_lo = format_args!("{lo:#x}"),
-            relro_hi = format_args!("{hi:#x}"),
-            size,
-            members = relro_secs.len(),
-            "PT_GNU_RELRO span"
-        );
-        if size == 0 {
-            tracing::warn!("PT_GNU_RELRO span is empty; emitting a zero-size RELRO header");
+                    Some(_) => break, // gap before this relro section → stop
+                }
+            } else if span.is_some() {
+                // A non-relro writable section ends the contiguous relro run.
+                break;
+            }
         }
-        segments.push(ProgramHeader {
-            p_type: elf::PT_GNU_RELRO,
-            p_flags: elf::PF_R,
-            p_offset: lo_off,
-            p_vaddr: lo,
-            p_paddr: lo,
-            p_filesz: size,
-            p_memsz: size,
-            p_align: 1,
-        });
+
+        if let Some((lo, hi, lo_off)) = span {
+            let size = hi - lo;
+            tracing::debug!(
+                relro_lo = format_args!("{lo:#x}"),
+                relro_hi = format_args!("{hi:#x}"),
+                size,
+                "PT_GNU_RELRO span (contiguous relro prefix)"
+            );
+            segments.push(ProgramHeader {
+                p_type: elf::PT_GNU_RELRO,
+                p_flags: elf::PF_R,
+                p_offset: lo_off,
+                p_vaddr: lo,
+                p_paddr: lo,
+                p_filesz: size,
+                p_memsz: size,
+                p_align: 1,
+            });
+        } else {
+            // No relro sections found — but `has_relro` reserved a header slot.
+            // Emit a zero-size RELRO so the program-header count stays consistent.
+            tracing::warn!("no contiguous RELRO region found; emitting zero-size header");
+            segments.push(ProgramHeader {
+                p_type: elf::PT_GNU_RELRO,
+                p_flags: elf::PF_R,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_paddr: 0,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: 1,
+            });
+        }
     }
     // Non-executable stack marker.
     segments.push(ProgramHeader {
