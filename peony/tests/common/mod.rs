@@ -180,6 +180,24 @@ pub fn link_c(dir: &Path, name: &str, src: &str) -> Option<PathBuf> {
 /// the way mold's tests drive the toolchain. Returns the exe path, or `None` if
 /// the toolchain isn't available. `cxx` selects the C++ driver.
 pub fn cc_b(dir: &Path, name: &str, srcs: &[(&str, &str)], cxx: bool) -> Option<PathBuf> {
+    cc_b_modeled(dir, name, srcs, cxx, false)
+}
+
+/// Like [`cc_b`] but links a **PIE** (the default for cc/rustc). The PIE path is
+/// where copy-relocations, `.gnu.hash` indexing of copy-reloc symbols, and the
+/// GNU-property/`.tm_clone_table` handling all matter — i.e. the path the C++
+/// iostream regression tests must exercise.
+pub fn cc_b_pie(dir: &Path, name: &str, srcs: &[(&str, &str)], cxx: bool) -> Option<PathBuf> {
+    cc_b_modeled(dir, name, srcs, cxx, true)
+}
+
+fn cc_b_modeled(
+    dir: &Path,
+    name: &str,
+    srcs: &[(&str, &str)],
+    cxx: bool,
+    pie: bool,
+) -> Option<PathBuf> {
     let bindir = dir.join("ldbin");
     std::fs::create_dir_all(&bindir).ok()?;
     std::fs::copy(PEONY, bindir.join("ld")).ok()?;
@@ -192,9 +210,13 @@ pub fn cc_b(dir: &Path, name: &str, srcs: &[(&str, &str)], cxx: bool) -> Option<
     let exe = dir.join(name);
     let driver = if cxx { "c++" } else { "cc" };
     let mut cmd = Command::new(driver);
-    cmd.arg(format!("-B{}/", bindir.display()))
-        .args(["-fno-pie", "-no-pie", "-o"])
-        .arg(&exe);
+    cmd.arg(format!("-B{}/", bindir.display()));
+    if pie {
+        cmd.args(["-fpie", "-pie"]);
+    } else {
+        cmd.args(["-fno-pie", "-no-pie"]);
+    }
+    cmd.arg("-o").arg(&exe);
     for p in &src_paths {
         cmd.arg(p);
     }

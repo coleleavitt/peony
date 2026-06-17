@@ -99,6 +99,35 @@ linkers (mold corpus, real-C objects, shared-library tests, TLS, relocations):
 cargo test
 ```
 
+## Benchmarking
+
+peony links real C, C++ (iostream/exceptions/STL), and Rust programs correctly,
+and is benchmarked against mold, lld, and GNU ld with a correctness-gated
+harness (a fast *wrong* linker is excluded from timing). See
+[`bench/BENCHMARKING.md`](bench/BENCHMARKING.md) for methodology and the honest
+baseline table.
+
+```sh
+bench/capture.sh rust-bin rust-hello /path/to/cargo/project --release
+bench/bench.sh --runs 20 --warmup 5
+```
+
+Micro-benchmarks of the internal hot paths run under criterion / CodSpeed:
+
+```sh
+cargo bench -p peony-bench
+```
+
+## Formal verification
+
+`rocq-tests/` holds nine machine-checked Rocq/Coq proofs (zero axioms beyond
+functional extensionality). They cover GC reachability, layout congruence,
+relocation disjoint-write determinism, symbol-resolution semilattice, and three
+results that justify beating a from-scratch linker on the edit–rebuild loop:
+incremental-relink soundness + the O(affected) cost bound, parallel-schedule
+work–span optimality, and ICF (identical code folding) soundness. `make` in
+`rocq-tests/` is the pass/fail oracle.
+
 ## License
 
 Licensed under either of [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
