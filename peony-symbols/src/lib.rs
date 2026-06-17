@@ -279,9 +279,12 @@ impl SymbolTable {
         let def_section = sym.section.map(|s| s.0);
 
         // A real definition overrides any prior tentative (common) definition.
-        if let Some(e) = self.resolutions.get(&sym.name) {
+        // Single lookup: inspect `common` and mutate the same entry in place,
+        // avoiding the former get-then-get_mut double hash of the name (this is
+        // the hottest resolve function; symbol-name hashing showed up in the
+        // alloc/hash profile).
+        if let Some(e) = self.resolutions.get_mut(&sym.name) {
             if e.common.is_some() {
-                let e = self.resolutions.get_mut(&sym.name).unwrap();
                 e.binding = sym.binding;
                 e.defined_in = Some(obj_id);
                 e.section_index = def_section;
