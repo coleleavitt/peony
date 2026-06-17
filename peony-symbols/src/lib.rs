@@ -134,6 +134,13 @@ pub struct SymbolResolution {
     pub plt_address: u64,
     /// Initial-Exec GOT slot address holding this symbol's TP offset (0 = none).
     pub gottp_address: u64,
+    /// For a dynamic import, the symbol-version string required from the
+    /// providing library (e.g. `GLIBC_2.34`), or `None` for an unversioned
+    /// reference. Drives `.gnu.version` / `.gnu.version_r`.
+    pub version: Option<Vec<u8>>,
+    /// For a dynamic import, the soname of the library that provides it (e.g.
+    /// `libc.so.6`). Groups version requirements per-library in `.gnu.version_r`.
+    pub soname: Option<String>,
 }
 
 impl SymbolResolution {
@@ -294,6 +301,8 @@ impl SymbolTable {
                     got_address: 0,
                     plt_address: 0,
                     gottp_address: 0,
+                    version: None,
+                    soname: None,
                 },
             );
         }
@@ -350,6 +359,8 @@ impl SymbolTable {
                         got_address: 0,
                         plt_address: 0,
                         gottp_address: 0,
+                        version: None,
+                        soname: None,
                     },
                 );
             }
@@ -372,6 +383,8 @@ impl SymbolTable {
             got_address: 0,
             plt_address: 0,
             gottp_address: 0,
+            version: None,
+            soname: None,
         }
     }
 
@@ -388,8 +401,21 @@ impl SymbolTable {
     /// Mark currently-undefined symbols that a shared library exports as dynamic
     /// imports (resolved at runtime). Returns how many references were satisfied.
     pub fn register_shared_exports(&mut self, exports: &[Vec<u8>]) -> usize {
+        self.register_shared_exports_versioned(exports, &[], "")
+    }
+
+    /// As [`register_shared_exports`], but also records each satisfied import's
+    /// version requirement (parallel to `exports`; `versions` may be shorter, in
+    /// which case missing entries are treated as unversioned) and the providing
+    /// library's `soname` (for per-library `.gnu.version_r` grouping).
+    pub fn register_shared_exports_versioned(
+        &mut self,
+        exports: &[Vec<u8>],
+        versions: &[Option<Vec<u8>>],
+        soname: &str,
+    ) -> usize {
         let mut n = 0;
-        for name in exports {
+        for (i, name) in exports.iter().enumerate() {
             // An undefined reference satisfied by the shared library.
             let satisfy = matches!(
                 self.resolutions.get(name),
@@ -401,9 +427,12 @@ impl SymbolTable {
             // Imports need a real SymbolId so they participate in GOT/.dynsym.
             let id = SymbolId(self.names.len() as u32);
             self.names.push(name.clone());
+            let ver = versions.get(i).cloned().flatten();
             let r = self.resolutions.get_mut(name).unwrap();
             r.import = true;
             r.id = id;
+            r.version = ver;
+            r.soname = Some(soname.to_string());
             n += 1;
         }
         n
@@ -412,6 +441,22 @@ impl SymbolTable {
     /// Whether any symbol is a dynamic import (→ a dynamic executable is needed).
     pub fn has_imports(&self) -> bool {
         self.resolutions.values().any(|r| r.import)
+    }
+
+    /// Ensure `name` has a real [`SymbolId`] (assigning one if it is still the
+    /// placeholder `u32::MAX`). Used for weak-undefined symbols that are
+    /// referenced through the GOT (e.g. `__gmon_start__`): they need a stable id
+    /// so their GOT slot gets a recorded address (holding 0). Returns the id.
+    pub fn ensure_id(&mut self, name: &[u8]) -> Option<SymbolId> {
+        let needs = matches!(self.resolutions.get(name), Some(r) if r.id.0 == u32::MAX);
+        if needs {
+            let id = SymbolId(self.names.len() as u32);
+            self.names.push(name.to_vec());
+            self.resolutions.get_mut(name).unwrap().id = id;
+            Some(id)
+        } else {
+            self.resolutions.get(name).map(|r| r.id)
+        }
     }
 
     /// Define (or overwrite) `name` as an absolute symbol with `value`

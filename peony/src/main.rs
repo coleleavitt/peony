@@ -177,6 +177,10 @@ fn main() -> Result<()> {
     // with any GNU linker scripts (e.g. libc.so) expanded to real files.
     let inputs = resolve_inputs(&args)?;
     let inputs = expand_inputs(inputs, &library_search_paths(&args.library_paths))?;
+    // When invoked directly as the linker (e.g. by rustc), the C-runtime startup
+    // objects that provide `_start`/`_init` are not passed; inject them as `cc`
+    // would for a dynamic/PIE executable.
+    let inputs = inject_crt_objects(inputs, &args);
 
     // Incremental fast-path: if every input and the previous output are
     // byte-identical to the last link, the existing output is already correct.
@@ -193,6 +197,11 @@ fn main() -> Result<()> {
         comdat_excluded,
         needed,
     } = load_and_resolve(&inputs)?;
+
+    // Weak-undefined symbols referenced through the GOT (e.g. `__gmon_start__`)
+    // need a real SymbolId so their GOT slot gets a recorded address (holding 0).
+    // Assign ids before the scan so the slots are tracked.
+    peony_reloc::assign_weak_got_ids(&objects, &mut symbols);
 
     tracing::info!("scanning relocations");
     let scan = scan_relocations(&objects, &symbols);
@@ -224,16 +233,28 @@ fn main() -> Result<()> {
         .map(|(n, _)| n.to_vec())
         .collect();
     imports.sort();
+    // Per-import version requirement, parallel to the sorted `imports`.
+    let import_versions: Vec<Option<Vec<u8>>> = imports
+        .iter()
+        .map(|n| symbols.lookup(n).and_then(|r| r.version.clone()))
+        .collect();
+    let import_sonames: Vec<Option<String>> = imports
+        .iter()
+        .map(|n| symbols.lookup(n).and_then(|r| r.soname.clone()))
+        .collect();
     // A PIE needs R_X86_64_RELATIVE dynamic relocations for absolute pointers,
     // even with no imports. Emit dynamic sections whenever there are imports OR
     // the output is a PIE (rustc/cc default).
     let n_relative = if args.pie {
         peony_reloc::count_relative(&objects, &symbols)
+            + peony_reloc::count_got_relative(&got_syms, &symbols)
     } else {
         0
     };
     let dynamic = (!imports.is_empty() || args.pie).then(|| peony_layout::DynamicInfo {
         imports,
+        import_versions,
+        import_sonames,
         needed: needed.clone(),
         pie: args.pie,
         n_relative,
@@ -337,7 +358,12 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     for so in inputs.iter().filter(|p| peony_object::is_shared_object(p)) {
         let lib = peony_object::parse_shared_object(so)
             .with_context(|| format!("reading shared object `{}`", so.display()))?;
-        if r.symbols.register_shared_exports(&lib.exports) > 0 {
+        if r.symbols.register_shared_exports_versioned(
+            &lib.exports,
+            &lib.export_versions,
+            &lib.soname,
+        ) > 0
+        {
             needed.push(lib.soname);
         }
     }
@@ -689,6 +715,81 @@ fn resolve_inputs(args: &Args) -> Result<Vec<PathBuf>> {
         anyhow::bail!("no input files");
     }
     Ok(inputs)
+}
+
+/// Inject C-runtime startup objects (`Scrt1.o crti.o crtbeginS.o … crtendS.o
+/// crtn.o`) around the user inputs, as the `cc` driver does, when none is already
+/// present. Only applied for executables (not `-shared`/`-r`). If the toolchain
+/// objects can't be located, the inputs are returned unchanged (a static link
+/// with its own `_start`, e.g. the test-suite's hand-written objects, still works).
+fn inject_crt_objects(inputs: Vec<PathBuf>, args: &Args) -> Vec<PathBuf> {
+    // Heuristic: skip if a Scrt1/crt1 object is already on the command line.
+    let already = inputs.iter().any(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "Scrt1.o" || n == "crt1.o" || n == "rcrt1.o")
+    });
+    // Only auto-inject for a PIE (the case rustc/cc drive without crt objects).
+    if already || !args.pie {
+        return inputs;
+    }
+    // Skip if the inputs already provide `_start` (a freestanding PIE that does
+    // not need the C runtime). crt's Scrt1.o also defines `_start`, so injecting
+    // would cause a duplicate-symbol error.
+    if inputs.iter().any(|p| object_defines_start(p)) {
+        return inputs;
+    }
+
+    // Locate the crt objects via the C toolchain. `crtbeginS.o`/`crtendS.o` are
+    // the PIC variants used for PIE and dynamic executables.
+    let find = |name: &str| -> Option<PathBuf> {
+        let out = std::process::Command::new("gcc")
+            .arg(format!("-print-file-name={name}"))
+            .output()
+            .ok()?;
+        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        // gcc returns the bare name unchanged when it can't find the file.
+        (p.is_absolute() && p.exists()).then_some(p)
+    };
+
+    let scrt1 = if args.pie { "Scrt1.o" } else { "crt1.o" };
+    let (begin, end) = if args.pie {
+        ("crtbeginS.o", "crtendS.o")
+    } else {
+        ("crtbegin.o", "crtend.o")
+    };
+    let (Some(c1), Some(ci), Some(cb), Some(ce), Some(cn)) = (
+        find(scrt1),
+        find("crti.o"),
+        find(begin),
+        find(end),
+        find("crtn.o"),
+    ) else {
+        return inputs; // toolchain crt unavailable — leave inputs as-is
+    };
+
+    let mut out = Vec::with_capacity(inputs.len() + 5);
+    out.push(c1);
+    out.push(ci);
+    out.push(cb);
+    out.extend(inputs);
+    out.push(ce);
+    out.push(cn);
+    out
+}
+
+/// True if `path` is a relocatable object that defines a global `_start`.
+/// Used to decide whether the C-runtime startup objects are needed.
+fn object_defines_start(path: &Path) -> bool {
+    if is_archive(path) || peony_object::is_shared_object(path) {
+        return false;
+    }
+    match peony_object::parse_object(path) {
+        Ok(obj) => obj.symbols.iter().any(|s| {
+            s.name == b"_start" && !s.is_undefined && s.binding != peony_object::Binding::Local
+        }),
+        Err(_) => false,
+    }
 }
 
 /// The full library search path: explicit `-L` dirs first (highest priority),

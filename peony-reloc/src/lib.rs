@@ -148,6 +148,35 @@ impl Default for RelocScanResult {
     }
 }
 
+/// Assign real [`SymbolId`]s to weak-undefined symbols that are referenced via
+/// the GOT, so their slots are tracked and get a recorded address (holding 0).
+/// Must run on `&mut symbols` before [`scan_relocations`].
+pub fn assign_weak_got_ids(objects: &[InputObject], symbols: &mut SymbolTable) {
+    for obj in objects {
+        for sec in &obj.sections {
+            for reloc in &sec.relocs {
+                if !needs_got(reloc.r_type) {
+                    continue;
+                }
+                let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                else {
+                    continue;
+                };
+                // Only weak, currently-undefined, non-import symbols need this.
+                let is_weak_undef = matches!(
+                    symbols.lookup(&sym.name),
+                    Some(r) if !r.is_defined() && !r.import && sym.binding == Binding::Weak
+                );
+                if is_weak_undef {
+                    symbols.ensure_id(&sym.name);
+                }
+            }
+        }
+    }
+}
+
 // ── Scan phase (parallel) ────────────────────────────────────────────────────
 
 /// Scan all relocations to determine the required GOT and PLT slots.
@@ -180,7 +209,12 @@ fn scan_object(obj: &InputObject, symbols: &SymbolTable) -> Vec<SyntheticSlot> {
             let Some(res) = symbols.lookup(&sym.name) else {
                 continue;
             };
-            if needs_got(reloc.r_type) && res.is_defined() {
+            // A GOT reference needs a slot whenever the symbol is defined, an
+            // import, OR a weak-undefined reference (whose slot holds 0 so code
+            // like `mov gmon@GOTPCREL,%rax; test %rax,%rax` correctly sees null).
+            if needs_got(reloc.r_type)
+                && (res.is_defined() || res.import || res.binding == Binding::Weak)
+            {
                 slots.push(SyntheticSlot::Got(res.id));
             } else if reloc.r_type == r_x86_64::PLT32 && res.import {
                 // A direct `call foo@PLT` to an imported function needs a PLT stub.
@@ -282,9 +316,42 @@ pub fn collect_relative(
             }
         }
     }
+
+    // GOT slots holding the address of a locally-defined (non-import) symbol also
+    // need an R_X86_64_RELATIVE in a PIE: the slot contains an absolute VA that
+    // the loader must bias. (Import GOT slots use GLOB_DAT instead.)
+    for (i, id) in layout.got_slots.iter().enumerate() {
+        let Some(name) = symbols.name_by_id(*id) else {
+            continue;
+        };
+        let Some(res) = symbols.lookup(name) else {
+            continue;
+        };
+        if res.import || !res.is_defined() {
+            continue;
+        }
+        let site = layout.got_base + (i as u64) * 8;
+        out.push((site, res.virtual_address));
+    }
+
     // Deterministic order (by site) for reproducible output + DT_RELACOUNT runs.
     out.sort_unstable();
     out
+}
+
+/// Count GOT slots that will need an `R_X86_64_RELATIVE` (defined non-import
+/// symbols referenced through the GOT in a PIE). Added to [`count_relative`] by
+/// the driver since GOT slots are known before layout.
+pub fn count_got_relative(got_syms: &[SymbolId], symbols: &SymbolTable) -> usize {
+    got_syms
+        .iter()
+        .filter(|id| {
+            symbols
+                .name_by_id(**id)
+                .and_then(|n| symbols.lookup(n))
+                .is_some_and(|r| !r.import && r.is_defined())
+        })
+        .count()
 }
 
 // ── Apply phase ──────────────────────────────────────────────────────────────
@@ -345,6 +412,11 @@ pub fn apply_reloc(
     } else {
         match ctx.symbols.lookup(&sym.name) {
             Some(r) if r.is_defined() => (r.virtual_address, r.got_address, r.plt_address, r.size),
+            // Weak-undefined: address resolves to 0, but a GOT reference still
+            // uses the symbol's allocated GOT slot (which holds 0). Passing the
+            // real `got_address` lets `mov sym@GOTPCREL,%rax; test %rax,%rax`
+            // correctly observe null instead of dereferencing a bogus slot.
+            Some(r) if sym.binding == Binding::Weak => (0, r.got_address, 0, 0),
             Some(_) if sym.binding == Binding::Weak => (0, 0, 0, 0),
             _ => {
                 return Err(RelocError::UndefinedSymbol {

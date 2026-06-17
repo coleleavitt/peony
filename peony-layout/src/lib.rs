@@ -87,6 +87,10 @@ pub enum SecSource {
     Plt,
     GotPlt,
     RelaPlt,
+    /// `.gnu.version` — one `Elf64_Half` per `.dynsym` entry.
+    GnuVersion,
+    /// `.gnu.version_r` — verneed records for the required library versions.
+    GnuVersionR,
 }
 
 /// Inputs needed to lay out a dynamic executable.
@@ -94,6 +98,13 @@ pub enum SecSource {
 pub struct DynamicInfo {
     /// Imported symbol names, in `.dynsym` order (dynsym index = position + 1).
     pub imports: Vec<Vec<u8>>,
+    /// Per-import version requirement, parallel to `imports`: the version string
+    /// (e.g. `GLIBC_2.34`), or `None` for an unversioned import. Drives
+    /// `.gnu.version` / `.gnu.version_r`.
+    pub import_versions: Vec<Option<Vec<u8>>>,
+    /// Per-import providing-library soname, parallel to `imports` (e.g.
+    /// `libc.so.6`). Groups version requirements per-library in `.gnu.version_r`.
+    pub import_sonames: Vec<Option<String>>,
     /// `DT_NEEDED` shared-library names.
     pub needed: Vec<String>,
     /// True when producing a position-independent executable (ET_DYN). PIE
@@ -120,6 +131,10 @@ pub struct DynBlobs {
     pub plt: Vec<u8>,
     pub got_plt: Vec<u8>,
     pub rela_plt: Vec<u8>,
+    pub gnu_version: Vec<u8>,
+    pub gnu_version_r: Vec<u8>,
+    /// Number of verneed entries (DT_VERNEEDNUM).
+    pub verneed_num: u64,
 }
 
 /// A merged output section with a full section-header plan.
@@ -231,6 +246,7 @@ impl Layout {
     /// exceed the reserved `n_relative`; any unused prefix stays `R_X86_64_NONE`.
     pub fn append_relative_relocs(&mut self, relative: &[(u64, u64)]) {
         let entry = elf::RELA_SIZE as usize;
+        let mut written = 0u64;
         for (i, &(site, target)) in relative.iter().enumerate() {
             let base = i * entry;
             if base + entry > self.dyn_blobs.rela_dyn.len() {
@@ -241,6 +257,28 @@ impl Layout {
             self.dyn_blobs.rela_dyn[base + 8..base + 16].copy_from_slice(&r_info.to_le_bytes());
             self.dyn_blobs.rela_dyn[base + 16..base + 24]
                 .copy_from_slice(&(target as i64).to_le_bytes());
+            written += 1;
+        }
+        // The reserved prefix may exceed the actual relative count (some locals
+        // were dropped by GC/COMDAT). Correct DT_RELACOUNT to the real number so
+        // glibc's fast path does not read a trailing NONE entry as RELATIVE.
+        self.patch_dt_relacount(written);
+    }
+
+    /// Overwrite the `DT_RELACOUNT` value in the `.dynamic` blob.
+    fn patch_dt_relacount(&mut self, count: u64) {
+        let dynbytes = &mut self.dyn_blobs.dynamic;
+        let mut i = 0;
+        while i + 16 <= dynbytes.len() {
+            let tag = i64::from_le_bytes(dynbytes[i..i + 8].try_into().unwrap());
+            if tag == elf::DT_RELACOUNT {
+                dynbytes[i + 8..i + 16].copy_from_slice(&count.to_le_bytes());
+                return;
+            }
+            if tag == elf::DT_NULL {
+                return;
+            }
+            i += 16;
         }
     }
 }
@@ -302,6 +340,20 @@ struct Builder {
     contributions: Vec<SectionContribution>,
 }
 
+/// The classic ELF (SysV) hash used for `vna_hash`/`vd_hash` in version records.
+fn elf_gnu_hash_ver(name: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &b in name {
+        h = (h << 4).wrapping_add(b as u32);
+        let g = h & 0xf000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
+}
+
 // ── Layout computation ──────────────────────────────────────────────────────
 
 /// Run the full layout pass. `got_syms` is the ordered list of symbols that need
@@ -332,7 +384,9 @@ pub fn compute_layout(
             dynstr.push(0);
             import_dynsym.insert(name.clone(), (i + 1) as u32);
         }
+        let mut soname_off: Vec<u32> = Vec::with_capacity(dynj.needed.len());
         for so in &dynj.needed {
+            soname_off.push(dynstr.len() as u32);
             needed_off.push(dynstr.len() as u32);
             dynstr.extend_from_slice(so.as_bytes());
             dynstr.push(0);
@@ -345,6 +399,91 @@ pub fn compute_layout(
             // st_other = 0, st_shndx = SHN_UNDEF (0), st_value/st_size = 0
             dynsym.extend_from_slice(&e);
         }
+
+        // ── Symbol versioning: .gnu.version + .gnu.version_r ──────────────────
+        //
+        // Group each distinct (soname, version) requirement into its providing
+        // library's Verneed record, assigning a globally-unique `vna_other`
+        // index (≥ 2; 0 = local, 1 = global/base). The versym array maps every
+        // dynsym entry to its index. This handles multi-library links (e.g. a
+        // C++ program needing libc, libstdc++, and libgcc_s) correctly.
+        let soname_index: FxHashMap<&str, usize> = dynj
+            .needed
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+        // Per-library ordered list of (version, vidx, name_off).
+        let mut per_lib: Vec<Vec<(Vec<u8>, u16, u32)>> = vec![Vec::new(); dynj.needed.len()];
+        let mut version_idx: FxHashMap<(usize, Vec<u8>), u16> = FxHashMap::default();
+        let mut next_vidx: u16 = 2;
+        for (ver, son) in dynj.import_versions.iter().zip(&dynj.import_sonames) {
+            let (Some(v), Some(s)) = (ver, son) else {
+                continue;
+            };
+            let Some(&lib) = soname_index.get(s.as_str()) else {
+                continue;
+            };
+            let key = (lib, v.clone());
+            if !version_idx.contains_key(&key) {
+                version_idx.insert(key, next_vidx);
+                let off = dynstr.len() as u32;
+                dynstr.extend_from_slice(v);
+                dynstr.push(0);
+                per_lib[lib].push((v.clone(), next_vidx, off));
+                next_vidx += 1;
+            }
+        }
+
+        // versym: Elf64_Half per dynsym entry (null sym → 0, then one per import).
+        let mut versym: Vec<u8> = Vec::with_capacity((dynj.imports.len() + 1) * 2);
+        versym.extend_from_slice(&0u16.to_le_bytes()); // null symbol
+        for (ver, son) in dynj.import_versions.iter().zip(&dynj.import_sonames) {
+            let idx = match (ver, son) {
+                (Some(v), Some(s)) => soname_index
+                    .get(s.as_str())
+                    .and_then(|&lib| version_idx.get(&(lib, v.clone())).copied())
+                    .unwrap_or(1),
+                _ => 1, // global/unversioned
+            };
+            versym.extend_from_slice(&idx.to_le_bytes());
+        }
+
+        // verneed: one Verneed per library that has versioned requirements, each
+        // with one Vernaux per distinct version.
+        let mut verneed: Vec<u8> = Vec::new();
+        let mut verneed_num: u64 = 0;
+        let active_libs: Vec<usize> = (0..dynj.needed.len())
+            .filter(|&l| !per_lib[l].is_empty())
+            .collect();
+        for (li, &lib) in active_libs.iter().enumerate() {
+            let versions = &per_lib[lib];
+            let lib_off = soname_off.get(lib).copied().unwrap_or(0);
+            let cnt = versions.len() as u16;
+            let vn_next = if li + 1 < active_libs.len() {
+                // size of this Verneed: 16 header + 16*cnt aux
+                16u32 + 16 * cnt as u32
+            } else {
+                0
+            };
+            // Elf64_Verneed: vn_version(2) vn_cnt(2) vn_file(4) vn_aux(4) vn_next(4) = 16
+            verneed.extend_from_slice(&1u16.to_le_bytes());
+            verneed.extend_from_slice(&cnt.to_le_bytes());
+            verneed.extend_from_slice(&lib_off.to_le_bytes());
+            verneed.extend_from_slice(&16u32.to_le_bytes()); // vn_aux → first aux
+            verneed.extend_from_slice(&vn_next.to_le_bytes());
+            // Elf64_Vernaux: vna_hash(4) vna_flags(2) vna_other(2) vna_name(4) vna_next(4) = 16
+            for (i, (vname, vidx, name_off)) in versions.iter().enumerate() {
+                let next = if i + 1 < versions.len() { 16u32 } else { 0u32 };
+                verneed.extend_from_slice(&elf_gnu_hash_ver(vname).to_le_bytes());
+                verneed.extend_from_slice(&0u16.to_le_bytes()); // vna_flags
+                verneed.extend_from_slice(&vidx.to_le_bytes()); // vna_other
+                verneed.extend_from_slice(&name_off.to_le_bytes()); // vna_name
+                verneed.extend_from_slice(&next.to_le_bytes()); // vna_next
+            }
+            verneed_num += 1;
+        }
+
         // SysV hash with no exported symbols (we only import).
         let nchain = (dynj.imports.len() + 1) as u32;
         let mut hash = Vec::new();
@@ -358,6 +497,12 @@ pub fn compute_layout(
         dyn_blobs.dynsym = dynsym;
         dyn_blobs.hash = hash;
         dyn_blobs.interp = elf::DEFAULT_INTERP.to_vec();
+        // Only attach versym/verneed when there is something to version.
+        if verneed_num > 0 {
+            dyn_blobs.gnu_version = versym;
+            dyn_blobs.gnu_version_r = verneed;
+            dyn_blobs.verneed_num = verneed_num;
+        }
     }
     // Number of GOT slots that resolve to dynamic imports (→ GLOB_DAT relocs).
     let n_glob_dat = got_syms
@@ -524,6 +669,18 @@ pub fn compute_layout(
             (".dynsym", elf::SHT_DYNSYM, 8, dyn_blobs.dynsym.len() as u64),
             (".dynstr", elf::SHT_STRTAB, 1, dyn_blobs.dynstr.len() as u64),
             (
+                ".gnu.version",
+                elf::SHT_GNU_VERSYM,
+                2,
+                dyn_blobs.gnu_version.len() as u64,
+            ),
+            (
+                ".gnu.version_r",
+                elf::SHT_GNU_VERNEED,
+                8,
+                dyn_blobs.gnu_version_r.len() as u64,
+            ),
+            (
                 ".rela.dyn",
                 elf::SHT_RELA,
                 8,
@@ -599,11 +756,17 @@ pub fn compute_layout(
         } else {
             0
         };
+        let has_ver = dyn_blobs.verneed_num > 0;
+        // DT_INIT / DT_FINI when the corresponding (executable) sections exist.
+        let n_init = rx.iter().filter(|b| b.name == ".init").count();
+        let n_fini = rx.iter().filter(|b| b.name == ".fini").count();
         dyn_entries = dynj.needed.len()
             + 5                                  // HASH,STRTAB,SYMTAB,STRSZ,SYMENT
             + if has_rela { 3 } else { 0 }       // DT_RELA, DT_RELASZ, DT_RELAENT
             + if dynj.n_relative > 0 { 1 } else { 0 } // DT_RELACOUNT
             + if n_plt > 0 { 4 } else { 0 }      // PLTGOT,PLTRELSZ,PLTREL,JMPREL
+            + if has_ver { 3 } else { 0 }        // VERSYM,VERNEED,VERNEEDNUM
+            + n_init + n_fini                    // DT_INIT, DT_FINI
             + n_flags
             + n_initfini * 2
             + 1; // DT_NULL
@@ -815,6 +978,13 @@ pub fn compute_layout(
                     s.sh_link = dynsym_shndx
                 }
                 SecSource::Dynamic => s.sh_link = dynstr_shndx,
+                // .gnu.version → links to .dynsym (one versym per dynsym entry).
+                SecSource::GnuVersion => s.sh_link = dynsym_shndx,
+                // .gnu.version_r → links to .dynstr; sh_info = number of verneed.
+                SecSource::GnuVersionR => {
+                    s.sh_link = dynstr_shndx;
+                    s.sh_info = dyn_blobs.verneed_num as u32;
+                }
                 _ => {}
             }
         }
@@ -991,12 +1161,26 @@ pub fn compute_layout(
             push_dyn(elf::DT_PLTREL, elf::DT_RELA as u64);
             push_dyn(elf::DT_JMPREL, va_of(SecSource::RelaPlt));
         }
+        // Symbol versioning tables.
+        if dyn_blobs.verneed_num > 0 {
+            push_dyn(elf::DT_VERSYM, va_of(SecSource::GnuVersion));
+            push_dyn(elf::DT_VERNEED, va_of(SecSource::GnuVersionR));
+            push_dyn(elf::DT_VERNEEDNUM, dyn_blobs.verneed_num);
+        }
         // PIE / eager-binding flags.
         if dynj.pie {
             push_dyn(elf::DT_FLAGS, elf::DF_BIND_NOW);
             push_dyn(elf::DT_FLAGS_1, elf::DF_1_NOW | elf::DF_1_PIE);
         } else if !plt_syms.is_empty() {
             push_dyn(elf::DT_FLAGS, elf::DF_BIND_NOW); // eager binding (no lazy resolver)
+        }
+        // DT_INIT / DT_FINI point at the legacy `_init`/`_fini` routines (from
+        // crti.o/crtn.o); glibc's __libc_start_main calls DT_INIT before main.
+        if let Some(s) = sections.iter().find(|s| s.name == ".init") {
+            push_dyn(elf::DT_INIT, s.sh_addr);
+        }
+        if let Some(s) = sections.iter().find(|s| s.name == ".fini") {
+            push_dyn(elf::DT_FINI, s.sh_addr);
         }
         // Init/fini arrays so the C runtime / ld.so runs global constructors.
         for (name, tag_arr, tag_sz) in [
@@ -1497,6 +1681,8 @@ fn place(
                 ".plt" => SecSource::Plt,
                 ".got.plt" => SecSource::GotPlt,
                 ".rela.plt" => SecSource::RelaPlt,
+                ".gnu.version" => SecSource::GnuVersion,
+                ".gnu.version_r" => SecSource::GnuVersionR,
                 _ if b.is_nobits => SecSource::Bss,
                 _ => SecSource::Input,
             },

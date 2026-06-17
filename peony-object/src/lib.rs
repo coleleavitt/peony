@@ -447,6 +447,31 @@ pub fn iter_archive_members(path: &Path) -> Result<Vec<ArchiveMember>> {
 pub struct SharedObject {
     pub soname: String,
     pub exports: Vec<Vec<u8>>,
+    /// For each export, the symbol version string it is defined at (e.g.
+    /// `GLIBC_2.34`), or `None` for an unversioned/base definition. Parallel to
+    /// `exports`. Used to synthesise `.gnu.version_r` so the dynamic loader
+    /// binds the correct versioned definition.
+    pub export_versions: Vec<Option<Vec<u8>>>,
+}
+
+/// Read `DT_SONAME` from a parsed shared object, if present.
+fn elf_soname(elf: &ElfFile64<Endianness>, data: &[u8]) -> Option<String> {
+    use object::read::elf::Dyn;
+    let endian = elf.endian();
+    let (dynamic, dyn_index) = elf.elf_section_table().dynamic(endian, data).ok()??;
+    // The string table referenced by the dynamic section.
+    let strings = elf
+        .elf_section_table()
+        .strings(endian, data, dyn_index)
+        .ok()?;
+    for d in dynamic {
+        if d.tag32(endian) == Some(elf::DT_SONAME as u32) {
+            if let Ok(name) = d.string(endian, strings) {
+                return Some(String::from_utf8_lossy(name).into_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Returns true if `path` is an ELF shared object (`ET_DYN`).
@@ -473,24 +498,49 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
             source: e,
         })?;
 
+    // Build the symbol-version table so each export can be tagged with its
+    // version string (needed to synthesise `.gnu.version_r` in the output).
+    let endian = elf.endian();
+    let versions = elf
+        .elf_section_table()
+        .versions(endian, data.as_slice())
+        .ok()
+        .flatten();
+
     let mut exports = Vec::new();
+    let mut export_versions = Vec::new();
     for sym in elf.dynamic_symbols() {
         if sym.is_undefined() || sym.is_local() {
             continue;
         }
-        if let Ok(name) = sym.name_bytes() {
-            if !name.is_empty() {
-                exports.push(name.to_vec());
-            }
+        let Ok(name) = sym.name_bytes() else { continue };
+        if name.is_empty() {
+            continue;
         }
+        // Resolve this symbol's version name, if the .so carries version info.
+        let ver = versions.as_ref().and_then(|vt| {
+            let vidx = vt.version_index(endian, sym.index());
+            match vt.version(vidx) {
+                Ok(Some(v)) => Some(v.name().to_vec()),
+                _ => None,
+            }
+        });
+        exports.push(name.to_vec());
+        export_versions.push(ver);
     }
 
-    let soname = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    // Prefer the embedded DT_SONAME over the file name.
+    let soname = elf_soname(&elf, data.as_slice()).unwrap_or_else(|| {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    });
 
-    Ok(SharedObject { soname, exports })
+    Ok(SharedObject {
+        soname,
+        exports,
+        export_versions,
+    })
 }
 
 // ── ELF64 format constants ──────────────────────────────────────────────────────
@@ -550,6 +600,10 @@ pub mod elf {
     pub const SHT_NOTE: u32 = 7;
     pub const SHT_NOBITS: u32 = 8;
     pub const SHT_DYNSYM: u32 = 11;
+    pub const SHT_GNU_HASH: u32 = 0x6fff_fff6;
+    pub const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
+    pub const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
+    pub const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
 
     /// GNU build-id note type.
     pub const NT_GNU_BUILD_ID: u32 = 3;
@@ -563,12 +617,15 @@ pub mod elf {
     pub const DT_PLTREL: i64 = 20;
     pub const DT_JMPREL: i64 = 23;
     pub const DT_STRTAB: i64 = 5;
+    pub const DT_SONAME: i64 = 14;
     pub const DT_SYMTAB: i64 = 6;
     pub const DT_RELA: i64 = 7;
     pub const DT_RELASZ: i64 = 8;
     pub const DT_RELAENT: i64 = 9;
     pub const DT_STRSZ: i64 = 10;
     pub const DT_SYMENT: i64 = 11;
+    pub const DT_INIT: i64 = 12;
+    pub const DT_FINI: i64 = 13;
     pub const DT_INIT_ARRAY: i64 = 25;
     pub const DT_FINI_ARRAY: i64 = 26;
     pub const DT_INIT_ARRAYSZ: i64 = 27;
