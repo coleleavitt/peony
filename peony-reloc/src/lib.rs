@@ -358,7 +358,9 @@ pub fn scan_relocations(
     // Small links scan faster serially: spinning up rayon's global pool for a
     // few objects costs more in thread management (`sched_yield`/`futex`) than
     // the scan itself. Fan out only once there are enough objects to amortize.
-    const PARALLEL_SCAN_THRESHOLD: usize = 16;
+    // See the parse-threshold note in main.rs: touching rayon's global pool on a
+    // small link costs more in futex/sched_yield idle-spin than the scan saves.
+    const PARALLEL_SCAN_THRESHOLD: usize = 256;
     let per_object: Vec<Vec<SyntheticSlot>> = if objects.len() >= PARALLEL_SCAN_THRESHOLD {
         objects
             .par_iter()

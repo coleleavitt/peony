@@ -14,8 +14,6 @@
 
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap2::MmapMut;
 use peony_layout::{Layout, SecSource};
@@ -23,7 +21,6 @@ use peony_object::{InputObject, elf};
 use peony_reloc::ApplyCtx;
 use peony_symbols::SymbolTable;
 use thiserror::Error;
-use ws_deque::{Steal, Worker};
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -520,7 +517,11 @@ fn dispatch_parallel(
     // costs far more in `futex`/`sched_yield`/mutex churn than the copies save.
     // Profiling a hello-world link showed ~74% of syscall time in futex+yield
     // from the parallel scaffolding alone. Stay serial below this threshold.
-    const PARALLEL_THRESHOLD: usize = 64;
+    // Section-copy work items: only fan out across ws-deque workers when there
+    // are enough that the concurrent copy outweighs spawning the worker scope
+    // (which otherwise idle-spins on futex/sched_yield — 85% of a small link's
+    // syscall time). Tiny links copy a handful of sections faster serially.
+    const PARALLEL_THRESHOLD: usize = 2048;
     if work_items.len() < PARALLEL_THRESHOLD {
         let error_slot = std::sync::Mutex::new(None);
         let ctx_ref = &ctx;
@@ -539,134 +540,26 @@ fn dispatch_parallel(
         .unwrap_or(1)
         .min(work_items.len());
 
-    let error_slot: Arc<std::sync::Mutex<Option<peony_reloc::RelocError>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let error_slot: std::sync::Mutex<Option<peony_reloc::RelocError>> = std::sync::Mutex::new(None);
 
-    let workers: Vec<Worker<WorkItem>> = (0..num_threads).map(|_| Worker::new()).collect();
-    let stealers: Vec<_> = workers.iter().map(|w| w.stealer()).collect();
-    for (i, item) in work_items.into_iter().enumerate() {
-        workers[i % num_threads].push(item);
-    }
-
-    let idle_count = Arc::new(AtomicUsize::new(0));
-
-    std::thread::scope(|scope| {
-        for (t, worker) in workers.into_iter().enumerate() {
-            let all_stealers: Vec<_> = stealers.iter().map(|s| s.clone()).collect();
-            let error_slot = Arc::clone(&error_slot);
-            let idle_count = Arc::clone(&idle_count);
-
-            scope.spawn(move || {
-                run_worker(
-                    t,
-                    worker,
-                    &all_stealers,
-                    objects,
-                    buf_ptr,
-                    buf_len,
-                    &ctx,
-                    &error_slot,
-                    &idle_count,
-                    num_threads,
-                );
-            });
-        }
+    // Spin-free lifeline scheduler (ws-deque): each section-copy is an independent
+    // task (disjoint output region), so we seed them all and let idle workers PARK
+    // on a condvar rather than busy-spin on `sched_yield`. The old hand-rolled
+    // Chase-Lev drain spun 24 threads on `spin_loop`/`sched_yield`, which on a
+    // small-but-over-threshold link dominated wall time (85% of syscalls). The
+    // lifeline scheduler wakes a sleeper only when work is pushed to it.
+    ws_deque::scheduler::run(num_threads, work_items, |item, _spawner| {
+        // Errors are rare (a malformed reloc); record the first and let the rest
+        // drain. We do not early-abort the schedule — the surviving sections are
+        // still written to disjoint regions, and the error is returned below.
+        process_item(item, objects, buf_ptr, buf_len, &ctx, &error_slot);
     });
 
-    if let Some(e) = Arc::try_unwrap(error_slot)
-        .ok()
-        .and_then(|m| m.into_inner().ok())
-        .flatten()
-    {
+    if let Some(e) = error_slot.into_inner().ok().flatten() {
         tracing::error!(output = %output_path.display(), %e, "relocation error");
         return Err(EmitError::Reloc(e));
     }
     Ok(())
-}
-
-/// Per-thread work loop with quiescence-based termination (no premature exit).
-fn run_worker(
-    t: usize,
-    worker: Worker<WorkItem>,
-    all_stealers: &[ws_deque::Stealer<WorkItem>],
-    objects: &[InputObject],
-    buf_ptr: usize,
-    buf_len: usize,
-    ctx: &ApplyCtx<'_>,
-    error_slot: &std::sync::Mutex<Option<peony_reloc::RelocError>>,
-    idle_count: &AtomicUsize,
-    num_threads: usize,
-) {
-    let mut is_idle = false;
-    loop {
-        if error_slot.lock().unwrap().is_some() {
-            break;
-        }
-
-        if let Some(item) = worker.pop() {
-            wake_if_idle(&mut is_idle, idle_count);
-            process_item(item, objects, buf_ptr, buf_len, ctx, error_slot);
-            continue;
-        }
-
-        if try_steal(
-            t,
-            all_stealers,
-            &mut is_idle,
-            idle_count,
-            objects,
-            buf_ptr,
-            buf_len,
-            ctx,
-            error_slot,
-        ) {
-            continue;
-        }
-
-        if !is_idle {
-            idle_count.fetch_add(1, Ordering::Release);
-            is_idle = true;
-        }
-        if idle_count.load(Ordering::Acquire) >= num_threads {
-            break;
-        }
-        std::hint::spin_loop();
-    }
-}
-
-fn wake_if_idle(is_idle: &mut bool, idle_count: &AtomicUsize) {
-    if *is_idle {
-        idle_count.fetch_sub(1, Ordering::Release);
-        *is_idle = false;
-    }
-}
-
-fn try_steal(
-    t: usize,
-    all_stealers: &[ws_deque::Stealer<WorkItem>],
-    is_idle: &mut bool,
-    idle_count: &AtomicUsize,
-    objects: &[InputObject],
-    buf_ptr: usize,
-    buf_len: usize,
-    ctx: &ApplyCtx<'_>,
-    error_slot: &std::sync::Mutex<Option<peony_reloc::RelocError>>,
-) -> bool {
-    for (i, s) in all_stealers.iter().enumerate() {
-        if i == t {
-            continue;
-        }
-        match s.steal() {
-            Steal::Success(item) => {
-                wake_if_idle(is_idle, idle_count);
-                process_item(item, objects, buf_ptr, buf_len, ctx, error_slot);
-                return true;
-            }
-            Steal::Retry => return true, // victim non-empty; retry without going idle
-            Steal::Empty => {}
-        }
-    }
-    false
 }
 
 /// Write a `.note.gnu.build-id` note: a content-derived 128-bit hash.

@@ -29,7 +29,12 @@ use thiserror::Error;
 use ws_deque::{Steal, Worker};
 
 // ── S3-GC grain size constant (SPEC §9) ─────────────────────────────────────
-const S3GC_GRAIN_SIZE: usize = 256;
+// Minimum frontier-section count per worker before the GC BFS fans out across
+// ws-deque threads. Set high: spawning a thread scope and idle-spinning on
+// futex/sched_yield costs far more than the BFS edge-walk for any link under a
+// few thousand live sections (a typical Rust/C++ exe). Genuinely huge links
+// (Chromium-scale, tens of thousands of sections per level) still parallelize.
+const S3GC_GRAIN_SIZE: usize = 8192;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 

@@ -631,7 +631,13 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // touching rayon's global pool spins up a worker per core that then idles
     // on `sched_yield`/`futex` for longer than the handful of parses take. Only
     // fan out once there are enough objects to amortize the thread management.
-    const PARALLEL_PARSE_THRESHOLD: usize = 16;
+    // Raised well above the small-link regime: rayon's global pool spawns one
+    // worker per core, and once touched those workers idle-spin on
+    // futex/sched_yield for the REST of the link (profiling a 22-object Rust
+    // link showed 85% of syscall time in futex+sched_yield from the pool, for
+    // work that runs faster serially). Only fan out for links big enough that
+    // the parse time dominates the thread-management cost.
+    const PARALLEL_PARSE_THRESHOLD: usize = 256;
     let parse_one = |p: &&PathBuf| {
         parse_object(p).with_context(|| format!("failed to parse `{}`", p.display()))
     };
