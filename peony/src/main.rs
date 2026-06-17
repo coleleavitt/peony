@@ -982,23 +982,33 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
                 continue;
             }
             let obj = m.obj.take().unwrap();
-            // Names this member defines are no longer undefined.
-            for name in &m.defines {
-                undefined.remove(name);
-            }
-            // Pulling the member may introduce NEW undefined references; add the
-            // ones the table now reports as undefined (incremental, not a full
-            // rescan). Cloning the undef refs the object carries is bounded by
-            // the member's own symbol count.
-            for sym in &obj.symbols {
-                if sym.is_undefined && !sym.name.is_empty() {
-                    let nm = &sym.name;
-                    if r.symbols.lookup(nm).is_none_or(|res| !res.is_defined()) {
-                        undefined.insert(nm.clone());
-                    }
+            // Snapshot the names this member touches (its claimed defines plus
+            // its own undefined refs) BEFORE resolving, then reconcile each
+            // against the ACTUAL table state AFTER resolve. Reconciling against
+            // the table — rather than trusting `m.defines` — is what keeps the
+            // incremental set correct under COMDAT exclusion: a member can be
+            // pulled yet have a claimed define dropped (its COMDAT group already
+            // seen), in which case that name stays undefined and must remain in
+            // the set. Bounded by the member's own symbol count.
+            let touched: Vec<Vec<u8>> = m
+                .defines
+                .iter()
+                .cloned()
+                .chain(
+                    obj.symbols
+                        .iter()
+                        .filter(|s| s.is_undefined && !s.name.is_empty())
+                        .map(|s| s.name.clone()),
+                )
+                .collect();
+            r.resolve(obj)?;
+            for nm in touched {
+                if r.symbols.lookup(&nm).is_some_and(|res| res.is_defined()) {
+                    undefined.remove(&nm);
+                } else {
+                    undefined.insert(nm);
                 }
             }
-            r.resolve(obj)?;
             included_any = true;
             pulled += 1;
         }
