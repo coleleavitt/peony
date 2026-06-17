@@ -21,7 +21,7 @@
 
 use peony_layout::Layout;
 use peony_object::{Binding, InputObject, InputReloc};
-use peony_symbols::{SymbolId, SymbolTable};
+use peony_symbols::{SymbolId, SymbolResolution, SymbolTable};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
@@ -940,6 +940,57 @@ pub struct ApplyCtx<'a> {
     /// Producing a shared object: keep General-/Local-Dynamic TLS (GOT pairs +
     /// `__tls_get_addr`) instead of relaxing to Local-Exec.
     pub shared: bool,
+    /// Optional integer-indexed symbol resolution, replacing the per-relocation
+    /// mangled-name HashMap lookup (216k relocs vs 49k symbols ⇒ ~4.4× reuse).
+    /// When present, `apply_reloc` resolves a global via
+    /// `index.resolution(obj_id, sym_pos)` — an array index, no hashing. Built
+    /// once after resolution; `None` falls back to name lookup. Correctness is
+    /// shadow-checked against the name path in debug builds.
+    pub sym_index: Option<&'a SymIndex<'a>>,
+}
+
+/// Integer-indexed symbol resolution: a per-object `sym_pos → &resolution` side
+/// table. Built in the driver from immutable objects + the frozen symbol table
+/// (Option B: no `InputSymbol` mutation, so no phase-dependent cached state). The
+/// per-relocation hot path indexes this instead of hashing the mangled name. See
+/// gpt-5.5 council note.
+pub struct SymIndex<'a> {
+    /// `by_object[obj_id][sym_pos]` = the borrowed resolution for that input
+    /// symbol, or `None` if it has no global resolution (local/empty name). We
+    /// store the reference DIRECTLY rather than a SymbolId, because undefined
+    /// symbols carry the sentinel id `u32::MAX` which is not a valid view index.
+    by_object: Vec<Vec<Option<&'a SymbolResolution>>>,
+}
+
+impl<'a> SymIndex<'a> {
+    /// Build the index from the objects and the frozen symbol table. Hashes each
+    /// object symbol's name once (≈49k total) — replacing the ≈216k per-reloc
+    /// name hashes with array indexing.
+    pub fn build(objects: &[InputObject], symbols: &'a SymbolTable) -> Self {
+        let by_object = objects
+            .iter()
+            .map(|obj| {
+                obj.symbols
+                    .iter()
+                    .map(|sym| {
+                        if sym.binding == Binding::Local || sym.name.is_empty() {
+                            None
+                        } else {
+                            symbols.lookup(&sym.name)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        SymIndex { by_object }
+    }
+
+    /// Resolve a global input symbol (by object + its position in that object's
+    /// symbol list) to its resolution, by integer indexing only.
+    #[inline]
+    pub fn resolution(&self, obj_id: usize, sym_pos: usize) -> Option<&'a SymbolResolution> {
+        *self.by_object.get(obj_id)?.get(sym_pos)?
+    }
 }
 
 /// Addresses used when computing a relocation value.
@@ -976,10 +1027,8 @@ pub fn apply_reloc(
     if reloc.r_type == r_x86_64::NONE {
         return Ok(());
     }
-    let Some(sym) = obj
-        .symbols
-        .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-    else {
+    let sym_pos = *obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX);
+    let Some(sym) = obj.symbols.get(sym_pos) else {
         return Ok(());
     };
 
@@ -1003,6 +1052,16 @@ pub fn apply_reloc(
     // determinism tests). Locals never enter the global table.
     let res = if sym.binding == Binding::Local {
         None
+    } else if let Some(index) = ctx.sym_index {
+        // Integer-indexed resolution (no name hash). Shadow-checked against the
+        // name path in debug builds to prove the index is faithful.
+        let by_id = index.resolution(obj_id, sym_pos);
+        debug_assert!(
+            by_id.map(|r| r.id) == ctx.symbols.lookup(&sym.name).map(|r| r.id),
+            "sym_index disagrees with name lookup for `{}`",
+            String::from_utf8_lossy(&sym.name)
+        );
+        by_id
     } else {
         ctx.symbols.lookup(&sym.name)
     };

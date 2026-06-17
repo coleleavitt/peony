@@ -464,10 +464,15 @@ fn write_section_data_parallel(
     // Phase 2: Parallel input section copy + relocation apply.
     let buf_ptr = buf.as_mut_ptr() as usize;
     let buf_len = buf.len();
+    // Integer-indexed symbol resolution for the per-relocation hot path: built
+    // once here (≈49k name hashes) to replace ≈216k per-reloc name hashes with
+    // array indexing. Borrows objects + symbols, which outlive this scope.
+    let sym_index = peony_reloc::SymIndex::build(objects, symbols);
     let ctx = ApplyCtx {
         symbols,
         layout,
         shared: layout.shared,
+        sym_index: Some(&sym_index),
     };
     let work_items = collect_input_work_items(layout);
     dispatch_parallel(work_items, objects, buf_ptr, buf_len, ctx, output_path)
