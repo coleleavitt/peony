@@ -81,3 +81,64 @@ fn tls_two_vars() {
     link(&exe, &[o], &[]);
     assert_eq!(run(&exe), 42);
 }
+
+/// A `.tbss` variable with alignment GREATER than `.tdata`'s forces the static
+/// TLS block base to be over-aligned. peony must align the TLS segment's
+/// `p_vaddr` to the MAX TLS-section alignment, or the highly-aligned variable
+/// lands at the wrong address (the bug that crashed large TLS-heavy binaries
+/// like a self-hosted toolchain — "TLS during destruction" in std). Verified by
+/// reading both values back through libc + a real `__thread` access.
+#[test]
+fn tls_overaligned_block_base() {
+    let dir = workdir("tls_align");
+    let Some(exe) = cc_b(
+        &dir,
+        "talign",
+        &[(
+            "t.c",
+            "#include <stdio.h>\n\
+             __thread int small = 5;\n\
+             __thread _Alignas(128) long big[4] = {11, 22, 33, 44};\n\
+             int main(void) {\n\
+                 // Touch both; the over-aligned `big` must be readable/correct.\n\
+                 if (small != 5) return 1;\n\
+                 for (int i = 0; i < 4; i++) if (big[i] != 11 * (i + 1)) return 2;\n\
+                 // Its runtime address must satisfy the 128-byte alignment.\n\
+                 if (((unsigned long)&big[0] & 127) != 0) return 3;\n\
+                 printf(\"tls-align ok\\n\");\n\
+                 return 42;\n\
+             }\n",
+        )],
+        false,
+    ) else {
+        eprintln!("skipping: toolchain unavailable");
+        return;
+    };
+    // PT_TLS p_vaddr must be aligned to the block's max alignment (>= 128).
+    let phdrs = readelf(&exe, &["-lW"]);
+    let tls_line = phdrs
+        .lines()
+        .find(|l| l.trim_start().starts_with("TLS"))
+        .expect("PT_TLS present");
+    // Columns: TLS off vaddr paddr filesz memsz flg align
+    let cols: Vec<&str> = tls_line.split_whitespace().collect();
+    let vaddr = u64::from_str_radix(cols[2].trim_start_matches("0x"), 16).unwrap();
+    let align = parse_align(cols.last().unwrap());
+    assert!(align >= 128, "PT_TLS align {align} should be >= 128");
+    assert_eq!(
+        vaddr % align,
+        0,
+        "PT_TLS vaddr {vaddr:#x} not aligned to {align}"
+    );
+    assert_eq!(run(&exe), 42);
+}
+
+/// Parse a program-header alignment field, which readelf prints as either a hex
+/// (`0x80`) or decimal value depending on version.
+fn parse_align(s: &str) -> u64 {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).unwrap_or(1)
+    } else {
+        s.parse().unwrap_or(1)
+    }
+}

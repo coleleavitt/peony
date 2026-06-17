@@ -600,9 +600,14 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
         }
     }
 
-    // Fixpoint: include any member that defines a currently-undefined symbol.
+    // Fixpoint: include any member that satisfies a currently-undefined symbol.
+    // Crucially, re-check undefinedness *per member* and update it as members are
+    // pulled in: archive semantics say a member is included only to resolve a
+    // symbol still undefined at that moment. Two archives may both define the
+    // same symbol (e.g. `__mulsc3` in compiler_builtins.rlib and libgcc.a); only
+    // the first should be pulled, or peony would report a spurious duplicate.
     loop {
-        let undefined: HashSet<Vec<u8>> = r
+        let mut undefined: HashSet<Vec<u8>> = r
             .symbols
             .iter()
             .filter(|(_, res)| !res.is_defined())
@@ -616,10 +621,16 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
             if m.obj.is_none() {
                 continue;
             }
+            // Only pull this member for symbols STILL undefined right now.
             if m.defines.is_disjoint(&undefined) {
                 continue;
             }
             let obj = m.obj.take().unwrap();
+            // The symbols this member newly provides are no longer undefined, so
+            // a later member defining the same name is not pulled for them.
+            for name in &m.defines {
+                undefined.remove(name);
+            }
             r.resolve(obj)?;
             included_any = true;
         }
@@ -641,12 +652,18 @@ const LINKER_SYMS: &[&str] = &[
     "edata",
     "_end",
     "end",
+    // `__dso_handle` identifies this DSO for `__cxa_atexit`/`__cxa_finalize`.
+    // The runtime only uses its ADDRESS as an opaque handle, so the image base
+    // is a valid, stable definition. crtbegin normally provides it, but when
+    // linking without crt (e.g. a cdylib) `libc_nonshared.a` references it
+    // undefined, so the linker must synthesise it.
+    "__dso_handle",
 ];
 
 fn linker_symbol_addr(name: &str, layout: &peony_layout::Layout) -> u64 {
     match name {
         "_GLOBAL_OFFSET_TABLE_" => layout.got_base,
-        "__executable_start" | "__ehdr_start" => layout.image_base,
+        "__executable_start" | "__ehdr_start" | "__dso_handle" => layout.image_base,
         "__bss_start" => layout.bss_start,
         "_edata" | "edata" => layout.edata,
         "_end" | "end" => layout.end,

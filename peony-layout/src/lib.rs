@@ -1246,6 +1246,34 @@ pub fn compute_layout(
     rw_pb.sort_by_key(|b| b.kind == SectionKind::Tdata); // false<true ⇒ .tdata last
     rw_bss.sort_by_key(|b| b.kind != SectionKind::Tbss); // false<true ⇒ .tbss first
 
+    // The static TLS block's base (the first TLS section, `.tdata`, or `.tbss`
+    // if there is no `.tdata`) must be aligned to the MAXIMUM alignment of any
+    // TLS section. glibc places the block at `tp - round_up(tls_size, p_align)`
+    // and computes each variable as `block_base + var_offset`; if the block base
+    // is under-aligned, a highly-aligned `.tbss` variable lands at the wrong
+    // address (corrupting TLS — e.g. std's "TLS during destruction" panic). Raise
+    // the leading TLS section's alignment to the block max so placement aligns it.
+    let max_tls_align = rw_pb
+        .iter()
+        .chain(rw_bss.iter())
+        .filter(|b| matches!(b.kind, SectionKind::Tdata | SectionKind::Tbss))
+        .map(|b| b.align)
+        .max()
+        .unwrap_or(1);
+    if max_tls_align > 1 {
+        // The first TLS section in placement order is `.tdata` (last in rw_pb) or,
+        // if absent, `.tbss` (first in rw_bss).
+        if let Some(tdata) = rw_pb
+            .iter_mut()
+            .rev()
+            .find(|b| b.kind == SectionKind::Tdata)
+        {
+            tdata.align = tdata.align.max(max_tls_align);
+        } else if let Some(tbss) = rw_bss.iter_mut().find(|b| b.kind == SectionKind::Tbss) {
+            tbss.align = tbss.align.max(max_tls_align);
+        }
+    }
+
     let mut rw_seg: Option<(u64, u64, u64)> = None; // (start, file_end, mem_end)
     if has_rw {
         va = align_up(va, page);
