@@ -639,6 +639,7 @@ dependencies = [
  "object",
  "peony-layout",
  "peony-object",
+ "peony-prof",
  "peony-reloc",
  "peony-symbols",
  "rayon",

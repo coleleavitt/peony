@@ -64,6 +64,39 @@ pub struct EmitConfig {
 ///
 /// All input sections write to disjoint file ranges (by Theorem 4.1), so they
 /// can be copied and relocated in parallel with zero synchronization.
+/// Open the output file and `mmap` it RW, sized to `file_size`. When
+/// `can_overwrite` (an existing file of the exact size), the file is opened
+/// without truncation and the map is reused as-is (TLB-friendly, avoids
+/// remap shootdowns); otherwise the file is created/truncated and the fresh map
+/// is zeroed. Returned as a raw `io::Error` so the caller attaches the path.
+fn open_output_map(
+    output_path: &Path,
+    file_size: u64,
+    can_overwrite: bool,
+) -> std::io::Result<MmapMut> {
+    let file = if can_overwrite {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(output_path)?
+    } else {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(output_path)?;
+        f.set_len(file_size)?;
+        f
+    };
+    // SAFETY: we hold the file open exclusively for the duration of the map.
+    let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
+    if !can_overwrite {
+        mmap.iter_mut().for_each(|b| *b = 0);
+    }
+    Ok(mmap)
+}
+
 pub fn emit_full(
     output_path: &Path,
     objects: &[InputObject],
@@ -88,55 +121,51 @@ pub fn emit_full(
     let existing_size = std::fs::metadata(output_path).ok().map(|m| m.len());
     let can_overwrite = existing_size == Some(file_size);
 
-    let file = if can_overwrite {
-        // Open existing file read-write without truncating (TLB-friendly).
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(output_path)
-            .map_err(io)?
-    } else {
-        // New or differently-sized file: create/truncate.
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(output_path)
-            .map_err(io)?;
-        f.set_len(file_size).map_err(io)?;
-        f
+    // SAFETY: we hold the file open exclusively for the duration of the map.
+    let mut mmap = {
+        let _t = peony_prof::trace("emit:mmap-open");
+        open_output_map(output_path, file_size, can_overwrite).map_err(io)?
     };
 
-    // SAFETY: we hold the file open exclusively for the duration of the map.
-    let mut mmap = unsafe { MmapMut::map_mut(&file) }.map_err(io)?;
-
-    // Zero out the mmap if we're writing over a differently-sized file or new file.
-    if !can_overwrite {
-        mmap.iter_mut().for_each(|b| *b = 0);
-    }
-
     // Write ELF header + program headers (serial, small, must be first).
-    write_headers(&mut mmap, layout);
+    {
+        let _t = peony_prof::trace("emit:headers");
+        write_headers(&mut mmap, layout);
+    }
 
     // Parallel section data copy + relocation apply (QUAD Theorem 5.1).
     // Each output section writes to a disjoint file range — zero-sync parallel.
     // Uses ws-deque's Chase-Lev work-stealing deque for load-balanced dispatch.
-    write_section_data_parallel(&mut mmap, objects, symbols, layout, output_path)?;
+    {
+        let _t = peony_prof::trace("emit:section-data");
+        write_section_data_parallel(&mut mmap, objects, symbols, layout, output_path)?;
+    }
 
     // Shared-object TLS GOT static slots (DTPOFF in GD/LDM pair slot1) — written
     // directly by VA→file-offset mapping through the `.got` section.
-    write_tls_got(&mut mmap, layout);
+    {
+        let _t = peony_prof::trace("emit:tls-got");
+        write_tls_got(&mut mmap, layout);
+    }
 
     // `.eh_frame_hdr` must be built from the RELOCATED `.eh_frame` bytes (the FDE
     // `PC begin` fields are set by R_X86_64_PC32 relocations applied above), so
     // it runs after section data + relocations are written.
-    write_eh_frame_hdr(&mut mmap, layout);
+    {
+        let _t = peony_prof::trace("emit:eh-frame-hdr");
+        write_eh_frame_hdr(&mut mmap, layout);
+    }
 
     // Section header table (serial, small, at end of file).
-    write_section_headers(&mut mmap, layout);
+    {
+        let _t = peony_prof::trace("emit:section-headers");
+        write_section_headers(&mut mmap, layout);
+    }
 
-    mmap.flush().map_err(io)?;
+    {
+        let _t = peony_prof::trace("emit:flush");
+        mmap.flush().map_err(io)?;
+    }
 
     // Make the output executable.
     #[cfg(unix)]
@@ -411,7 +440,9 @@ fn write_section_data_parallel(
     // serially because they reference shared `layout` data. Input sections
     // (the bulk of the data) are written in parallel.
 
-    // Phase 1: Write all synthetic sections serially (fast — small data).
+    // Phase 1: Write all synthetic sections serially (fast — small data,
+    // except build-id which hashes all input bytes; framed separately).
+    let synth = peony_prof::trace("emit:synthetic-sections");
     for sec in &layout.output_sections {
         match sec.source {
             SecSource::Input => {} // handled in phase 2
@@ -433,7 +464,13 @@ fn write_section_data_parallel(
             SecSource::SymTabShndx => write_bytes(buf, sec.sh_offset, &layout.symtab_shndx),
             SecSource::StrTab => write_bytes(buf, sec.sh_offset, &layout.strtab),
             SecSource::ShStrTab => write_bytes(buf, sec.sh_offset, &layout.shstrtab),
-            SecSource::NoteBuildId => write_build_id(buf, objects, sec.sh_offset),
+            SecSource::NoteBuildId => {
+                // build-id is a serial per-byte hash over ALL input section
+                // bytes (~17MB on ripgrep) — framed separately because it is the
+                // prime suspect for emit's poor thread-scaling.
+                let _t = peony_prof::trace("emit:build-id-hash");
+                write_build_id(buf, objects, sec.sh_offset)
+            }
             SecSource::NoteGnuProperty => {
                 write_bytes(buf, sec.sh_offset, &layout.gnu_property_note)
             }
@@ -460,6 +497,7 @@ fn write_section_data_parallel(
             }
         }
     }
+    drop(synth);
 
     // Phase 2: Parallel input section copy + relocation apply.
     let buf_ptr = buf.as_mut_ptr() as usize;
@@ -467,7 +505,10 @@ fn write_section_data_parallel(
     // Integer-indexed symbol resolution for the per-relocation hot path: built
     // once here (≈49k name hashes) to replace ≈216k per-reloc name hashes with
     // array indexing. Borrows objects + symbols, which outlive this scope.
-    let sym_index = peony_reloc::SymIndex::build(objects, symbols);
+    let sym_index = {
+        let _t = peony_prof::trace("emit:sym-index-build");
+        peony_reloc::SymIndex::build(objects, symbols)
+    };
     let ctx = ApplyCtx {
         symbols,
         layout,
@@ -475,6 +516,7 @@ fn write_section_data_parallel(
         sym_index: Some(&sym_index),
     };
     let work_items = collect_input_work_items(layout);
+    let _t = peony_prof::trace("emit:section-copy-dispatch");
     dispatch_parallel(work_items, objects, buf_ptr, buf_len, ctx, output_path)
 }
 

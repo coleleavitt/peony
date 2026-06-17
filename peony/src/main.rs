@@ -381,6 +381,10 @@ fn main() -> Result<()> {
         let _p = peony_prof::phase("reloc-scan");
         scan_relocations(&objects, &symbols, args.shared)
     };
+    // Everything from here to the layout span was previously untimed ("other"):
+    // GOT/PLT/TLS slot extraction, copy-reloc marking, import/dynsym assignment,
+    // export collection and dynamic-section sizing. Attribute it.
+    let _postscan = peony_prof::phase("reloc-postproc");
     let got_syms = scan.got_symbols();
     let plt_syms = scan.plt_symbols();
     let tls_got = peony_layout::TlsGotInfo {
@@ -573,6 +577,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    drop(_postscan);
     let layout_span = peony_prof::phase("layout");
     let mut layout = peony_layout::compute_layout_icf(
         &objects,
@@ -595,6 +600,10 @@ fn main() -> Result<()> {
         "layout complete"
     );
 
+    // Post-layout symbol finalization + dynamic-reloc assembly was previously
+    // untimed ("other"): patch linker-symbol addresses, finalize the symtab,
+    // and (for ET_DYN) collect RELATIVE/IRELATIVE/TLS/symbolic dynamic relocs.
+    let _finalize = peony_prof::phase("finalize-syms");
     set_linker_addresses(&mut symbols, &layout, &provided);
     finalize_symbols(&mut symbols, &layout);
     // A shared object may legitimately reference symbols it does not define;
@@ -655,6 +664,7 @@ fn main() -> Result<()> {
         }
         layout.append_all_dynamic_relocs(&relative, &irelative, &tls_dyn, &symbolic);
     }
+    drop(_finalize);
 
     let _emit_span = peony_prof::phase("emit");
     emit_full(

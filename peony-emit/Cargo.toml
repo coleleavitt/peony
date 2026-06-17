@@ -10,6 +10,7 @@ peony-object      = { path = "../peony-object" }
 peony-symbols     = { path = "../peony-symbols" }
 peony-layout      = { path = "../peony-layout" }
 peony-reloc       = { path = "../peony-reloc" }
+peony-prof        = { path = "../peony-prof" }
 object.workspace     = true
 memmap2.workspace    = true
 ws-deque.workspace   = true

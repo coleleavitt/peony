@@ -68,3 +68,62 @@ libc, identical to bench.sh). Corpus: ripgrep, 419 inputs. peony `--release`.
 
 See `sha256.txt`. All four corpora linked **deterministically** (link-twice
 sha256 matched itself) at this baseline.
+
+---
+
+# Phase-1 update — instrumentation attributed "other" + emit internals
+
+After adding `phase()` markers to the untimed gaps and `trace()` frames inside
+emit (byte-identical output, all tests green), the ripgrep breakdown is now:
+
+| phase           | t=24     | note                                       |
+|-----------------|---------:|--------------------------------------------|
+| **emit**        | 78.97ms  | **44.5%** — see emit internals below       |
+| parse+resolve   | 40.32ms  | 22.7%                                      |
+| **reloc-postproc** | 17.77ms | **10.0%** — was hidden in "other"        |
+| layout          | 12.03ms  | 6.8%                                       |
+| resolve-inputs  | 14.98ms  | 8.4%                                       |
+| finalize-syms   |  5.94ms  | 3.3% — was hidden in "other"               |
+| reloc-scan      |  3.12ms  | 1.8%                                       |
+| other           |  4.40ms  | 2.5% (was 19.2% — now attributed)          |
+
+## emit internals (`--trace`), t=24 vs t=1 — THE SMOKING GUN
+
+| sub-phase                  | t=24    | t=1     | scaling | verdict             |
+|----------------------------|--------:|--------:|--------:|---------------------|
+| **emit:build-id-hash**     | **52.97ms** | **53.64ms** | **1.00×** | SERIAL, 30% of link |
+| emit:flush                 | 15.71ms |  4.94ms | 0.31×   | INVERTED (msync)    |
+| emit:section-copy-dispatch |  5.00ms | 15.09ms | 3.02×   | scales fine         |
+| emit:sym-index-build       |  2.77ms |  2.65ms | —       | small               |
+| emit:mmap-open             |  1.32ms |  1.38ms | —       | small               |
+
+### The decisive finding
+
+**`build_id_hash` is the single biggest cost in the whole link — 53ms = 30%,
+fully serial, and it is doing far too much work:**
+
+- `cc` injects `--build-id` by default (`--enable-linker-build-id`), so it runs
+  on every real link — cannot be skipped.
+- It is a **byte-at-a-time double-FNV** (`build_id_hash`, peony-emit:587) over
+  **all ~18.5MB of *input* section bytes** — including `.debug_*`, COMDAT-
+  discarded, and non-allocated sections — scattered across thousands of separate
+  `Vec`s. Throughput ≈349 MB/s.
+- The emitted output is only ~4MB. mold/lld compute the build-id over the
+  **contiguous output image** (and use a parallel tree hash), not the scattered
+  oversized input set.
+
+**This dwarfs everything the original plan targeted.** The sharded resolver
+(5.5ms) and even all of parse (14ms) are noise next to this 53ms serial hash.
+
+### Re-ranked again (by this measurement)
+
+1. **build-id hash** — biggest single win (30%), low-risk, INDEPENDENT of the
+   zero-copy refactor. Hash the contiguous output buffer (4MB not 18.5MB) with a
+   parallel/blocked hash. NOTE: changes the 16 build-id bytes → re-baseline the
+   sha256 gate (peony's build-id was never byte-identical to ld's anyway — the
+   gate is self-consistency, validated by executing the output).
+2. **emit:flush 15.7ms, inverted scaling** — msync/dirty-page writeback; smaller.
+3. zero-copy + parallel emit copy (the dispatch already scales 3×).
+4. reloc-postproc 17.8ms — newly surfaced #3 phase.
+5. everything else (parse, layout) — smaller.
+6. sharded resolver — still last/conditional.
