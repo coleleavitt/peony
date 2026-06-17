@@ -1422,10 +1422,22 @@ fn inject_crt_objects(inputs: Vec<PathBuf>, args: &Args) -> Vec<PathBuf> {
         return inputs;
     }
 
-    // Locate the crt objects via the C toolchain. `crtbeginS.o`/`crtendS.o` are
-    // the PIC variants used for PIE and dynamic executables.
+    // Locate the crt objects. First try the cached GCC library dirs (no
+    // subprocess — `gcc_library_dirs()` is memoised); only fall back to
+    // `gcc -print-file-name` if a crt isn't on those dirs. The old code spawned
+    // gcc 5× and each call PATH-walked (~117 execve on a typical link).
     let find = |name: &str| -> Option<PathBuf> {
-        let out = std::process::Command::new("gcc")
+        for dir in gcc_library_dirs() {
+            let p = dir.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        let gcc = ["/usr/bin/gcc", "/usr/local/bin/gcc", "/usr/bin/cc"]
+            .into_iter()
+            .find(|p| std::fs::metadata(p).is_ok())
+            .unwrap_or("gcc");
+        let out = std::process::Command::new(gcc)
             .arg(format!("-print-file-name={name}"))
             .output()
             .ok()?;
