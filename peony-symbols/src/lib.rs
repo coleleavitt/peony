@@ -141,6 +141,9 @@ pub struct SymbolResolution {
     /// For a dynamic import, the soname of the library that provides it (e.g.
     /// `libc.so.6`). Groups version requirements per-library in `.gnu.version_r`.
     pub soname: Option<String>,
+    /// `STT_GNU_IFUNC`: the definition is an indirect function. A GOT slot for it
+    /// gets an `R_X86_64_IRELATIVE` so the loader runs the resolver at startup.
+    pub is_ifunc: bool,
 }
 
 impl SymbolResolution {
@@ -273,6 +276,7 @@ impl SymbolTable {
                     e.section_index = def_section;
                     e.value = sym.value;
                     e.size = sym.size;
+                    e.is_ifunc = sym.is_ifunc;
                 }
                 ConflictAction::KeepExisting => {}
                 ConflictAction::WarnLocal => {
@@ -303,6 +307,7 @@ impl SymbolTable {
                     gottp_address: 0,
                     version: None,
                     soname: None,
+                    is_ifunc: sym.is_ifunc,
                 },
             );
         }
@@ -361,6 +366,7 @@ impl SymbolTable {
                         gottp_address: 0,
                         version: None,
                         soname: None,
+                        is_ifunc: false,
                     },
                 );
             }
@@ -385,6 +391,7 @@ impl SymbolTable {
             gottp_address: 0,
             version: None,
             soname: None,
+            is_ifunc: false,
         }
     }
 

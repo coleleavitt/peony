@@ -260,20 +260,38 @@ impl Layout {
     /// glibc's DT_RELACOUNT fast path stays valid). `relative.len()` must not
     /// exceed the reserved `n_relative`; any unused prefix stays `R_X86_64_NONE`.
     pub fn append_relative_relocs(&mut self, relative: &[(u64, u64)]) {
-        // Assemble RELATIVE entries first, then the stashed GLOB_DATs — no type-0
-        // gap between or after them (BFD/eu-elflint reject NONE in .rela.dyn).
+        self.append_dynamic_relocs(relative, &[]);
+    }
+
+    /// Assemble `.rela.dyn`: `R_X86_64_RELATIVE` entries first (covered by
+    /// `DT_RELACOUNT`), then `R_X86_64_IRELATIVE` IFUNC entries, then the stashed
+    /// `R_X86_64_GLOB_DAT` imports — with no type-0 gap anywhere (BFD/eu-elflint
+    /// reject `NONE` records in `.rela.dyn`). `irelative` is `(got_slot_va,
+    /// resolver_va)`; the loader runs the resolver and stores its result.
+    pub fn append_dynamic_relocs(&mut self, relative: &[(u64, u64)], irelative: &[(u64, u64)]) {
         let cap = self.rela_dyn_section_size() as usize;
+        let glob_len = self.dyn_blobs.rela_glob_dat.len();
         let mut bytes = Vec::with_capacity(cap);
         let mut written = 0u64;
         for &(site, target) in relative {
-            if bytes.len() + elf::RELA_SIZE as usize > cap - self.dyn_blobs.rela_glob_dat.len() {
-                break; // never crowd out the GLOB_DAT suffix
+            if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
+                break; // never crowd out the IRELATIVE/GLOB_DAT suffixes
             }
             let r_info = elf::R_X86_64_RELATIVE as u64; // symbol index 0
             bytes.extend_from_slice(&site.to_le_bytes());
             bytes.extend_from_slice(&r_info.to_le_bytes());
             bytes.extend_from_slice(&(target as i64).to_le_bytes());
             written += 1;
+        }
+        // IRELATIVE: IFUNC GOT slots resolved by running the resolver at startup.
+        for &(site, resolver) in irelative {
+            if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
+                break;
+            }
+            let r_info = elf::R_X86_64_IRELATIVE as u64; // symbol index 0
+            bytes.extend_from_slice(&site.to_le_bytes());
+            bytes.extend_from_slice(&r_info.to_le_bytes());
+            bytes.extend_from_slice(&(resolver as i64).to_le_bytes());
         }
         let glob = std::mem::take(&mut self.dyn_blobs.rela_glob_dat);
         bytes.extend_from_slice(&glob);

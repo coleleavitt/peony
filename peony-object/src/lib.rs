@@ -136,6 +136,10 @@ pub struct InputSymbol {
     /// Tentative (common) definition: `value` holds the required alignment and
     /// `size` the byte size. The linker allocates space in `.bss`.
     pub is_common: bool,
+    /// `STT_GNU_IFUNC`: an indirect function whose `value` is a resolver. A
+    /// reference to it gets an `R_X86_64_IRELATIVE` dynamic relocation so the
+    /// loader runs the resolver and stores its result.
+    pub is_ifunc: bool,
     /// Section index for defined symbols; `None` for absolute/common/undefined.
     pub section: Option<SectionIndex>,
     /// Value (offset within section for defined symbols; alignment for common).
@@ -274,6 +278,12 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
     let mut symbols = Vec::new();
     let mut symbol_map = FxHashMap::default();
 
+    // Raw ELF symbol table, so we can read `st_type()` (for STT_GNU_IFUNC,
+    // which the high-level API folds into SymbolKind::Text).
+    use object::read::elf::Sym as _;
+    let endian = elf.endian();
+    let elf_symtab = elf.elf_symbol_table();
+
     for sym in elf.symbols() {
         let idx = sym.index();
         let name = sym.name_bytes().unwrap_or(b"").to_vec();
@@ -284,12 +294,17 @@ pub fn parse_bytes(path: String, data: &[u8]) -> Result<InputObject> {
         } else {
             Binding::Global
         };
+        let is_ifunc = elf_symtab
+            .symbol(idx)
+            .map(|s| s.st_type() == elf::STT_GNU_IFUNC)
+            .unwrap_or(false);
         let isym = InputSymbol {
             index: idx,
             name,
             binding,
             is_undefined: sym.is_undefined(),
             is_common: sym.is_common(),
+            is_ifunc,
             section: sym.section_index(),
             value: sym.address(),
             size: sym.size(),
@@ -820,6 +835,7 @@ pub mod elf {
     pub const STT_NOTYPE: u8 = 0;
     pub const STT_OBJECT: u8 = 1;
     pub const STT_FUNC: u8 = 2;
+    pub const STT_GNU_IFUNC: u8 = 10;
     pub const STT_SECTION: u8 = 3;
     pub const STT_FILE: u8 = 4;
     pub const STT_TLS: u8 = 6;

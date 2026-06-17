@@ -303,12 +303,21 @@ fn main() -> Result<()> {
     // entries (PIE only) come first, then the GLOB_DATs. For a non-PIE dynamic
     // executable there are no relatives, so this just materialises the GLOB_DATs.
     if dynamic.is_some() {
-        let relative = if args.pie {
-            peony_reloc::collect_relative(&objects, &symbols, &layout)
+        // Partition data relocations into RELATIVE (normal) and IRELATIVE (IFUNC,
+        // resolver run at startup). Only meaningful for PIE; a non-PIE dynamic
+        // exe has no base-relative data relocs.
+        let (relative, irelative) = if args.pie {
+            peony_reloc::collect_dynamic_data_relocs(&objects, &symbols, &layout)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        layout.append_relative_relocs(&relative);
+        if !irelative.is_empty() {
+            tracing::info!(
+                ifuncs = irelative.len(),
+                "emitting R_X86_64_IRELATIVE relocations"
+            );
+        }
+        layout.append_dynamic_relocs(&relative, &irelative);
     }
 
     emit_full(

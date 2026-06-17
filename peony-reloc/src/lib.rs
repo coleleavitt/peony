@@ -289,7 +289,22 @@ pub fn collect_relative(
     symbols: &SymbolTable,
     layout: &Layout,
 ) -> Vec<(u64, u64)> {
+    let (relative, _ifunc) = collect_dynamic_data_relocs(objects, symbols, layout);
+    relative
+}
+
+/// Collect data (`R_X86_64_64`) dynamic relocations, partitioned into plain
+/// `R_X86_64_RELATIVE` targets and `R_X86_64_IRELATIVE` (IFUNC) targets. An R64
+/// site against an IFUNC must run the resolver, so it becomes IRELATIVE with the
+/// resolver address as the addend; all other defined-symbol R64 sites are
+/// RELATIVE. Returns `(relative, irelative)` as `(site_va, value_va)` pairs.
+pub fn collect_dynamic_data_relocs(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
     let mut out = Vec::new();
+    let mut ifunc = Vec::new();
     for (obj_id, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
             // Only allocated sections land in the loaded image.
@@ -306,16 +321,17 @@ pub fn collect_relative(
                 else {
                     continue;
                 };
-                // Resolve the target VA exactly as the apply phase will.
-                let target = if sym.binding == Binding::Local {
+                // Resolve the target VA exactly as the apply phase will, and note
+                // whether the target is an IFUNC (→ IRELATIVE, not RELATIVE).
+                let (target, is_ifunc) = if sym.binding == Binding::Local {
                     match sym.section.and_then(|si| layout.address_of(obj_id, si.0)) {
-                        Some(va) => va + sym.value,
+                        Some(va) => (va + sym.value, sym.is_ifunc),
                         None => continue, // absolute or dropped — no base bias needed
                     }
                 } else {
                     match symbols.lookup(&sym.name) {
                         // Imports are handled by GLOB_DAT, not RELATIVE.
-                        Some(r) if r.is_defined() && !r.import => r.virtual_address,
+                        Some(r) if r.is_defined() && !r.import => (r.virtual_address, r.is_ifunc),
                         _ => continue,
                     }
                 };
@@ -324,14 +340,19 @@ pub fn collect_relative(
                 };
                 let site = site_va + reloc.offset;
                 let value = (target as i64).wrapping_add(reloc.addend) as u64;
-                out.push((site, value));
+                if is_ifunc {
+                    ifunc.push((site, value));
+                } else {
+                    out.push((site, value));
+                }
             }
         }
     }
 
     // GOT slots holding the address of a locally-defined (non-import) symbol also
-    // need an R_X86_64_RELATIVE in a PIE: the slot contains an absolute VA that
-    // the loader must bias. (Import GOT slots use GLOB_DAT instead.)
+    // need a dynamic relocation in a PIE: a plain RELATIVE for a normal symbol
+    // (the slot holds an absolute VA the loader biases), or an IRELATIVE for an
+    // IFUNC (the loader runs the resolver). Import GOT slots use GLOB_DAT.
     for (i, id) in layout.got_slots.iter().enumerate() {
         let Some(name) = symbols.name_by_id(*id) else {
             continue;
@@ -343,12 +364,17 @@ pub fn collect_relative(
             continue;
         }
         let site = layout.got_base + (i as u64) * 8;
-        out.push((site, res.virtual_address));
+        if res.is_ifunc {
+            ifunc.push((site, res.virtual_address));
+        } else {
+            out.push((site, res.virtual_address));
+        }
     }
 
     // Deterministic order (by site) for reproducible output + DT_RELACOUNT runs.
     out.sort_unstable();
-    out
+    ifunc.sort_unstable();
+    (out, ifunc)
 }
 
 /// Count GOT slots that will need an `R_X86_64_RELATIVE` (defined non-import

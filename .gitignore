@@ -1,3 +1,8 @@
 /target
 mold/
 /tmp
+rocq-tests/*.vo
+rocq-tests/*.vok
+rocq-tests/*.vos
+rocq-tests/*.glob
+rocq-tests/.*.aux
