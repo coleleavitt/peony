@@ -656,4 +656,54 @@ mod tests {
         let k2 = compute_epoch_key(&[], 43);
         assert_ne!(k1, k2, "epoch key must depend on args_hash");
     }
+
+    #[test]
+    fn section_records_round_trip_through_manifest() {
+        // record_link_with_sections must persist SectionRecords (offset, size,
+        // capacity, fingerprint, vaddr) so an in-place relink can read them back.
+        let dir = std::env::temp_dir().join(format!("peony-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a.out");
+        let inp = dir.join("in.o");
+        std::fs::write(&out, b"OUTPUT-BINARY-CONTENT").unwrap();
+        std::fs::write(&inp, b"input-object").unwrap();
+
+        let secs = vec![
+            SectionRecord {
+                name: ".text".to_string(),
+                fingerprint: Fingerprint::of_bytes(b"text-bytes"),
+                file_offset: 0x1000,
+                size: 0x200,
+                capacity: 0x200,
+                virtual_address: 0x1000,
+            },
+            SectionRecord {
+                name: ".data".to_string(),
+                fingerprint: Fingerprint::of_bytes(b"data-bytes"),
+                file_offset: 0x2000,
+                size: 0x40,
+                capacity: 0x40,
+                virtual_address: 0x2000,
+            },
+        ];
+        record_link_with_sections(&out, &[inp], &secs, &[]).unwrap();
+
+        // Read the manifest back and confirm the records survived intact.
+        let bytes = std::fs::read(manifest_path(&out)).unwrap();
+        let (m, _): (Manifest, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(m.sections.len(), 2);
+        assert_eq!(m.sections[0].name, ".text");
+        assert_eq!(m.sections[0].file_offset, 0x1000);
+        assert!(
+            m.sections[0].capacity >= m.sections[0].size,
+            "capacity >= size"
+        );
+        assert_eq!(m.sections[1].name, ".data");
+        assert_eq!(
+            m.sections[1].fingerprint,
+            Fingerprint::of_bytes(b"data-bytes")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

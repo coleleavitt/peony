@@ -635,11 +635,50 @@ fn main() -> Result<()> {
     .context("binary emission failed")?;
 
     if args.incremental {
-        peony_cache::record_link(&args.output, &inputs).context("incremental cache record")?;
+        let sections = section_records(&args.output, &layout).unwrap_or_default();
+        peony_cache::record_link_with_sections(&args.output, &inputs, &sections, &[])
+            .context("incremental cache record")?;
     }
 
     tracing::info!(output = %args.output.display(), "link complete");
     Ok(())
+}
+
+/// Capture per-output-section records (offset, size, capacity, content
+/// fingerprint, vaddr) from a finished link for the incremental manifest. This
+/// is the data an in-place relink needs to decide which sections it may patch
+/// without relaying out. Capacity currently equals size (no incremental padding
+/// is reserved yet); a future padding pass can widen it. Reads the emitted
+/// output once and slices each allocatable section by its file range.
+fn section_records(
+    output: &Path,
+    layout: &peony_layout::Layout,
+) -> Option<Vec<peony_cache::SectionRecord>> {
+    let bytes = std::fs::read(output).ok()?;
+    let mut records = Vec::new();
+    for sec in &layout.output_sections {
+        // Only file-backed allocatable sections have stable, patchable bytes.
+        if sec.sh_type == peony_object::elf::SHT_NOBITS
+            || sec.sh_flags & peony_object::elf::SHF_ALLOC == 0
+        {
+            continue;
+        }
+        let start = sec.sh_offset as usize;
+        let end = start + sec.sh_size as usize;
+        let fingerprint = match bytes.get(start..end) {
+            Some(slice) => peony_cache::Fingerprint::of_bytes(slice),
+            None => continue, // out-of-range (e.g. .tbss): skip
+        };
+        records.push(peony_cache::SectionRecord {
+            name: sec.name.clone(),
+            fingerprint,
+            file_offset: sec.sh_offset,
+            size: sec.sh_size,
+            capacity: sec.sh_size, // no padding reserved yet
+            virtual_address: sec.sh_addr,
+        });
+    }
+    Some(records)
 }
 
 // ── Loading + resolution ───────────────────────────────────────────────────────
