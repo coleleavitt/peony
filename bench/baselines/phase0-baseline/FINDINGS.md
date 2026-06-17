@@ -199,7 +199,29 @@ to separate commits.
 | parse+resolve   | ~41ms       | 27.4ms     | the 17MB copy gone |
 | emit            | ~25ms       | 12.5ms     | blit straight from mmap |
 | **TOTAL link**  | ~120ms      | **83ms**   | **~30% faster**  |
-| **peak RSS**    | ~225MB      | **140MB**  | **−38%**         |
+
+### ⚠️ RSS correction (verified properly afterward)
+
+An earlier draft of this file claimed zero-copy cut RSS 225MB → 140MB (−38%).
+**That was wrong — an uncontrolled single-run fluke.** Measured properly
+(best-of-3 at a fixed `--threads 1`, against the pre-zero-copy commit `748867d`
+built in a worktree):
+
+| build              | peak RSS (t=1) |
+|--------------------|---------------:|
+| pre-zero-copy (p2) | 153 MB         |
+| zero-copy (p3)     | 155 MB         |
+
+Zero-copy did **NOT** reduce peak RSS at ripgrep scale. Why: the section bytes
+were copied *out of* the mmap before, but the mmap source pages are faulted in
+during parse regardless, and a smaps snapshot shows the resident bulk is
+**anonymous** (~105MB) — the symbol table + 419 `InputObject`s' section/symbol/
+reloc `Vec`s + layout structures — which zero-copy does not touch. (`--threads 0`
+peaks ~216MB; the extra ~60MB is the rayon pool's transient emit buffers + 24
+thread stacks w/ huge pages.) The real zero-copy win is **speed** (−30% link,
+re-measured many times), not memory. mold's 8MB RSS comes from retaining far
+less metadata — a separate, larger effort. The honest RSS gap vs mold remains
+~20× and is dominated by per-object metadata, not section bytes.
 
 Parse is still SERIAL (council rule: never combine data-model change with
 concurrency); the win here is removing the copy + RSS, not parse threading.
@@ -218,4 +240,5 @@ Parallel parse is a separate follow-up now unblocked by `Send`-able indices.
 3.3× (start) → 2.0× (build-id) → with the link now at 83ms vs mold ~8ms the
 wall-clock ratio is re-measured in the next bench pass. The two shipped phases
 (build-id + zero-copy) together cut peony's own cold-link time ~177ms → ~83ms
-(−53%) and RSS 225MB → 140MB.
+(−53%). RSS is unchanged (~155MB; see the correction above — the earlier −38%
+RSS claim was a measurement error).

@@ -64,36 +64,51 @@ corpus itself (no fallback to bfd).
 Two epochs are shown: **before** the parallel/zero-copy rewrite and the
 **current** numbers after each shipped phase. peony is built `--release`.
 
-| corpus       | inputs | peony (before) | peony (now) | mold  | lld   | peony/mold (before → now) |
-|--------------|-------:|---------------:|------------:|------:|------:|---------------------------:|
-| hello-c      | 1      | ~15 ms         | ~26 ms*     | ~7 ms | ~9 ms | ~2.6× → ~1.0× (parity)     |
-| hello-cxx    | 1      | ~22 ms         | ~30 ms*     | ~8 ms | ~11ms | ~2.4× → **0.96× (beats)**  |
-| rust-hello   | 23     | ~28 ms         | ~71 ms*     | ~8 ms | ~58ms | ~2.0× → ~1.8×              |
-| ripgrep      | 419    | ~126ms         | ~117 ms     | ~8 ms | ~87ms | ~3.3× → **~2.0×**          |
+peony/mold ratios below are hyperfine median, 15 runs, warm cache, identical
+flags (a non-`performance` governor adds noise to absolute ms — the *ratio* is
+the honest figure).
 
-\* the small-link wall-times rose vs the old table because of measurement noise
-(non-`performance` governor on this run) — the *ratio* to mold is the honest
-figure; hello-cxx now beats mold and hello-c is at parity. The big-link result
-is the headline: **ripgrep closed from 3.3× to ~2.0×** behind mold.
+| corpus       | inputs | peony/mold (start) | peony/mold (now) |
+|--------------|-------:|-------------------:|-----------------:|
+| hello-c      | 1      | ~2.6×              | **1.13×** (near parity) |
+| hello-cxx    | 1      | ~2.4×              | **1.36×**        |
+| rust-hello   | 23     | ~2.0×              | **1.45×**        |
+| ripgrep      | 419    | ~3.3×              | **2.17×**        |
 
-**What moved the needle (measured, not guessed):** a per-phase scaling profiler
-(`--stats`/`--trace`, see `baselines/phase0-baseline/FINDINGS.md`) found the real
-cold-link bottleneck was NOT symbol resolution (only 3.2% of the link) but the
-**build-id hash: 30% of a ripgrep link, fully serial**, hashing all ~18.5MB of
-scattered input bytes. Hashing the ~4MB contiguous *output* in parallel blocks
-instead (commit `748867d`) cut it 17× (53ms→3ms) and the whole link ~30%.
+The headline: **ripgrep closed from 3.3× to 2.17×** behind mold, and the small
+links are now within ~1.1–1.4×. All four still pass the correctness gate (peony
+output runs and matches the lld reference).
 
-**Remaining gap, by measured self-time (ripgrep, post-build-id):**
+**What moved the needle (measured, not guessed)** — a per-phase scaling profiler
+(`--stats`/`--trace`, see `baselines/phase0-baseline/FINDINGS.md`) drove three
+shipped wins, NONE of which was the symbol resolver the plan first assumed (only
+3.2% of the link):
 
-1. **parse+resolve ~32%** — parse-bare + the lazy archive fixpoint; the
-   per-section `Vec<u8>` copy (17MB) makes it memory-bandwidth bound. The
-   zero-copy arena refactor (in progress) removes the copy and unblocks a parse
-   that actually scales.
-2. **reloc-postproc ~16%** — GOT/PLT/TLS slot extraction + dynsym assignment.
-3. **emit ~20%** — the section-copy already scales 3×; zero-copy lets it blit
-   straight from the input mmap.
-4. **Peak RSS:** peony ~225MB vs mold ~8MB on ripgrep — the per-section copy is
-   the main culprit; zero-copy attacks this directly.
+1. **build-id hash** (`748867d`): was 30% of a ripgrep link, fully serial,
+   hashing all ~18.5MB of scattered input. Now hashes the ~4MB contiguous
+   *output* in parallel blocks — 17× faster (53ms→3ms), whole link −30%.
+2. **zero-copy section data** (`1413aae`): sections borrow from a link-wide mmap
+   arena instead of a per-section `Vec<u8>` copy; emit blits straight from the
+   mmap. Another −30% on the link. (RSS unchanged — the resident bulk is
+   anonymous per-object metadata, not section bytes; see FINDINGS.)
+3. **parallel parse** (`3bd7efd`): race-free via object-local owned rebase;
+   parse-bare 11→7ms.
+
+**Remaining gap, by measured self-time (ripgrep, best-of-8, ~60ms total):**
+
+1. **parse+resolve ~24ms** — parse-bare 7.6ms (parallel, near floor), archive
+   fixpoint 5.9ms (serial), resolve-bare 2.6ms.
+2. **reloc-postproc ~8.7ms** — GOT/PLT/TLS slot extraction + dynsym assignment
+   (serial, 1.04×).
+3. **resolve-inputs ~8ms** — `-l` library path resolution + script expansion (I/O).
+4. **layout ~7.4ms** — serial address assignment.
+5. **emit ~8.8ms** — scales 2.2×, no single hotspot; done.
+
+**Peak RSS:** peony ~155MB (`--threads 1`) / ~216MB (`--threads 0`) vs mold ~8MB
+on ripgrep. The bulk is **anonymous per-object metadata** (symbol table + 419
+objects' section/symbol/reloc `Vec`s), not section bytes — so closing it needs a
+metadata-compaction effort (interned/arena-allocated symbols, compact section
+records), a separate larger project, not the section-byte zero-copy already done.
 
 ## Where peony already wins: the edit–rebuild loop
 
