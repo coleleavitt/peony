@@ -69,6 +69,7 @@ struct Args {
     entry_explicit: bool,
     gc_sections: bool,
     icf: bool,
+    stats: bool,
     defsym: Vec<String>,
     linker_scripts: Vec<PathBuf>,
     plugin: Option<PathBuf>,
@@ -104,6 +105,7 @@ impl Default for Args {
             entry_explicit: false,
             gc_sections: false,
             icf: false,
+            stats: false,
             defsym: Vec::new(),
             linker_scripts: Vec::new(),
             plugin: None,
@@ -177,6 +179,7 @@ fn parse_args() -> Result<Args> {
             }
             "--gc-sections" => a.gc_sections = true,
             "--no-gc-sections" => a.gc_sections = false,
+            "--stats" => a.stats = true,
             // Identical Code Folding. `=all`/`=safe` accepted; `=none` disables.
             "--icf=all" | "--icf=safe" | "--icf" => a.icf = true,
             "--icf=none" | "--no-icf" => a.icf = false,
@@ -281,6 +284,11 @@ fn main() -> Result<()> {
     }
 
     let mut args = parse_args()?;
+    // `--stats`: turn on the in-linker phase profiler so the breakdown table is
+    // printed at the end. Cheap no-op for every normal link.
+    if args.stats {
+        peony_prof::enable();
+    }
     if maybe_handoff_lto_plugin(&args)? {
         return Ok(());
     }
@@ -312,8 +320,11 @@ fn main() -> Result<()> {
 
     // Positional inputs plus `-l<name>` libraries resolved against `-L` paths,
     // with any GNU linker scripts (e.g. libc.so) expanded to real files.
-    let inputs = resolve_inputs(&args)?;
-    let inputs = expand_inputs(inputs, &library_search_paths(&args.library_paths))?;
+    let inputs = {
+        let _p = peony_prof::phase("resolve-inputs");
+        let inputs = resolve_inputs(&args)?;
+        expand_inputs(inputs, &library_search_paths(&args.library_paths))?
+    };
     // When invoked directly as the linker (e.g. by rustc), the C-runtime startup
     // objects that provide `_start`/`_init` are not passed; inject them as `cc`
     // would for a dynamic/PIE executable. A shared object has no `_start`/crt1.
@@ -347,7 +358,11 @@ fn main() -> Result<()> {
         mut symbols,
         comdat_excluded,
         needed,
-    } = load_and_resolve(&inputs)?;
+    } = {
+        let _p = peony_prof::phase("parse+resolve");
+        load_and_resolve(&inputs)?
+    };
+    peony_prof::record_items("parse+resolve", objects.len() as u64);
 
     // Weak-undefined symbols referenced through the GOT (e.g. `__gmon_start__`)
     // need a real SymbolId so their GOT slot gets a recorded address (holding 0).
@@ -355,7 +370,10 @@ fn main() -> Result<()> {
     peony_reloc::assign_weak_got_ids(&objects, &mut symbols);
 
     tracing::info!("scanning relocations");
-    let scan = scan_relocations(&objects, &symbols, args.shared);
+    let scan = {
+        let _p = peony_prof::phase("reloc-scan");
+        scan_relocations(&objects, &symbols, args.shared)
+    };
     let got_syms = scan.got_symbols();
     let plt_syms = scan.plt_symbols();
     let tls_got = peony_layout::TlsGotInfo {
@@ -548,6 +566,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let layout_span = peony_prof::phase("layout");
     let mut layout = peony_layout::compute_layout_icf(
         &objects,
         &symbols,
@@ -560,6 +579,7 @@ fn main() -> Result<()> {
         fold_map.as_ref(),
     )
     .context("layout computation failed")?;
+    drop(layout_span);
     tracing::info!(
         sections = layout.output_sections.len(),
         segments = layout.segments.len(),
@@ -629,6 +649,7 @@ fn main() -> Result<()> {
         layout.append_all_dynamic_relocs(&relative, &irelative, &tls_dyn, &symbolic);
     }
 
+    let _emit_span = peony_prof::phase("emit");
     emit_full(
         &args.output,
         &objects,
@@ -645,7 +666,9 @@ fn main() -> Result<()> {
             .context("incremental cache record")?;
     }
 
+    drop(_emit_span);
     tracing::info!(output = %args.output.display(), "link complete");
+    peony_prof::report();
     Ok(())
 }
 

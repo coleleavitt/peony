@@ -8,6 +8,7 @@ members = [
     "peony-cache",
     "peony-emit",
     "peony-bench",
+    "peony-prof",
 ]
 resolver = "2"
 

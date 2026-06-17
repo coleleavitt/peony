@@ -1,0 +1,11 @@
+[package]
+name = "peony-prof"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# In-linker phase profiler. The point: MEASURE where a link spends its time from
+# inside peony (phase wall-clock + bytes + counts) instead of guessing with
+# external strace/perf. Near-zero cost when disabled; one `--stats` table when on.
+
+[dependencies]

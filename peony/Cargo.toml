@@ -16,6 +16,7 @@ peony-layout  = { path = "../peony-layout" }
 peony-reloc   = { path = "../peony-reloc" }
 peony-cache   = { path = "../peony-cache" }
 peony-emit    = { path = "../peony-emit" }
+peony-prof    = { path = "../peony-prof" }
 
 anyhow.workspace     = true
 clap.workspace       = true

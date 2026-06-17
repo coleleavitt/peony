@@ -1,0 +1,341 @@
+//! `peony-prof` — an in-linker phase profiler.
+//!
+//! The recurring pain when tuning peony was *guessing* where time went via
+//! external `strace`/`perf`. This crate measures it from the inside: wrap each
+//! link phase in a [`phase`] guard and, when profiling is enabled, peony prints
+//! a breakdown table (phase, wall-clock, % of total, and optional byte/item
+//! counters). When disabled (the default) every operation is a cheap atomic
+//! load that short-circuits — no timers, no allocation, no table.
+//!
+//! ```ignore
+//! peony_prof::enable();                 // driver does this on `--stats`
+//! {
+//!     let _g = peony_prof::phase("parse");
+//!     // ... parse work ...
+//!     peony_prof::record_bytes("parse", bytes_read);
+//! }
+//! peony_prof::report();                 // prints the table to stderr
+//! ```
+//!
+//! Phases are recorded in first-`phase()`-call order so the table reads like the
+//! pipeline. Re-entering a phase name accumulates (so a phase split across calls
+//! sums correctly). Designed to be safe to call from any thread.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Global on/off switch. When false, every public entry point is a single
+/// relaxed atomic load and an early return — so leaving profiling calls in the
+/// hot path costs essentially nothing in a normal link.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Process start, captured the first time profiling is enabled, so the report
+/// can show each phase's share of the whole run.
+static T0: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// One accumulated phase: total nanoseconds, number of spans, and optional
+/// user counters (bytes processed, items processed).
+#[derive(Default, Clone)]
+struct PhaseStat {
+    nanos: u128,
+    spans: u64,
+    bytes: u64,
+    items: u64,
+}
+
+/// Insertion-ordered phase table. A Vec keeps first-seen order (the pipeline
+/// order); lookups are linear but the phase count is tiny (≈8).
+static PHASES: Mutex<Vec<(String, PhaseStat)>> = Mutex::new(Vec::new());
+
+/// Enable profiling. Idempotent; resets the clock and clears prior data so a
+/// process that links several times reports the most recent run.
+pub fn enable() {
+    ENABLED.store(true, Ordering::Relaxed);
+    *T0.lock().unwrap() = Some(Instant::now());
+    PHASES.lock().unwrap().clear();
+}
+
+/// Is profiling on? Hot-path callers can gate expensive counter computation.
+#[inline]
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// An RAII span: times from creation to drop and accumulates into the named
+/// phase. No-op (and stores no name) when profiling is disabled.
+pub struct Span {
+    name: &'static str,
+    start: Instant,
+    active: bool,
+}
+
+/// Begin timing a phase. The returned guard records the elapsed time into
+/// `name` when dropped. Cheap no-op when disabled.
+#[inline]
+pub fn phase(name: &'static str) -> Span {
+    let active = is_enabled();
+    Span {
+        name,
+        start: Instant::now(),
+        active,
+    }
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let elapsed = self.start.elapsed().as_nanos();
+        let mut phases = PHASES.lock().unwrap();
+        match phases.iter_mut().find(|(n, _)| n == self.name) {
+            Some((_, s)) => {
+                s.nanos += elapsed;
+                s.spans += 1;
+            }
+            None => phases.push((
+                self.name.to_string(),
+                PhaseStat {
+                    nanos: elapsed,
+                    spans: 1,
+                    bytes: 0,
+                    items: 0,
+                },
+            )),
+        }
+    }
+}
+
+/// Add to a phase's byte counter (e.g. bytes parsed, bytes written). No-op when
+/// disabled. Creates the phase row if it does not yet exist.
+#[inline]
+pub fn record_bytes(name: &'static str, bytes: u64) {
+    add_counter(name, bytes, 0);
+}
+
+/// Add to a phase's item counter (e.g. objects, symbols, relocations).
+#[inline]
+pub fn record_items(name: &'static str, items: u64) {
+    add_counter(name, 0, items);
+}
+
+fn add_counter(name: &'static str, bytes: u64, items: u64) {
+    if !is_enabled() {
+        return;
+    }
+    let mut phases = PHASES.lock().unwrap();
+    match phases.iter_mut().find(|(n, _)| n == name) {
+        Some((_, s)) => {
+            s.bytes += bytes;
+            s.items += items;
+        }
+        None => phases.push((
+            name.to_string(),
+            PhaseStat {
+                nanos: 0,
+                spans: 0,
+                bytes,
+                items,
+            },
+        )),
+    }
+}
+
+/// A free-running counter not tied to a timed phase (e.g. syscall-ish events the
+/// linker itself can count, like `file_opens`). Stored as an item counter under
+/// the given name. Cheap no-op when disabled.
+static COUNTERS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Named global counters, parallel to `COUNTERS` by index.
+const COUNTER_NAMES: [&str; 8] = [
+    "file_opens",
+    "file_reads",
+    "bytes_read",
+    "objects_parsed",
+    "symbols_resolved",
+    "relocs_applied",
+    "sections_emitted",
+    "spare",
+];
+
+/// Bump a named global counter (matched against [`COUNTER_NAMES`]). Always a
+/// cheap relaxed add when enabled; no-op otherwise.
+#[inline]
+pub fn count(name: &str, n: u64) {
+    if !is_enabled() {
+        return;
+    }
+    if let Some(i) = COUNTER_NAMES.iter().position(|&c| c == name) {
+        COUNTERS[i].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Print the phase + counter breakdown to stderr. No-op when disabled.
+pub fn report() {
+    if !is_enabled() {
+        return;
+    }
+    let total_ns = T0
+        .lock()
+        .unwrap()
+        .map(|t0| t0.elapsed().as_nanos())
+        .unwrap_or(0)
+        .max(1);
+    let phases = PHASES.lock().unwrap();
+
+    eprintln!("\n── peony --stats ──────────────────────────────────────────");
+    eprintln!(
+        "{:<18} {:>10} {:>7}  {:>12} {:>10}",
+        "phase", "wall", "%", "bytes", "items"
+    );
+    let mut timed_ns: u128 = 0;
+    for (name, s) in phases.iter() {
+        timed_ns += s.nanos;
+        let pct = (s.nanos as f64 / total_ns as f64) * 100.0;
+        eprintln!(
+            "{:<18} {:>10} {:>6.1}% {:>12} {:>10}",
+            name,
+            fmt_ns(s.nanos),
+            pct,
+            human(s.bytes),
+            s.items,
+        );
+    }
+    let other = total_ns.saturating_sub(timed_ns);
+    eprintln!(
+        "{:<18} {:>10} {:>6.1}%  (startup/teardown/untimed)",
+        "other",
+        fmt_ns(other),
+        (other as f64 / total_ns as f64) * 100.0
+    );
+    eprintln!("{:<18} {:>10}", "TOTAL", fmt_ns(total_ns));
+
+    // Global counters (only print non-zero ones).
+    let mut printed_header = false;
+    for (i, name) in COUNTER_NAMES.iter().enumerate() {
+        let v = COUNTERS[i].load(Ordering::Relaxed);
+        if v == 0 {
+            continue;
+        }
+        if !printed_header {
+            eprintln!("── counters ──");
+            printed_header = true;
+        }
+        eprintln!("  {name:<18} {v}");
+    }
+    eprintln!("───────────────────────────────────────────────────────────");
+}
+
+fn fmt_ns(ns: u128) -> String {
+    if ns >= 1_000_000 {
+        format!("{:.2}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+fn human(bytes: u64) -> String {
+    const U: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut b = bytes as f64;
+    let mut i = 0;
+    while b >= 1024.0 && i < U.len() - 1 {
+        b /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{b:.1}{}", U[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests mutate process-global profiler state, so they must not run
+    // concurrently. Serialise them on one mutex.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn disabled_is_noop() {
+        let _t = TEST_LOCK.lock().unwrap();
+        // With profiling off, phases record nothing and report is silent.
+        ENABLED.store(false, Ordering::Relaxed);
+        PHASES.lock().unwrap().clear();
+        let before = COUNTERS[0].load(Ordering::Relaxed);
+        {
+            let _g = phase("noop_phase");
+            record_bytes("noop_phase", 100);
+            count("file_opens", 5);
+        }
+        // Disabled ⇒ nothing recorded: no phase row, counter unchanged.
+        assert!(
+            !PHASES
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "noop_phase"),
+            "disabled profiling must not create phase rows"
+        );
+        assert_eq!(
+            COUNTERS[0].load(Ordering::Relaxed),
+            before,
+            "disabled profiling must not bump counters"
+        );
+        report(); // must not panic when disabled
+    }
+
+    #[test]
+    fn enabled_accumulates_phase_time_and_counters() {
+        let _t = TEST_LOCK.lock().unwrap();
+        enable();
+        COUNTERS[0].store(0, Ordering::Relaxed);
+        {
+            let _g = phase("parse");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            record_bytes("parse", 4096);
+            record_items("parse", 3);
+        }
+        count("file_opens", 7);
+        let phases = PHASES.lock().unwrap();
+        let (_, s) = phases
+            .iter()
+            .find(|(n, _)| n == "parse")
+            .expect("phase present");
+        assert!(s.nanos >= 1_000_000, "≥1ms recorded, got {}ns", s.nanos);
+        assert_eq!(s.spans, 1);
+        assert_eq!(s.bytes, 4096);
+        assert_eq!(s.items, 3);
+        drop(phases);
+        assert_eq!(COUNTERS[0].load(Ordering::Relaxed), 7);
+        // reset for other tests
+        ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn reentering_a_phase_accumulates() {
+        let _t = TEST_LOCK.lock().unwrap();
+        enable();
+        for _ in 0..3 {
+            let _g = phase("loop");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let phases = PHASES.lock().unwrap();
+        let (_, s) = phases.iter().find(|(n, _)| n == "loop").unwrap();
+        assert_eq!(s.spans, 3, "three spans summed under one phase");
+        ENABLED.store(false, Ordering::Relaxed);
+    }
+}
