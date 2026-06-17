@@ -12,7 +12,10 @@ VFILES := \
   RelocMonoid.v \
   SectionGC.v \
   Layout.v \
-  IncrementalSoundness.v
+  IncrementalSoundness.v \
+  IncrementalCostBound.v \
+  ParallelSchedule.v \
+  ICFSoundness.v
 
 VOFILES := $(VFILES:.v=.vo)
 

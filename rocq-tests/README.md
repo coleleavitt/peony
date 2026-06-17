@@ -29,8 +29,11 @@ under the global context* (zero axioms).
 | `SectionGC.v` | §3 | `gc_sound` (every GC-live section is reachable), `gc_contains_roots`, `bfs_superset_*` (level-synchronous BFS = reachability) |
 | `Layout.v` | §4 | `layout_all_aligned` (page alignment), `layout_page_congruent` (vaddr ≡ fileoff mod page), `layout_addr_lower_bound` + `layout_no_overlap` (disjoint windows) |
 | `IncrementalSoundness.v` | §6, §10.2 | **NOVEL** — `incremental_relink_sound` family + `green_is_byte_stable`, `red_is_forced`, `minimal_cut_characterization` (byte-level incremental soundness + minimal recomputation cut) |
+| `IncrementalCostBound.v` | §6 (new) | **NOVEL** — `incremental_beats_fromscratch`: a single-section edit of an n-section link costs incremental-work 1 vs from-scratch n (`single_edit_cost_is_one`, `fromscratch_grows_unboundedly`); `capacity_stable_cost_bounded` (incremental ≤ from-scratch always). The Ω(n) edit-rebuild separation from mold/lld. |
+| `ParallelSchedule.v` | §7 (new) | **NOVEL framing** — work–span (Brent) bounds for the disjoint-footprint section-copy antichain: `span_lower_bound`, `work_lower_bound` (no schedule beats max(T∞, T₁/P)), `greedy_within_2x_opt` (work-stealing is a 2-approximation), `linear_speedup_regime` |
+| `ICFSoundness.v` | §9 (new) | **NOVEL** — Identical Code Folding soundness as bisimulation: `icf_call_preserved`, `icf_addr_change_iff_folded` (the address-significance hazard, characterised), `icf_observationally_equivalent` (sound iff no folded fn is address-significant), `icf_rel_refines_content` (Hopcroft partition refinement is a valid quotient) |
 
-## The two novel theorems
+## The novel theorems
 
 The deep-research prior-art survey (`../research/`, papers downloaded and
 `pdftotext`-extracted under `../research/txt/`) confirmed that while the
@@ -61,6 +64,35 @@ algebraic structure the council flagged as missing: relocation patches form a
 partial commutative monoid whose action on the output buffer is a homomorphism,
 from which parallel determinism falls out as commutativity. This connects peony's
 emit phase to the resource algebras (PCMs / Iris cameras) of separation logic.
+
+Three further results (added after a second deep-research pass on incremental/
+parallel-linking theory — Acar self-adjusting computation arXiv:1106.0478 /
+arXiv:2105.06712, Brent/Graham work–span, Hopcroft partition refinement):
+
+4. **Incremental Cost Bound** (`IncrementalCostBound.v`). The *quantitative*
+   companion to soundness: under capacity-stability the incremental relink work
+   equals the affected-set size (`incremental_cost_eq_num_changed`), so a
+   single-file edit of an n-object program costs **1** while a from-scratch
+   linker (mold, lld — which have no incremental mode) pays **n**
+   (`incremental_beats_fromscratch`). This is the formal statement of *why*
+   peony can beat mold on the edit–rebuild loop: same output bytes (Theorem A),
+   asymptotically less work.
+
+5. **Parallel Schedule Optimality** (`ParallelSchedule.v`). Because section
+   copies write disjoint output ranges (`RelocDisjoint.v`), their dependence DAG
+   is an antichain; the work–span model gives matching lower bounds
+   (`span_lower_bound`, `work_lower_bound`) and a 2-approximation guarantee for
+   the greedy ws-deque scheduler (`greedy_within_2x_opt`), with exact linear
+   speedup when sections are uniform. This bounds the *best any linker can do* on
+   the copy phase — the ceiling peony's parallel emit provably approaches.
+
+6. **ICF Soundness** (`ICFSoundness.v`). Identical Code Folding is behaviour-
+   preserving exactly on non-address-significant functions: calls are always
+   safe to redirect (`icf_call_preserved`), and the only observable hazard is an
+   address comparison between folded functions (`icf_addr_change_iff_folded`),
+   which the address-safe side-condition excludes (`icf_observationally_equivalent`).
+   The ICF equivalence refines content-equality (`icf_rel_refines_content`),
+   validating Hopcroft-style partition refinement as the folding algorithm.
 
 ## Relationship to the implementation
 
