@@ -70,6 +70,7 @@ struct Args {
     gc_sections: bool,
     icf: bool,
     stats: bool,
+    trace: bool,
     defsym: Vec<String>,
     linker_scripts: Vec<PathBuf>,
     plugin: Option<PathBuf>,
@@ -106,6 +107,7 @@ impl Default for Args {
             gc_sections: false,
             icf: false,
             stats: false,
+            trace: false,
             defsym: Vec::new(),
             linker_scripts: Vec::new(),
             plugin: None,
@@ -180,6 +182,7 @@ fn parse_args() -> Result<Args> {
             "--gc-sections" => a.gc_sections = true,
             "--no-gc-sections" => a.gc_sections = false,
             "--stats" => a.stats = true,
+            "--trace" => a.trace = true,
             // Identical Code Folding. `=all`/`=safe` accepted; `=none` disables.
             "--icf=all" | "--icf=safe" | "--icf" => a.icf = true,
             "--icf=none" | "--no-icf" => a.icf = false,
@@ -285,8 +288,12 @@ fn main() -> Result<()> {
 
     let mut args = parse_args()?;
     // `--stats`: turn on the in-linker phase profiler so the breakdown table is
-    // printed at the end. Cheap no-op for every normal link.
-    if args.stats {
+    // printed at the end. `--trace` additionally records the call-flow tree
+    // (caller→callee by file:line) for following a bug through the pipeline.
+    // Both are cheap no-ops for every normal link.
+    if args.trace {
+        peony_prof::trace_enable();
+    } else if args.stats {
         peony_prof::enable();
     }
     if maybe_handoff_lto_plugin(&args)? {
@@ -717,6 +724,7 @@ fn section_records(
 /// Object indices in the returned `Vec` match the [`peony_symbols::ObjectId`]s
 /// assigned during resolution (lock-step `add_object` + `push`).
 fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
+    let _t = peony_prof::trace("load_and_resolve");
     let mut r = Resolver::default();
 
     // Classify each input ONCE by reading only its leading magic bytes. The old
@@ -871,6 +879,7 @@ struct Member {
 }
 
 fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()> {
+    let _t = peony_prof::trace("include_archive_members");
     let mut members: Vec<Member> = Vec::new();
     // Deduplicate archive paths, keeping first-seen order. `cc`/`rustc` pass the
     // same archive repeatedly (e.g. `-lgcc … -lgcc_s … -lgcc`, four `-lgcc`s) to
@@ -1508,6 +1517,7 @@ fn resolve_inputs(args: &Args) -> Result<Vec<PathBuf>> {
 /// objects can't be located, the inputs are returned unchanged (a static link
 /// with its own `_start`, e.g. the test-suite's hand-written objects, still works).
 fn inject_crt_objects(inputs: Vec<PathBuf>, args: &Args) -> Vec<PathBuf> {
+    let _t = peony_prof::trace("inject_crt_objects");
     // Heuristic: skip if a Scrt1/crt1 object is already on the command line.
     let already = inputs.iter().any(|p| {
         p.file_name()

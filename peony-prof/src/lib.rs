@@ -21,6 +21,8 @@
 //! pipeline. Re-entering a phase name accumulates (so a phase split across calls
 //! sums correctly). Designed to be safe to call from any thread.
 
+use std::cell::RefCell;
+use std::panic::Location;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -142,6 +144,146 @@ fn add_counter(name: &'static str, bytes: u64, items: u64) {
     }
 }
 
+// ── Call-flow tracing ────────────────────────────────────────────────────────
+//
+// The phase table above tells you WHICH phase is slow; the trace tree below
+// tells you the FLOW — who called what, in order, at which source line — so a
+// bug can be followed through the pipeline instead of guessed. Wrap a suspect
+// function body in `let _t = peony_prof::trace("name");` and the captured tree
+// shows the nested caller→callee path with file:line and per-frame timing.
+//
+// Tracing is gated behind `trace_enable()` (separate from `enable()`) because
+// fine-grained per-call tracing is heavier than phase timing; you turn it on
+// only when hunting a specific bug. Tree state is thread-local: each worker
+// thread builds its own tree, avoiding cross-thread lock contention, and
+// `trace_tree()` prints whichever thread asks (typically the main driver).
+
+static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// One node in the call-flow tree: a label, where it was entered (file:line),
+/// nesting depth, elapsed nanos, and the order it was ENTERED (so the printed
+/// tree preserves execution order even though nodes finish out of order).
+#[derive(Clone)]
+struct TraceNode {
+    label: &'static str,
+    loc: &'static Location<'static>,
+    depth: usize,
+    nanos: u128,
+    enter_seq: u64,
+}
+
+thread_local! {
+    /// Current nesting depth on this thread.
+    static TRACE_DEPTH: RefCell<usize> = const { RefCell::new(0) };
+    /// Completed trace nodes for this thread, in finish order.
+    static TRACE_NODES: RefCell<Vec<TraceNode>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Monotonic enter sequence so the tree can be re-sorted into execution order.
+static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Turn on call-flow tracing. Implies [`enable`] so the report runs too.
+pub fn trace_enable() {
+    enable();
+    TRACE_ENABLED.store(true, Ordering::Relaxed);
+    TRACE_SEQ.store(0, Ordering::Relaxed);
+    TRACE_NODES.with(|n| n.borrow_mut().clear());
+    TRACE_DEPTH.with(|d| *d.borrow_mut() = 0);
+}
+
+/// An RAII trace frame: records `label` + the call site + nesting depth + time.
+pub struct TraceFrame {
+    label: &'static str,
+    loc: &'static Location<'static>,
+    start: Instant,
+    depth: usize,
+    enter_seq: u64,
+    active: bool,
+}
+
+/// Enter a trace frame. `#[track_caller]` captures the CALLER's file:line, so the
+/// tree shows where in the source the flow went. Cheap no-op when tracing is off.
+#[inline]
+#[track_caller]
+pub fn trace(label: &'static str) -> TraceFrame {
+    if !TRACE_ENABLED.load(Ordering::Relaxed) {
+        return TraceFrame {
+            label,
+            loc: Location::caller(),
+            start: Instant::now(),
+            depth: 0,
+            enter_seq: 0,
+            active: false,
+        };
+    }
+    let depth = TRACE_DEPTH.with(|d| {
+        let mut d = d.borrow_mut();
+        let cur = *d;
+        *d += 1;
+        cur
+    });
+    TraceFrame {
+        label,
+        loc: Location::caller(),
+        start: Instant::now(),
+        depth,
+        enter_seq: TRACE_SEQ.fetch_add(1, Ordering::Relaxed),
+        active: true,
+    }
+}
+
+impl Drop for TraceFrame {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let nanos = self.start.elapsed().as_nanos();
+        TRACE_DEPTH.with(|d| *d.borrow_mut() = self.depth);
+        TRACE_NODES.with(|n| {
+            n.borrow_mut().push(TraceNode {
+                label: self.label,
+                loc: self.loc,
+                depth: self.depth,
+                nanos,
+                enter_seq: self.enter_seq,
+            })
+        });
+    }
+}
+
+/// Print the call-flow tree for the CURRENT thread to stderr: nested
+/// caller→callee frames in execution order, each with file:line and timing. Use
+/// after a link to follow how the flow actually executed. No-op when tracing off.
+pub fn trace_tree() {
+    if !TRACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut nodes = TRACE_NODES.with(|n| n.borrow().clone());
+    if nodes.is_empty() {
+        return;
+    }
+    // Re-order into execution (enter) order; depth then renders the nesting.
+    nodes.sort_by_key(|n| n.enter_seq);
+    eprintln!("\n── peony --trace (call flow) ──────────────────────────────");
+    for n in &nodes {
+        let indent = "  ".repeat(n.depth);
+        let file = n
+            .loc
+            .file()
+            .rsplit('/')
+            .next()
+            .unwrap_or_else(|| n.loc.file());
+        eprintln!(
+            "{indent}{} {:>9}  ({}:{})",
+            n.label,
+            fmt_ns(n.nanos),
+            file,
+            n.loc.line()
+        );
+    }
+    eprintln!("───────────────────────────────────────────────────────────");
+}
+
 /// A free-running counter not tied to a timed phase (e.g. syscall-ish events the
 /// linker itself can count, like `file_opens`). Stored as an item counter under
 /// the given name. Cheap no-op when disabled.
@@ -234,6 +376,9 @@ pub fn report() {
         eprintln!("  {name:<18} {v}");
     }
     eprintln!("───────────────────────────────────────────────────────────");
+
+    // If call-flow tracing was on, follow it with the flow tree.
+    trace_tree();
 }
 
 fn fmt_ns(ns: u128) -> String {
@@ -337,5 +482,45 @@ mod tests {
         let (_, s) = phases.iter().find(|(n, _)| n == "loop").unwrap();
         assert_eq!(s.spans, 3, "three spans summed under one phase");
         ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn trace_builds_nested_caller_callee_tree() {
+        let _t = TEST_LOCK.lock().unwrap();
+        trace_enable();
+        {
+            let _outer = trace("outer");
+            {
+                let _inner = trace("inner");
+                let _leaf = trace("leaf");
+            } // leaf, inner drop here
+        } // outer drops here
+        let nodes = TRACE_NODES.with(|n| n.borrow().clone());
+        // Three frames captured, with increasing depth following the call nesting.
+        let by_label = |l: &str| nodes.iter().find(|n| n.label == l).expect("frame present");
+        assert_eq!(by_label("outer").depth, 0);
+        assert_eq!(by_label("inner").depth, 1);
+        assert_eq!(by_label("leaf").depth, 2);
+        // Enter order is preserved: outer < inner < leaf.
+        assert!(by_label("outer").enter_seq < by_label("inner").enter_seq);
+        assert!(by_label("inner").enter_seq < by_label("leaf").enter_seq);
+        // Each frame captured a real source line.
+        assert!(by_label("outer").loc.line() > 0);
+        TRACE_ENABLED.store(false, Ordering::Relaxed);
+        ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn trace_disabled_is_noop() {
+        let _t = TEST_LOCK.lock().unwrap();
+        TRACE_ENABLED.store(false, Ordering::Relaxed);
+        TRACE_NODES.with(|n| n.borrow_mut().clear());
+        {
+            let _f = trace("x");
+        }
+        assert!(
+            TRACE_NODES.with(|n| n.borrow().is_empty()),
+            "disabled tracing records no nodes"
+        );
     }
 }
