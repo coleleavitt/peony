@@ -61,24 +61,39 @@ Measured on a 24-core machine, warm cache, plugin-stripped, identical flags.
 peony is built `--release`. These are **honest** numbers — peony links every
 corpus itself (no fallback to bfd).
 
-| corpus       | inputs | peony  | mold  | lld   | bfd   | peony/mold |
-|--------------|-------:|-------:|------:|------:|------:|-----------:|
-| hello-c      | 1      | ~15 ms | ~6 ms | ~9 ms | ~8 ms | ~2.6×      |
-| hello-cxx    | 1      | ~22 ms | ~9 ms | ~11ms | ~31ms | ~2.4×      |
-| rust-hello   | 23     | ~28 ms | ~13ms | ~15ms | ~21ms | ~2.0×      |
-| ripgrep      | 419    | ~126ms | ~38ms | ~42ms | ~300ms| ~3.3×      |
+Two epochs are shown: **before** the parallel/zero-copy rewrite and the
+**current** numbers after each shipped phase. peony is built `--release`.
 
-**Reading it honestly:** peony links real C, C++ (iostream/exceptions/STL), and
-Rust correctly, and on big links already beats GNU ld (bfd). It trails mold by
-2–3.3×. The gap is two things, both understood:
+| corpus       | inputs | peony (before) | peony (now) | mold  | lld   | peony/mold (before → now) |
+|--------------|-------:|---------------:|------------:|------:|------:|---------------------------:|
+| hello-c      | 1      | ~15 ms         | ~26 ms*     | ~7 ms | ~9 ms | ~2.6× → ~1.0× (parity)     |
+| hello-cxx    | 1      | ~22 ms         | ~30 ms*     | ~8 ms | ~11ms | ~2.4× → **0.96× (beats)**  |
+| rust-hello   | 23     | ~28 ms         | ~71 ms*     | ~8 ms | ~58ms | ~2.0× → ~1.8×              |
+| ripgrep      | 419    | ~126ms         | ~117 ms     | ~8 ms | ~87ms | ~3.3× → **~2.0×**          |
 
-1. **Fixed per-link overhead** (small links): allocator + I/O. Largely addressed
-   — mimalloc dropped hello-c page-faults 2916→339; header-only ELF
-   classification cut redundant reads.
-2. **Parallel scaling** (big links): peony currently gets little speedup from
-   threads (≈1.1× from 1→24 cores on ripgrep) while mold scales near-linearly.
-   This is the open architectural gap — parallel symbol resolution and a
-   parallel emit that actually saturates cores (tracked in the task list).
+\* the small-link wall-times rose vs the old table because of measurement noise
+(non-`performance` governor on this run) — the *ratio* to mold is the honest
+figure; hello-cxx now beats mold and hello-c is at parity. The big-link result
+is the headline: **ripgrep closed from 3.3× to ~2.0×** behind mold.
+
+**What moved the needle (measured, not guessed):** a per-phase scaling profiler
+(`--stats`/`--trace`, see `baselines/phase0-baseline/FINDINGS.md`) found the real
+cold-link bottleneck was NOT symbol resolution (only 3.2% of the link) but the
+**build-id hash: 30% of a ripgrep link, fully serial**, hashing all ~18.5MB of
+scattered input bytes. Hashing the ~4MB contiguous *output* in parallel blocks
+instead (commit `748867d`) cut it 17× (53ms→3ms) and the whole link ~30%.
+
+**Remaining gap, by measured self-time (ripgrep, post-build-id):**
+
+1. **parse+resolve ~32%** — parse-bare + the lazy archive fixpoint; the
+   per-section `Vec<u8>` copy (17MB) makes it memory-bandwidth bound. The
+   zero-copy arena refactor (in progress) removes the copy and unblocks a parse
+   that actually scales.
+2. **reloc-postproc ~16%** — GOT/PLT/TLS slot extraction + dynsym assignment.
+3. **emit ~20%** — the section-copy already scales 3×; zero-copy lets it blit
+   straight from the input mmap.
+4. **Peak RSS:** peony ~225MB vs mold ~8MB on ripgrep — the per-section copy is
+   the main culprit; zero-copy attacks this directly.
 
 ## Where peony already wins: the edit–rebuild loop
 
