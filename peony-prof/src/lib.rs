@@ -162,7 +162,11 @@ static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// One node in the call-flow tree: a label, where it was entered (file:line),
 /// nesting depth, elapsed nanos, and the order it was ENTERED (so the printed
-/// tree preserves execution order even though nodes finish out of order).
+/// tree preserves execution order even though nodes finish out of order). A node
+/// with `is_event = true` is a zero-duration point marker (e.g. "symbol
+/// conflict", "comdat excluded") logged AT a source line inside a frame, with an
+/// optional `detail` string — this is what lets you see what happened per line,
+/// not just which function ran.
 #[derive(Clone)]
 struct TraceNode {
     label: &'static str,
@@ -170,6 +174,8 @@ struct TraceNode {
     depth: usize,
     nanos: u128,
     enter_seq: u64,
+    is_event: bool,
+    detail: String,
 }
 
 thread_local! {
@@ -246,9 +252,40 @@ impl Drop for TraceFrame {
                 depth: self.depth,
                 nanos,
                 enter_seq: self.enter_seq,
+                is_event: false,
+                detail: String::new(),
             })
         });
     }
+}
+
+/// Log a point-in-flow EVENT at the current nesting depth: a labelled marker
+/// captured at the calling source line, with an optional detail string. Use it
+/// to see what happened *inside* a frame, line by line — e.g.
+/// `event!("comdat-excluded", sig)`, `event!("symbol-conflict", name)`,
+/// `event!("archive-round", format!("round {r}: pulled {n}"))`. Renders in the
+/// trace tree at the line it was logged. Cheap no-op when tracing is off.
+#[inline]
+#[track_caller]
+pub fn event(label: &'static str, detail: impl Into<String>) {
+    if !TRACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let depth = TRACE_DEPTH.with(|d| *d.borrow());
+    let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let loc = Location::caller();
+    let detail = detail.into();
+    TRACE_NODES.with(|n| {
+        n.borrow_mut().push(TraceNode {
+            label,
+            loc,
+            depth,
+            nanos: 0,
+            enter_seq: seq,
+            is_event: true,
+            detail,
+        })
+    });
 }
 
 /// Print the call-flow tree for the CURRENT thread to stderr: nested
@@ -273,13 +310,29 @@ pub fn trace_tree() {
             .rsplit('/')
             .next()
             .unwrap_or_else(|| n.loc.file());
-        eprintln!(
-            "{indent}{} {:>9}  ({}:{})",
-            n.label,
-            fmt_ns(n.nanos),
-            file,
-            n.loc.line()
-        );
+        if n.is_event {
+            // Point event: "• label: detail (file:line)" — no duration.
+            let detail = if n.detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", n.detail)
+            };
+            eprintln!(
+                "{indent}• {}{}  ({}:{})",
+                n.label,
+                detail,
+                file,
+                n.loc.line()
+            );
+        } else {
+            eprintln!(
+                "{indent}{} {:>9}  ({}:{})",
+                n.label,
+                fmt_ns(n.nanos),
+                file,
+                n.loc.line()
+            );
+        }
     }
     eprintln!("───────────────────────────────────────────────────────────");
 }
@@ -517,10 +570,36 @@ mod tests {
         TRACE_NODES.with(|n| n.borrow_mut().clear());
         {
             let _f = trace("x");
+            event("e", "d");
         }
         assert!(
             TRACE_NODES.with(|n| n.borrow().is_empty()),
-            "disabled tracing records no nodes"
+            "disabled tracing records no nodes or events"
         );
+    }
+
+    #[test]
+    fn events_logged_at_frame_depth_with_detail() {
+        let _t = TEST_LOCK.lock().unwrap();
+        trace_enable();
+        {
+            let _f = trace("phase");
+            event("conflict", "sym_foo");
+            event("excluded", String::from("comdat_bar"));
+        }
+        let nodes = TRACE_NODES.with(|n| n.borrow().clone());
+        let ev: Vec<_> = nodes.iter().filter(|n| n.is_event).collect();
+        assert_eq!(ev.len(), 2, "two events recorded");
+        // Events sit at depth 1 (inside the frame) and carry their detail.
+        assert!(ev.iter().all(|e| e.depth == 1));
+        assert!(
+            ev.iter()
+                .any(|e| e.label == "conflict" && e.detail == "sym_foo")
+        );
+        assert!(ev.iter().any(|e| e.detail == "comdat_bar"));
+        // Events have zero duration.
+        assert!(ev.iter().all(|e| e.nanos == 0));
+        TRACE_ENABLED.store(false, Ordering::Relaxed);
+        ENABLED.store(false, Ordering::Relaxed);
     }
 }

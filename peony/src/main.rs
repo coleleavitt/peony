@@ -736,15 +736,23 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // (`classify_file` replaces the old is_archive + is_shared_object double
     // open). cc/rustc repeat archives like `-lgcc` 4×, and each object was
     // formerly opened twice just to classify — the memo + single read cut that.
-    let mut kind_cache: FxHashMap<&Path, Kind> = FxHashMap::default();
-    let kinds: Vec<Kind> = inputs
-        .iter()
-        .map(|p| {
-            *kind_cache
-                .entry(p.as_path())
-                .or_insert_with(|| peony_object::classify_file(p))
-        })
-        .collect();
+    let kinds: Vec<Kind> = {
+        let _t = peony_prof::trace("classify-inputs");
+        let mut kind_cache: FxHashMap<&Path, Kind> = FxHashMap::default();
+        let kinds: Vec<Kind> = inputs
+            .iter()
+            .map(|p| {
+                *kind_cache
+                    .entry(p.as_path())
+                    .or_insert_with(|| peony_object::classify_file(p))
+            })
+            .collect();
+        peony_prof::event(
+            "classified",
+            format!("{} inputs, {} distinct", inputs.len(), kind_cache.len()),
+        );
+        kinds
+    };
 
     // ── Bare objects: parallel parse, then serial resolve in input order ─────
     let bare: Vec<&PathBuf> = inputs
@@ -768,10 +776,25 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     let parse_one = |p: &&PathBuf| {
         parse_object(p).with_context(|| format!("failed to parse `{}`", p.display()))
     };
-    let parsed: Vec<InputObject> = if bare.len() >= PARALLEL_PARSE_THRESHOLD {
-        bare.par_iter().map(parse_one).collect::<Result<_>>()?
-    } else {
-        bare.iter().map(parse_one).collect::<Result<_>>()?
+    let parsed: Vec<InputObject> = {
+        let _t = peony_prof::trace("parse-bare");
+        peony_prof::event(
+            "parse",
+            format!(
+                "{} bare objects, {}",
+                bare.len(),
+                if bare.len() >= PARALLEL_PARSE_THRESHOLD {
+                    "parallel"
+                } else {
+                    "serial"
+                }
+            ),
+        );
+        if bare.len() >= PARALLEL_PARSE_THRESHOLD {
+            bare.par_iter().map(parse_one).collect::<Result<_>>()?
+        } else {
+            bare.iter().map(parse_one).collect::<Result<_>>()?
+        }
     };
     // Now that the objects are parsed we know roughly how many distinct symbols
     // the link will define; pre-size the resolution map to avoid repeated
@@ -780,8 +803,11 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     if est_symbols > r.symbols.len() {
         r.symbols.reserve(est_symbols);
     }
-    for obj in parsed {
-        r.resolve(obj)?;
+    {
+        let _t = peony_prof::trace("resolve-bare");
+        for obj in parsed {
+            r.resolve(obj)?;
+        }
     }
 
     // ── Archives: lazily include members that satisfy undefined references ────
@@ -920,22 +946,33 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
     }
 
     // Fixpoint: include any member that satisfies a currently-undefined symbol.
-    // Crucially, re-check undefinedness *per member* and update it as members are
-    // pulled in: archive semantics say a member is included only to resolve a
-    // symbol still undefined at that moment. Two archives may both define the
-    // same symbol (e.g. `__mulsc3` in compiler_builtins.rlib and libgcc.a); only
-    // the first should be pulled, or peony would report a spurious duplicate.
+    // Archive semantics: a member is pulled only to resolve a symbol STILL
+    // undefined at that moment. Two archives may define the same symbol (e.g.
+    // `__mulsc3` in compiler_builtins.rlib and libgcc.a); only the first is
+    // pulled, else a spurious duplicate.
+    //
+    // The `undefined` set is maintained INCREMENTALLY instead of rebuilt from the
+    // whole symbol table every round. The old code re-scanned all N symbols each
+    // of up to R rounds — O(R·N), quadratic when many members pull across many
+    // rounds (a big static link is tens of rounds over ~10k symbols = ~100k
+    // wasted scans). Now: build it once, remove names a pulled member defines,
+    // and ADD any new undefined refs that member introduces. Total work is
+    // O(N + Σ member_symbols), and the trace logs each round so the fixpoint's
+    // shape is visible.
+    let mut undefined: HashSet<Vec<u8>> = r
+        .symbols
+        .iter()
+        .filter(|(_, res)| !res.is_defined())
+        .map(|(n, _)| n.to_vec())
+        .collect();
+    let mut round = 0u32;
     loop {
-        let mut undefined: HashSet<Vec<u8>> = r
-            .symbols
-            .iter()
-            .filter(|(_, res)| !res.is_defined())
-            .map(|(n, _)| n.to_vec())
-            .collect();
         if undefined.is_empty() {
             break;
         }
+        round += 1;
         let mut included_any = false;
+        let mut pulled = 0u32;
         for m in members.iter_mut() {
             if m.obj.is_none() {
                 continue;
@@ -945,14 +982,33 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
                 continue;
             }
             let obj = m.obj.take().unwrap();
-            // The symbols this member newly provides are no longer undefined, so
-            // a later member defining the same name is not pulled for them.
+            // Names this member defines are no longer undefined.
             for name in &m.defines {
                 undefined.remove(name);
             }
+            // Pulling the member may introduce NEW undefined references; add the
+            // ones the table now reports as undefined (incremental, not a full
+            // rescan). Cloning the undef refs the object carries is bounded by
+            // the member's own symbol count.
+            for sym in &obj.symbols {
+                if sym.is_undefined && !sym.name.is_empty() {
+                    let nm = &sym.name;
+                    if r.symbols.lookup(nm).is_none_or(|res| !res.is_defined()) {
+                        undefined.insert(nm.clone());
+                    }
+                }
+            }
             r.resolve(obj)?;
             included_any = true;
+            pulled += 1;
         }
+        peony_prof::event(
+            "archive-round",
+            format!(
+                "round {round}: pulled {pulled}, {} undef left",
+                undefined.len()
+            ),
+        );
         if !included_any {
             break;
         }
