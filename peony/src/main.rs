@@ -41,16 +41,10 @@ use peony_layout::{
     check_undefined,
     finalize_symbols,
 };
-use peony_object::{
-    Binding,
-    InputObject,
-    iter_archive_members,
-    parse_bytes_into,
-    parse_object,
-    parse_owned_member,
-};
+use peony_object::{Binding, InputObject, iter_archive_members, parse_owned_member};
 use peony_reloc::scan_relocations;
 use peony_symbols::SymbolTable;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing_subscriber::EnvFilter;
 
@@ -801,39 +795,71 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // link showed 85% of syscall time in futex+sched_yield from the pool, for
     // work that runs faster serially). Only fan out for links big enough that
     // the parse time dominates the thread-management cost.
-    // Zero-copy parse: each bare object's mmap is moved into the arena and its
-    // sections borrow slices of that map (no per-section copy). Parse is SERIAL
-    // in this commit — `parse_object`/`parse_bytes_into` need `&mut arena` to
-    // push the map, so a parallel parse needs a different arena strategy
-    // (per-thread bump arenas), which is a separate follow-up. The big win here
-    // is removing the 17MB section-byte memcpy + the matching RSS, not parse
-    // concurrency (measured: build-id, not parse, was the dominant cost).
+    // Zero-copy parallel parse, in two stages so the shared arena is never
+    // written from a worker thread (which would race / be nondeterministic):
+    //   1. SERIAL pre-map — move every bare object's mmap into the arena and
+    //      record its file_id. mmap is a cheap syscall; page faults happen
+    //      lazily inside parse, so the real work still parallelizes.
+    //   2. PARALLEL parse — each worker reads its object's bytes straight from
+    //      the (now stable, immutable) arena mmap and produces an InputObject
+    //      plus any transformed-bytes buffers (compressed .debug_*), with
+    //      object-local Owned indices.
+    //   3. SERIAL merge — append each object's owned buffers in object order and
+    //      rebase its Owned handles, so the final layout is deterministic
+    //      regardless of which thread finished first.
+    const PARALLEL_PARSE_THRESHOLD: usize = 64;
+    // Stage 1: pre-map. `mapped[i]` = (file_id, label) for bare[i]; bytes are
+    // fetched from the arena by file_id inside the parse closure.
+    let mut mapped: Vec<(u32, String)> = Vec::with_capacity(bare.len());
+    for p in &bare {
+        let label = p.display().to_string();
+        // An empty/unmappable file can't be mmap'd; it is not a valid object and
+        // `parse_bare_parallel` would fail it like the old serial path did. Map
+        // it (reusing the classification map if present) or surface the error.
+        let mmap = match mmap_cache.remove(p.as_path()).flatten() {
+            Some(m) => m.into_mmap(),
+            None => peony_object::MappedInput::open(p)
+                .ok_or_else(|| anyhow::anyhow!("failed to open/map `{}`", p.display()))?
+                .into_mmap(),
+        };
+        let file_id = r.arena.push_mmap(mmap);
+        mapped.push((file_id, label));
+    }
+    // Stage 2: parallel parse from the stable arena mmaps.
     let parsed: Vec<InputObject> = {
         let _t = peony_prof::trace("parse-bare");
         peony_prof::event(
             "parse",
-            format!("{} bare objects, serial zero-copy", bare.len()),
-        );
-        let mut parsed = Vec::with_capacity(bare.len());
-        for p in &bare {
-            let label = p.display().to_string();
-            // Reuse the classification mmap if present (it already mapped the
-            // file); otherwise open+map via parse_object. Either way the map
-            // lands in the arena and sections borrow from it.
-            let obj = match mmap_cache.remove(p.as_path()).flatten() {
-                Some(m) => {
-                    let file_id = r.arena.push_mmap(m.into_mmap());
-                    // SAFETY: the byte slice borrows arena.mmaps[file_id], stable
-                    // for the arena's life; parse copies nothing out of it.
-                    let bytes = r.arena.mmap_bytes(file_id);
-                    let bytes: &[u8] =
-                        unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-                    parse_bytes_into(&mut r.arena, file_id, label, bytes)
-                        .with_context(|| format!("failed to parse `{}`", p.display()))?
+            format!(
+                "{} bare objects, {}",
+                mapped.len(),
+                if mapped.len() >= PARALLEL_PARSE_THRESHOLD {
+                    "parallel zero-copy"
+                } else {
+                    "serial zero-copy"
                 }
-                None => parse_object(&mut r.arena, p)
-                    .with_context(|| format!("failed to parse `{}`", p.display()))?,
+            ),
+        );
+        // SAFETY: `arena` is only read here (mmap bytes); no thread mutates it.
+        // The borrow is shared + the mmaps are stable for the arena's lifetime.
+        let arena_ref = &r.arena;
+        let parse_one =
+            |&(file_id, ref label): &(u32, String)| -> Result<(InputObject, Vec<Vec<u8>>)> {
+                let bytes = arena_ref.mmap_bytes(file_id);
+                // owned_base = 0: handles are object-local, rebased at merge.
+                peony_object::parse_bare_parallel(file_id, 0, label.clone(), bytes)
+                    .with_context(|| format!("failed to parse `{label}`"))
             };
+        let results: Vec<(InputObject, Vec<Vec<u8>>)> = if mapped.len() >= PARALLEL_PARSE_THRESHOLD
+        {
+            mapped.par_iter().map(parse_one).collect::<Result<_>>()?
+        } else {
+            mapped.iter().map(parse_one).collect::<Result<_>>()?
+        };
+        // Stage 3: serial merge in object order (deterministic owned rebase).
+        let mut parsed = Vec::with_capacity(results.len());
+        for (mut obj, local_owned) in results {
+            r.arena.merge_parsed_owned(&mut obj, local_owned);
             parsed.push(obj);
         }
         parsed

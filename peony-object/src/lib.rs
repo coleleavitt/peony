@@ -125,6 +125,25 @@ impl InputArena {
         id
     }
 
+    /// Append an object's locally-produced owned buffers (from
+    /// [`parse_bare_parallel`], which used `owned_base = 0`) to the arena and
+    /// rebase that object's `Owned` section handles by the arena's prior owned
+    /// length. Called serially in object order after a parallel parse, so the
+    /// final owned indices are deterministic regardless of parse completion
+    /// order. No-op for the common object (no owned/compressed-debug sections).
+    pub fn merge_parsed_owned(&mut self, obj: &mut InputObject, local_owned: Vec<Vec<u8>>) {
+        if local_owned.is_empty() {
+            return;
+        }
+        let base = self.owned.len() as u32;
+        for sec in &mut obj.sections {
+            if let DataSrc::Owned(i) = sec.data.src {
+                sec.data.src = DataSrc::Owned(base + i);
+            }
+        }
+        self.owned.extend(local_owned);
+    }
+
     /// Intern raw bytes and return a [`SectionData`] handle pointing at them.
     /// Convenience for callers (and tests) that have bytes in hand rather than a
     /// file range — the bytes go into the owned store.
@@ -362,7 +381,12 @@ pub fn parse_bytes_into(
     path: String,
     data: &[u8],
 ) -> Result<InputObject> {
-    parse_backed(arena, DataSrc::Mmap(file_id), 0, path, data)
+    // Serial path: owned bufs (rare; compressed debug) go straight into the arena.
+    let base = arena.owned.len() as u32;
+    let mut sink = Vec::new();
+    let obj = parse_backed(DataSrc::Mmap(file_id), base, 0, &mut sink, path, data)?;
+    arena.owned.extend(sink);
+    Ok(obj)
 }
 
 /// Parse an archive member whose bytes were copied into the arena's `owned`
@@ -376,18 +400,44 @@ pub fn parse_owned_member(
     path: String,
     data: &[u8],
 ) -> Result<InputObject> {
-    parse_backed(arena, DataSrc::Owned(owned_id), 0, path, data)
+    let base = arena.owned.len() as u32;
+    let mut sink = Vec::new();
+    let obj = parse_backed(DataSrc::Owned(owned_id), base, 0, &mut sink, path, data)?;
+    arena.owned.extend(sink);
+    Ok(obj)
 }
 
-/// Parse an ELF-64 object whose bytes live in the arena at `backing` (a `Mmap`
-/// or `Owned` slot). `base_off` is the object's byte offset within that backing
-/// buffer (0 for a bare object / a member at the start of its buffer); section
-/// offsets are made absolute (`base_off + file_range`) so they index the whole
-/// backing buffer directly. No section bytes are copied for the `Mmap` case.
+/// Parse a bare object straight from its mapped bytes, WITHOUT touching the
+/// shared arena — for parallel parse. Returns the object plus any
+/// transformed-bytes buffers it produced (compressed `.debug_*`); the caller
+/// must append those to `arena.owned` IN OBJECT ORDER and the `Owned` handles
+/// are pre-rebased relative to `owned_base` so the rebase is just the append.
+/// `owned_base` must equal the arena's `owned` length at the point this object's
+/// buffers will land — the caller computes a per-object prefix sum (deterministic,
+/// independent of thread completion order). See [`InputArena::reserve_owned_base`].
+pub fn parse_bare_parallel(
+    file_id: u32,
+    owned_base: u32,
+    path: String,
+    data: &[u8],
+) -> Result<(InputObject, Vec<Vec<u8>>)> {
+    let mut sink = Vec::new();
+    let obj = parse_backed(DataSrc::Mmap(file_id), owned_base, 0, &mut sink, path, data)?;
+    Ok((obj, sink))
+}
+
+/// Parse an ELF-64 object whose bytes live at `backing` (a `Mmap` or `Owned`
+/// slot). Transformed-bytes sections (compressed debug) are pushed into
+/// `owned_sink` and their [`DataSrc::Owned`] handle is `owned_base + sink_index`
+/// — so a caller that appends `owned_sink` to `arena.owned` starting at
+/// `owned_base` makes every handle correct, with NO shared-arena write during
+/// parse (this is what lets parse run in parallel deterministically). `base_off`
+/// is the object's offset within its backing buffer. No bytes copied for `Mmap`.
 fn parse_backed(
-    arena: &mut InputArena,
     backing: DataSrc,
+    owned_base: u32,
     base_off: u64,
+    owned_sink: &mut Vec<Vec<u8>>,
     path: String,
     data: &[u8],
 ) -> Result<InputObject> {
@@ -434,7 +484,10 @@ fn parse_backed(
                 .into_owned();
             let len = bytes.len();
             assert!(len <= u32::MAX as usize, "section too large for u32 len");
-            let oid = arena.push_owned(bytes);
+            // Push to the LOCAL sink; the handle is rebased by `owned_base` so the
+            // caller's append-to-arena makes it correct without any shared write.
+            let oid = owned_base + owned_sink.len() as u32;
+            owned_sink.push(bytes);
             owned_len = Some(len as u64);
             data_handle = SectionData {
                 src: DataSrc::Owned(oid),
@@ -472,9 +525,10 @@ fn parse_backed(
             section.size()
         };
         if kind == SectionKind::EhFrame {
-            // The section bytes live in the backing buffer; read them via the
-            // handle just computed (no copy — `arena.bytes` is a slice).
-            let raw_data = arena.bytes(data_handle);
+            // `.eh_frame` is never compressed-debug, so its bytes are a slice of
+            // this object's backing buffer `data` at the section's file range
+            // (no copy). Read straight from `data` — no arena needed during parse.
+            let raw_data = &data[file_off as usize..(file_off + file_len) as usize];
             // Determine whether the section *ends* with a genuine 4-byte zero
             // terminator by walking records to the end. A trailing run of zero
             // bytes that is reached at a record boundary is the terminator; zeros
