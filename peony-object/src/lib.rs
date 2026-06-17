@@ -723,7 +723,13 @@ pub fn classify_file(path: &Path) -> FileKind {
     };
     // A short read still lets us inspect what we got (archives are 8 bytes).
     let n = f.read(&mut hdr).unwrap_or(0);
-    let h = &hdr[..n];
+    classify_bytes(&hdr[..n])
+}
+
+/// Classify from already-loaded leading bytes — the zero-syscall variant used
+/// when an input has been mmap'd once and is reused across phases (see
+/// [`MappedInput`]). Identical logic to [`classify_file`] minus the open+read.
+pub fn classify_bytes(h: &[u8]) -> FileKind {
     if h.len() >= 8 && &h[0..8] == b"!<arch>\n" {
         return FileKind::Archive;
     }
@@ -731,6 +737,32 @@ pub fn classify_file(path: &Path) -> FileKind {
         return FileKind::Shared;
     }
     FileKind::Bare
+}
+
+/// A single read-only memory map of an input file, opened ONCE and reused for
+/// every phase that needs its bytes (classification, `_start` probe, parse).
+/// Previously each input was opened 3× — once per phase. Holding the `Mmap`
+/// keeps `bytes()` valid for the map's lifetime without copying the file.
+pub struct MappedInput {
+    _mmap: Mmap,
+    // A raw pointer + len would alias the mmap; instead expose via accessor.
+}
+
+impl MappedInput {
+    /// mmap `path` once. Returns `None` if the file can't be opened/mapped (an
+    /// empty file can't be mmap'd; callers treat that as a 0-byte input).
+    pub fn open(path: &Path) -> Option<MappedInput> {
+        let file = std::fs::File::open(path).ok()?;
+        // SAFETY: read-only view; never mutated, dropped when MappedInput drops.
+        let mmap = unsafe { Mmap::map(&file) }.ok()?;
+        Some(MappedInput { _mmap: mmap })
+    }
+
+    /// The mapped bytes.
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        &self._mmap
+    }
 }
 
 /// Does this object define a non-local, defined `_start`? Used by the driver to

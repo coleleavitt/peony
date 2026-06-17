@@ -731,25 +731,35 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // code called `is_archive` + `is_shared_object` in three separate filters,
     // re-opening (and `is_shared_object` formerly re-reading whole) every input
     // up to 3× — on a 419-object link that was ~3950 openat calls. One pass.
-    use peony_object::FileKind as Kind;
-    // Classify each DISTINCT path once, with a SINGLE header read per path
-    // (`classify_file` replaces the old is_archive + is_shared_object double
-    // open). cc/rustc repeat archives like `-lgcc` 4×, and each object was
-    // formerly opened twice just to classify — the memo + single read cut that.
+    use peony_object::{FileKind as Kind, MappedInput};
+    // mmap each DISTINCT input ONCE, then reuse the mapping for classification
+    // AND parsing — instead of opening each file 2× (classify header-read +
+    // parse mmap). Bare objects are parsed straight from the mapped bytes via
+    // parse_bytes (no second open). Archives/shared keep their own readers (they
+    // need member iteration / whole-file reads). cc/rustc repeat archives like
+    // `-lgcc` 4×, so the map is keyed by distinct path.
+    let mut mmap_cache: FxHashMap<&Path, Option<MappedInput>> = FxHashMap::default();
+    for p in inputs {
+        mmap_cache
+            .entry(p.as_path())
+            .or_insert_with(|| MappedInput::open(p));
+    }
     let kinds: Vec<Kind> = {
         let _t = peony_prof::trace("classify-inputs");
-        let mut kind_cache: FxHashMap<&Path, Kind> = FxHashMap::default();
         let kinds: Vec<Kind> = inputs
             .iter()
-            .map(|p| {
-                *kind_cache
-                    .entry(p.as_path())
-                    .or_insert_with(|| peony_object::classify_file(p))
-            })
+            .map(
+                |p| match mmap_cache.get(p.as_path()).and_then(|m| m.as_ref()) {
+                    // Classify from the already-mapped bytes — zero extra syscalls.
+                    Some(m) => peony_object::classify_bytes(m.bytes()),
+                    // Unmappable (e.g. empty file): fall back to a header read.
+                    None => peony_object::classify_file(p),
+                },
+            )
             .collect();
         peony_prof::event(
             "classified",
-            format!("{} inputs, {} distinct", inputs.len(), kind_cache.len()),
+            format!("{} inputs, {} distinct", inputs.len(), mmap_cache.len()),
         );
         kinds
     };
@@ -773,8 +783,16 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // work that runs faster serially). Only fan out for links big enough that
     // the parse time dominates the thread-management cost.
     const PARALLEL_PARSE_THRESHOLD: usize = 256;
+    // Parse from the already-mapped bytes (no second open). `mmap_cache` is
+    // read-only here and `MappedInput` is `Sync`, so this is safe under rayon.
     let parse_one = |p: &&PathBuf| {
-        parse_object(p).with_context(|| format!("failed to parse `{}`", p.display()))
+        let label = p.display().to_string();
+        match mmap_cache.get(p.as_path()).and_then(|m| m.as_ref()) {
+            Some(m) => parse_bytes(label, m.bytes())
+                .with_context(|| format!("failed to parse `{}`", p.display())),
+            // Unmappable input: fall back to the open+mmap path.
+            None => parse_object(p).with_context(|| format!("failed to parse `{}`", p.display())),
+        }
     };
     let parsed: Vec<InputObject> = {
         let _t = peony_prof::trace("parse-bare");
