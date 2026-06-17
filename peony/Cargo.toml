@@ -23,3 +23,7 @@ rayon.workspace      = true
 rustc-hash.workspace = true
 tracing.workspace    = true
 tracing-subscriber.workspace = true
+# Fast multi-threaded allocator (same choice mold makes). A linker is extremely
+# allocation-heavy (every symbol, section, reloc); the system malloc's per-call
+# mmap/brk churn shows up as page-faults dominating a small link's wall time.
+mimalloc = { version = "0.1", default-features = false }

@@ -25,6 +25,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+// A linker allocates intensely (one allocation per symbol/section/reloc) and
+// frees almost nothing until exit. mimalloc's thread-local sharded heaps avoid
+// the system malloc's mmap/brk churn that otherwise dominates a small link as
+// page-faults. mold makes the same choice.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use peony_emit::{EmitConfig, emit_full};
 use peony_layout::{
