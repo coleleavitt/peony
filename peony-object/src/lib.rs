@@ -695,13 +695,19 @@ fn elf_soname(elf: &ElfFile64<Endianness>, data: &[u8]) -> Option<String> {
 
 /// Returns true if `path` is an ELF shared object (`ET_DYN`).
 pub fn is_shared_object(path: &Path) -> bool {
-    let Ok(data) = std::fs::read(path) else {
+    // `e_type` is a 2-byte field at offset 16 of the ELF header — read only the
+    // header, not the whole file. The old `fs::read` slurped entire multi-MB
+    // rlibs just to classify them, and this runs in a filter over every input.
+    use std::io::Read;
+    let mut hdr = [0u8; 20];
+    let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
-    matches!(
-        ElfFile64::<Endianness>::parse(data.as_slice()).map(|e| e.kind()),
-        Ok(object::ObjectKind::Dynamic)
-    )
+    if f.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    // ELF magic + ET_DYN (3) in the e_type halfword (little-endian at offset 16).
+    &hdr[0..4] == b"\x7fELF" && u16::from_le_bytes([hdr[16], hdr[17]]) == 3
 }
 
 /// Parse a shared object's exported dynamic symbols and its `DT_SONAME`
