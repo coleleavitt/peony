@@ -437,6 +437,9 @@ fn write_section_data_parallel(
             SecSource::StrTab => write_bytes(buf, sec.sh_offset, &layout.strtab),
             SecSource::ShStrTab => write_bytes(buf, sec.sh_offset, &layout.shstrtab),
             SecSource::NoteBuildId => write_build_id(buf, objects, sec.sh_offset),
+            SecSource::NoteGnuProperty => {
+                write_bytes(buf, sec.sh_offset, &layout.gnu_property_note)
+            }
             SecSource::Interp => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.interp),
             SecSource::Hash => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.hash),
             SecSource::DynSym => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.dynsym),
@@ -720,7 +723,14 @@ fn write_symtab(buf: &mut [u8], symbols: &SymbolTable, layout: &Layout, base_off
         s[0..4].copy_from_slice(&ent.name_off.to_le_bytes());
         s[4] = ent.info;
         s[5] = elf::STV_DEFAULT;
-        let shndx = if ent.shndx >= elf::SHN_LORESERVE as u32 {
+        // `st_shndx` is a 16-bit field. Any value that fits — including the
+        // reserved pseudo-indices SHN_ABS (0xfff1), SHN_COMMON (0xfff2) — is
+        // written verbatim. SHN_XINDEX (with the true index in `.symtab_shndx`)
+        // is used ONLY for a genuine real-section index that does not fit in 16
+        // bits (≥ 0x10000 sections). Rewriting an SHN_ABS symbol to SHN_XINDEX
+        // forces a bogus extended-index table that BFD/gdb reject ("not in
+        // executable format") — the cause of the C++ exe load failure.
+        let shndx = if ent.shndx >= 0x1_0000 {
             elf::SHN_XINDEX
         } else {
             ent.shndx as u16

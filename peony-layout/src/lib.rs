@@ -82,6 +82,9 @@ pub enum SecSource {
     ShStrTab,
     /// `.note.gnu.build-id` — emit writes the note header + content hash.
     NoteBuildId,
+    /// `.note.gnu.property` — emit writes the merged x86 property note from
+    /// [`Layout::gnu_property_note`].
+    NoteGnuProperty,
     /// Dynamic-linking sections — emit writes the corresponding blob from
     /// [`Layout::dyn_blobs`].
     Interp,
@@ -341,6 +344,8 @@ pub struct Layout {
     pub tls_got_writes: Vec<(u64, u64)>,
     /// Bytes for `SecSource::RelaEmit(i)` sections.
     pub emit_relocs: Vec<Vec<u8>>,
+    /// Merged `.note.gnu.property` note bytes (empty if no input carried one).
+    pub gnu_property_note: Vec<u8>,
 }
 
 impl Layout {
@@ -966,12 +971,30 @@ pub fn compute_layout(
     // Preserve first-seen order for determinism.
     let mut order: Vec<String> = Vec::new();
 
+    // Sections that anchor a defined symbol must be kept even at size 0: a
+    // boundary symbol like `__TMC_END__` (defined at offset 0 of crtendS's
+    // empty `.tm_clone_table`) marks the *end* of a concatenated region, and
+    // `register_tm_clones` computes `(__TMC_END__ - .tm_clone_table) >> 3`. If
+    // the empty section is dropped, the symbol resolves to a bogus address and
+    // C++ startup jumps through a garbage clone-table pointer and crashes. ld
+    // and mold keep these zero-size anchor sections; so must peony.
+    let mut symbol_anchored: FxHashSet<(usize, usize)> = FxHashSet::default();
+    for (obj_idx, obj) in objects.iter().enumerate() {
+        for sym in &obj.symbols {
+            if let Some(sec) = sym.section {
+                symbol_anchored.insert((obj_idx, sec.0));
+            }
+        }
+    }
+
     for (obj_idx, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
             if !is_allocatable(&sec.name, sec.kind, sec.flags) {
                 continue;
             }
-            if sec.size == 0 {
+            // Drop zero-size sections EXCEPT those that anchor a defined symbol
+            // (e.g. `.tm_clone_table` bracketed by `__TMC_END__`).
+            if sec.size == 0 && !symbol_anchored.contains(&(obj_idx, sec.index.0)) {
                 continue;
             }
             // --gc-sections: skip sections not reachable from the roots.
@@ -1122,6 +1145,24 @@ pub fn compute_layout(
             size: common_size,
             perm: Perm::Rw,
             is_nobits: true,
+            contributions: Vec::new(),
+        });
+    }
+
+    // Synthesise the single merged `.note.gnu.property` (RO) from all inputs.
+    // The generic loop skips raw `.note.gnu.property` (see `is_allocatable`), so
+    // this is the only place it is produced — exactly one well-formed note.
+    let gnu_property_note = merge_gnu_property_notes(objects).unwrap_or_default();
+    if !gnu_property_note.is_empty() {
+        ro.push(Builder {
+            name: ".note.gnu.property".to_string(),
+            kind: SectionKind::Other,
+            sh_flags: elf::SHF_ALLOC,
+            sh_type: elf::SHT_NOTE,
+            align: 8,
+            size: gnu_property_note.len() as u64,
+            perm: Perm::Ro,
+            is_nobits: false,
             contributions: Vec::new(),
         });
     }
@@ -2441,6 +2482,7 @@ pub fn compute_layout(
         shared: config.shared,
         tls_got_writes: Vec::new(), // filled post-layout by the driver
         emit_relocs,
+        gnu_property_note,
     })
 }
 
@@ -2764,6 +2806,7 @@ fn place(
             source: match b.name.as_str() {
                 ".got" => SecSource::Got,
                 ".note.gnu.build-id" => SecSource::NoteBuildId,
+                ".note.gnu.property" => SecSource::NoteGnuProperty,
                 ".interp" => SecSource::Interp,
                 ".hash" => SecSource::Hash,
                 ".gnu.hash" => SecSource::GnuHash,
@@ -2896,17 +2939,42 @@ fn build_symtab_plan(
 }
 
 fn build_symtab_shndx(symtab: &[SymEntry]) -> Vec<u8> {
-    if !symtab
+    // An extended section-index table (SHT_SYMTAB_SHNDX) is required ONLY when a
+    // symbol references a *real* output section whose index is ≥ SHN_LORESERVE
+    // (0xff00), i.e. a link with ≥ 65279 sections. The reserved band
+    // 0xff00..=0xffff — SHN_ABS (0xfff1), SHN_COMMON (0xfff2), SHN_XINDEX
+    // (0xffff) — are pseudo-indices, NOT overflowing section numbers, and must
+    // stay in `st_shndx` verbatim. Emitting a `.symtab_shndx` for an SHN_ABS
+    // symbol produces an ELF that BFD/gdb reject ("not in executable format"),
+    // because SHT_SYMTAB_SHNDX is only valid for genuine index overflow. peony
+    // never has that many sections, so this table is never needed.
+    // A real overflowing index is ≥ 0x10000 (does not fit the 16-bit st_shndx);
+    // the reserved band 0xff00..=0xffff are pseudo-indices, never real sections.
+    let real_overflow = |sh: u32| sh >= SHN_RESERVED_HI;
+    let n_overflow = symtab.iter().filter(|e| real_overflow(e.shndx)).count();
+    let n_reserved = symtab
         .iter()
-        .any(|ent| ent.shndx >= elf::SHN_LORESERVE as u32)
-    {
+        .filter(|e| e.shndx >= elf::SHN_LORESERVE as u32 && e.shndx < SHN_RESERVED_HI)
+        .count();
+    tracing::debug!(
+        symbols = symtab.len(),
+        overflow_indices = n_overflow,
+        reserved_pseudo_indices = n_reserved,
+        "symtab_shndx: extended index table {}",
+        if n_overflow > 0 {
+            "REQUIRED"
+        } else {
+            "not needed"
+        }
+    );
+    if n_overflow == 0 {
         return Vec::new();
     }
 
     let mut out = Vec::with_capacity((symtab.len() + 1) * 4);
     out.extend_from_slice(&0u32.to_le_bytes()); // null symbol
     for ent in symtab {
-        let xindex = if ent.shndx >= elf::SHN_LORESERVE as u32 {
+        let xindex = if real_overflow(ent.shndx) {
             ent.shndx
         } else {
             0
@@ -2915,6 +2983,12 @@ fn build_symtab_shndx(symtab: &[SymEntry]) -> Vec<u8> {
     }
     out
 }
+
+/// One past the top of the ELF reserved section-index band (`SHN_HIRESERVE` is
+/// 0xffff). A symbol index in `SHN_LORESERVE..SHN_RESERVED_HI` is a pseudo-index
+/// (`SHN_ABS`, `SHN_COMMON`, `SHN_XINDEX`), never a real section number, so it is
+/// written verbatim into the 16-bit `st_shndx` and never needs `.symtab_shndx`.
+const SHN_RESERVED_HI: u32 = 0x1_0000;
 
 fn resolve_entry(
     symbols: &SymbolTable,
@@ -3035,12 +3109,158 @@ fn is_allocatable(name: &[u8], kind: SectionKind, flags: u64) -> bool {
     if kind == SectionKind::Debug {
         return false;
     }
-    // Most `.note` sections need merge/synthetic handling. Preserve GNU property
-    // notes explicitly because the loader consumes them through PT_GNU_PROPERTY.
-    if name.starts_with(b".note") && name != b".note.gnu.property" {
+    // All `.note` sections get synthetic/merge handling, never raw concatenation.
+    // `.note.gnu.property` in particular MUST be merged into a single note (the
+    // AND of every input's x86 feature bits); concatenating one note per input
+    // object produces a malformed multi-note section that BFD rejects ("file
+    // format not recognized") and that corrupts C++ startup. It is rebuilt as a
+    // synthetic section from [`merge_gnu_property_notes`].
+    if name.starts_with(b".note") {
         return false;
     }
     true
+}
+
+// ── GNU property note merging (x86-64) ───────────────────────────────────────
+// A program-wide `.note.gnu.property` is the AND of every relocatable input's
+// note: a feature bit survives only if *every* contributing object advertises
+// it. Per the Linux x86 psABI, the linker emits ONE merged `NT_GNU_PROPERTY_TYPE_0`
+// note. Concatenating per-object notes (peony's old behaviour) is malformed.
+
+const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
+const GNU_PROPERTY_X86_ISA_1_NEEDED: u32 = 0xc000_0001;
+const GNU_PROPERTY_X86_ISA_1_USED: u32 = 0xc000_0000;
+const GNU_PROPERTY_X86_FEATURE_2_USED: u32 = 0xc001_0001;
+
+/// One decoded x86 GNU-property datum (4-byte `pr_type` → u32 bitmask value).
+#[derive(Clone, Copy)]
+struct GnuProp {
+    pr_type: u32,
+    value: u32,
+}
+
+/// Parse the `pr_type`/`pr_data` pairs from one `NT_GNU_PROPERTY_TYPE_0` note's
+/// descriptor (the bytes after the `namesz/descsz/type` header + "GNU\0" name).
+fn parse_property_descriptor(desc: &[u8]) -> Vec<GnuProp> {
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + 8 <= desc.len() {
+        let pr_type = u32::from_le_bytes([desc[o], desc[o + 1], desc[o + 2], desc[o + 3]]);
+        let pr_datasz =
+            u32::from_le_bytes([desc[o + 4], desc[o + 5], desc[o + 6], desc[o + 7]]) as usize;
+        let data_off = o + 8;
+        if data_off + pr_datasz > desc.len() {
+            break;
+        }
+        // x86 properties carry a single u32 bitmask.
+        if pr_datasz >= 4 {
+            let v = u32::from_le_bytes([
+                desc[data_off],
+                desc[data_off + 1],
+                desc[data_off + 2],
+                desc[data_off + 3],
+            ]);
+            out.push(GnuProp { pr_type, value: v });
+        }
+        // Each property is padded to 8 bytes (pr_datasz rounded up).
+        o = data_off + ((pr_datasz + 7) & !7);
+    }
+    out
+}
+
+/// Merge every input `.note.gnu.property` into the canonical single-note byte
+/// image, returning `None` when no input carries one (so no section is emitted).
+///
+/// FEATURE_1_AND / FEATURE_2_USED / ISA_1_NEEDED are AND-merged (a bit must be
+/// present in every contributing object). ISA_1_USED is OR-merged. This matches
+/// `ld`/`lld`/`mold`; the AND semantics are why a single program-wide note is
+/// mandatory rather than a concatenation.
+fn merge_gnu_property_notes(objects: &[InputObject]) -> Option<Vec<u8>> {
+    use rustc_hash::FxHashMap;
+    let mut seen = false;
+    // pr_type → (merged value, is_first_for_and).
+    let mut feature_and: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut isa_used: u32 = 0;
+    let mut isa_used_seen = false;
+
+    for obj in objects {
+        for sec in &obj.sections {
+            if sec.name != b".note.gnu.property" {
+                continue;
+            }
+            seen = true;
+            // Walk the notes in this section.
+            let d = &sec.data;
+            let mut o = 0usize;
+            while o + 12 <= d.len() {
+                let namesz = u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+                let descsz = u32::from_le_bytes([d[o + 4], d[o + 5], d[o + 6], d[o + 7]]) as usize;
+                let _ntype = u32::from_le_bytes([d[o + 8], d[o + 9], d[o + 10], d[o + 11]]);
+                let name_off = o + 12;
+                let desc_off = name_off + ((namesz + 3) & !3);
+                if desc_off + descsz > d.len() {
+                    break;
+                }
+                for p in parse_property_descriptor(&d[desc_off..desc_off + descsz]) {
+                    match p.pr_type {
+                        GNU_PROPERTY_X86_FEATURE_1_AND
+                        | GNU_PROPERTY_X86_FEATURE_2_USED
+                        | GNU_PROPERTY_X86_ISA_1_NEEDED => {
+                            feature_and
+                                .entry(p.pr_type)
+                                .and_modify(|v| *v &= p.value)
+                                .or_insert(p.value);
+                        }
+                        GNU_PROPERTY_X86_ISA_1_USED => {
+                            isa_used |= p.value;
+                            isa_used_seen = true;
+                        }
+                        _ => {}
+                    }
+                }
+                o = desc_off + ((descsz + 3) & !3);
+            }
+        }
+    }
+    if !seen {
+        return None;
+    }
+
+    // Assemble the merged descriptor: deterministic pr_type order.
+    let mut props: Vec<GnuProp> = Vec::new();
+    if isa_used_seen {
+        props.push(GnuProp {
+            pr_type: GNU_PROPERTY_X86_ISA_1_USED,
+            value: isa_used,
+        });
+    }
+    let mut keys: Vec<u32> = feature_and.keys().copied().collect();
+    keys.sort_unstable();
+    for k in keys {
+        props.push(GnuProp {
+            pr_type: k,
+            value: feature_and[&k],
+        });
+    }
+
+    // Encode the descriptor (each property: pr_type u32, pr_datasz=4 u32, value
+    // u32, padded to 8). On x86-64 each datum is 4 bytes → padded to 8.
+    let mut desc = Vec::new();
+    for p in &props {
+        desc.extend_from_slice(&p.pr_type.to_le_bytes());
+        desc.extend_from_slice(&4u32.to_le_bytes());
+        desc.extend_from_slice(&p.value.to_le_bytes());
+        desc.extend_from_slice(&[0, 0, 0, 0]); // pad value to 8 bytes
+    }
+
+    // Note header: namesz=4 ("GNU\0"), descsz, type=NT_GNU_PROPERTY_TYPE_0 (5).
+    let mut note = Vec::new();
+    note.extend_from_slice(&4u32.to_le_bytes());
+    note.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+    note.extend_from_slice(&5u32.to_le_bytes());
+    note.extend_from_slice(b"GNU\0");
+    note.extend_from_slice(&desc);
+    Some(note)
 }
 
 fn should_passthrough_non_alloc(sec: &peony_object::InputSection, strip_debug: bool) -> bool {
@@ -3162,22 +3382,33 @@ mod tests {
 
     #[test]
     fn symtab_shndx_is_only_emitted_for_overflow_entries() {
+        // Ordinary indices: no extended table.
         assert!(build_symtab_shndx(&[sym(1), sym(elf::SHN_LORESERVE as u32 - 1)]).is_empty());
 
-        let blob = build_symtab_shndx(&[
-            sym(1),
-            sym(elf::SHN_LORESERVE as u32),
-            sym(elf::SHN_XINDEX as u32 + 7),
-        ]);
+        // The reserved pseudo-index band (SHN_LORESERVE..=0xffff) — SHN_ABS,
+        // SHN_COMMON, SHN_XINDEX — are NOT real overflowing section numbers and
+        // must NOT trigger a `.symtab_shndx` (doing so makes BFD/gdb reject the
+        // file). A real C++ exe has SHN_ABS (0xfff1) symbols and zero sections
+        // over 0xff00, so no table is emitted.
+        assert!(
+            build_symtab_shndx(&[
+                sym(1),
+                sym(elf::SHN_LORESERVE as u32),
+                sym(0xfff1), // SHN_ABS
+                sym(elf::SHN_XINDEX as u32),
+            ])
+            .is_empty()
+        );
+
+        // Only a genuine ≥ 0x10000 section index (a link with > 65535 sections)
+        // needs the extended table.
+        let blob = build_symtab_shndx(&[sym(1), sym(0x1_0000), sym(0x1_0007)]);
         let words: Vec<u32> = blob
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-
-        assert_eq!(
-            words,
-            vec![0, 0, elf::SHN_LORESERVE as u32, elf::SHN_XINDEX as u32 + 7,]
-        );
+        // null + [1→0, 0x10000→0x10000, 0x10007→0x10007]
+        assert_eq!(words, vec![0, 0, 0x1_0000, 0x1_0007]);
     }
 
     #[test]
