@@ -698,19 +698,39 @@ fn elf_soname(elf: &ElfFile64<Endianness>, data: &[u8]) -> Option<String> {
 
 /// Returns true if `path` is an ELF shared object (`ET_DYN`).
 pub fn is_shared_object(path: &Path) -> bool {
-    // `e_type` is a 2-byte field at offset 16 of the ELF header — read only the
-    // header, not the whole file. The old `fs::read` slurped entire multi-MB
-    // rlibs just to classify them, and this runs in a filter over every input.
+    matches!(classify_file(path), FileKind::Shared)
+}
+
+/// Coarse input-file classification from the leading bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    /// A relocatable object (`ET_REL`) or anything that isn't an archive/shared.
+    Bare,
+    /// An `ar` archive (`!<arch>\n`).
+    Archive,
+    /// An ELF shared object (`ET_DYN`).
+    Shared,
+}
+
+/// Classify an input by reading ONLY its 20-byte header — a single open+read,
+/// replacing the former `is_archive` + `is_shared_object` double-open per input.
+/// On a 23-object Rust link that halves the classification syscalls.
+pub fn classify_file(path: &Path) -> FileKind {
     use std::io::Read;
     let mut hdr = [0u8; 20];
     let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
+        return FileKind::Bare;
     };
-    if f.read_exact(&mut hdr).is_err() {
-        return false;
+    // A short read still lets us inspect what we got (archives are 8 bytes).
+    let n = f.read(&mut hdr).unwrap_or(0);
+    let h = &hdr[..n];
+    if h.len() >= 8 && &h[0..8] == b"!<arch>\n" {
+        return FileKind::Archive;
     }
-    // ELF magic + ET_DYN (3) in the e_type halfword (little-endian at offset 16).
-    &hdr[0..4] == b"\x7fELF" && u16::from_le_bytes([hdr[16], hdr[17]]) == 3
+    if h.len() >= 18 && &h[0..4] == b"\x7fELF" && u16::from_le_bytes([h[16], h[17]]) == 3 {
+        return FileKind::Shared;
+    }
+    FileKind::Bare
 }
 
 /// Does this object define a non-local, defined `_start`? Used by the driver to

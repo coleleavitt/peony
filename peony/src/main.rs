@@ -45,7 +45,7 @@ use peony_object::{Binding, InputObject, iter_archive_members, parse_bytes, pars
 use peony_reloc::scan_relocations;
 use peony_symbols::SymbolTable;
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing_subscriber::EnvFilter;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -340,7 +340,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    init_thread_pool(args.threads)?;
+    init_thread_pool(args.threads, inputs.len())?;
 
     let Resolved {
         objects,
@@ -700,22 +700,18 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // code called `is_archive` + `is_shared_object` in three separate filters,
     // re-opening (and `is_shared_object` formerly re-reading whole) every input
     // up to 3× — on a 419-object link that was ~3950 openat calls. One pass.
-    #[derive(PartialEq)]
-    enum Kind {
-        Bare,
-        Archive,
-        Shared,
-    }
+    use peony_object::FileKind as Kind;
+    // Classify each DISTINCT path once, with a SINGLE header read per path
+    // (`classify_file` replaces the old is_archive + is_shared_object double
+    // open). cc/rustc repeat archives like `-lgcc` 4×, and each object was
+    // formerly opened twice just to classify — the memo + single read cut that.
+    let mut kind_cache: FxHashMap<&Path, Kind> = FxHashMap::default();
     let kinds: Vec<Kind> = inputs
         .iter()
         .map(|p| {
-            if is_archive(p) {
-                Kind::Archive
-            } else if peony_object::is_shared_object(p) {
-                Kind::Shared
-            } else {
-                Kind::Bare
-            }
+            *kind_cache
+                .entry(p.as_path())
+                .or_insert_with(|| peony_object::classify_file(p))
         })
         .collect();
 
@@ -853,7 +849,23 @@ struct Member {
 
 fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()> {
     let mut members: Vec<Member> = Vec::new();
-    for ar in archives {
+    // Deduplicate archive paths, keeping first-seen order. `cc`/`rustc` pass the
+    // same archive repeatedly (e.g. `-lgcc … -lgcc_s … -lgcc`, four `-lgcc`s) to
+    // paper over link-order cycles between libgcc and libc. Reading each archive
+    // 4× cost ~13MB of redundant I/O on a hello-world link. This is sound because
+    // the member-inclusion loop below is a GLOBAL fixpoint over ALL collected
+    // members — it re-checks the still-undefined set each round, so a member is
+    // pulled exactly when it first resolves a live undef regardless of how many
+    // times its archive was named. Collecting each archive's members once is thus
+    // equivalent to collecting them N times (duplicates would only be dropped by
+    // the fixpoint anyway).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let unique: Vec<&PathBuf> = archives
+        .iter()
+        .filter(|ar| seen.insert((**ar).clone()))
+        .copied()
+        .collect();
+    for ar in unique {
         for m in iter_archive_members(ar)
             .with_context(|| format!("reading archive `{}`", ar.display()))?
         {
@@ -1616,17 +1628,29 @@ fn gcc_library_dirs() -> &'static [PathBuf] {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn init_thread_pool(threads: usize) -> Result<()> {
+fn init_thread_pool(threads: usize, n_inputs: usize) -> Result<()> {
     // `--threads 0` (the default) does NOT mean "all cores": profiling a
     // 423-object link showed peony's parallel phases stop scaling at ~4 workers
     // and get SLOWER beyond that (thread-management + allocator contention
     // outweigh the embarrassingly-parallel parse/scan once the serial layout and
     // per-reloc symbol lookups dominate — Amdahl). Letting rayon default to all
     // 24 cores cost ~25% over a 4-worker pool. Cap the default at a modest count;
-    // an explicit `--threads N` still overrides. (Once symbol resolution and the
-    // reloc apply are made to scale, raise this.)
+    // an explicit `--threads N` still overrides.
+    //
+    // CRUCIAL for small links: rayon's global pool spawns N worker threads at
+    // build time, and on a tiny link (a `cc hello.c` is ~10 inputs) those
+    // workers spawn, find no work past the serial thresholds, and busy-spin on
+    // sched_yield — measured at ~13ms of pure overhead and 264 sched_yield calls
+    // on a 1-object link, making peony 3x slower than mold purely in thread
+    // churn. Below the parallel thresholds there is nothing to parallelise, so
+    // use a SINGLE thread: no worker pool, no spin. The PARALLEL_*_THRESHOLD
+    // constants (256 objects) gate the actual fan-out, so a 1-thread pool here
+    // loses nothing for small links and the big-link path is unaffected.
+    const SMALL_LINK_INPUTS: usize = 64;
     let n = if threads > 0 {
         threads
+    } else if n_inputs < SMALL_LINK_INPUTS {
+        1
     } else {
         std::thread::available_parallelism()
             .map(|c| c.get())
