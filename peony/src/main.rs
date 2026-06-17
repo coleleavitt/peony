@@ -417,8 +417,8 @@ fn main() -> Result<()> {
         "relocation scan complete"
     );
 
-    // Combine the GC live-set with COMDAT deduplication into the set of sections
-    // the layout will actually emit.
+    // Combine the GC live-set with COMDAT deduplication into the section filter
+    // the layout will apply.
     let live = compute_live(
         &objects,
         args.gc_sections,
@@ -427,8 +427,17 @@ fn main() -> Result<()> {
         &comdat_excluded,
         args.shared, // shared-object exports are GC roots
     );
-    if let Some(l) = &live {
-        tracing::info!(live_sections = l.len(), "section selection complete");
+    match &live {
+        LiveFilter::Only(l) => {
+            tracing::info!(live_sections = l.len(), "section selection complete (gc)")
+        }
+        LiveFilter::Except(d) => {
+            tracing::info!(
+                excluded_sections = d.len(),
+                "section selection complete (comdat)"
+            )
+        }
+        LiveFilter::All => {}
     }
 
     // Dynamic mode: any shared-library import → emit a dynamic executable.
@@ -586,7 +595,7 @@ fn main() -> Result<()> {
         &symbols,
         &got_syms,
         &plt_syms,
-        live.as_ref(),
+        live.as_filter(),
         dynamic.as_ref(),
         &config,
         &tls_got,
@@ -1201,19 +1210,40 @@ fn compute_live(
     entry: &str,
     comdat_excluded: &FxHashSet<(usize, usize)>,
     export_roots: bool,
-) -> Option<FxHashSet<(usize, usize)>> {
-    if !gc && comdat_excluded.is_empty() {
-        return None;
+) -> LiveFilter {
+    if !gc {
+        // No GC: emit everything except the COMDAT-discarded dups. This is a
+        // small DENY-list — avoids materialising a set of all ~37k (obj,sec)
+        // pairs just to remove a handful (measured ~5ms of pure hashset build).
+        if comdat_excluded.is_empty() {
+            return LiveFilter::All;
+        }
+        return LiveFilter::Except(comdat_excluded.clone());
     }
-    let mut live = if gc {
-        peony_layout::gc_sections_rooted(objects, symbols, entry, export_roots)
-    } else {
-        all_sections(objects)
-    };
+    // --gc-sections: an allow-list of reachable sections, minus COMDAT dups.
+    let mut live = peony_layout::gc_sections_rooted(objects, symbols, entry, export_roots);
     for key in comdat_excluded {
         live.remove(key);
     }
-    Some(live)
+    LiveFilter::Only(live)
+}
+
+/// Owned section-emission filter produced by [`compute_live`]; borrowed as a
+/// [`peony_layout::SectionFilter`] when passed to the layout.
+enum LiveFilter {
+    All,
+    Only(FxHashSet<(usize, usize)>),
+    Except(FxHashSet<(usize, usize)>),
+}
+
+impl LiveFilter {
+    fn as_filter(&self) -> peony_layout::SectionFilter<'_> {
+        match self {
+            LiveFilter::All => peony_layout::SectionFilter::All,
+            LiveFilter::Only(s) => peony_layout::SectionFilter::Only(s),
+            LiveFilter::Except(s) => peony_layout::SectionFilter::Except(s),
+        }
+    }
 }
 
 /// The export allowlist parsed from a `--version-script`.
@@ -1276,14 +1306,6 @@ fn parse_version_script(path: &Path) -> Result<VersionScript> {
         }
     }
     Ok(vs)
-}
-
-fn all_sections(objects: &[InputObject]) -> FxHashSet<(usize, usize)> {
-    objects
-        .iter()
-        .enumerate()
-        .flat_map(|(i, o)| o.sections.iter().map(move |s| (i, s.index.0)))
-        .collect()
 }
 
 /// Expand any GNU linker-script inputs (e.g. the system `libc.so`, which is a

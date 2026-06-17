@@ -30,6 +30,34 @@ use ws_deque::{Steal, Worker};
 
 pub mod icf;
 
+/// Which input sections the layout should emit. Replaces an
+/// `Option<&FxHashSet<(usize,usize)>>` allow-list so the common
+/// "everything-except-a-few-COMDAT-dups" case need not materialise a set of
+/// EVERY (object, section) pair (≈37k entries on ripgrep — measured at ~5ms of
+/// pure hashset build). `Except` is a small deny-list; `Only` is the
+/// `--gc-sections` allow-list; `All` is the no-filter default.
+#[derive(Clone, Copy)]
+pub enum SectionFilter<'a> {
+    /// Emit every section (no GC, no COMDAT dedup).
+    All,
+    /// Emit only sections in this set (`--gc-sections` reachable set).
+    Only(&'a FxHashSet<(usize, usize)>),
+    /// Emit every section EXCEPT those in this set (COMDAT-discarded dups).
+    Except(&'a FxHashSet<(usize, usize)>),
+}
+
+impl SectionFilter<'_> {
+    /// Whether `(object_id, section_index)` should be emitted.
+    #[inline]
+    pub fn emits(&self, key: &(usize, usize)) -> bool {
+        match self {
+            SectionFilter::All => true,
+            SectionFilter::Only(s) => s.contains(key),
+            SectionFilter::Except(s) => !s.contains(key),
+        }
+    }
+}
+
 // ── S3-GC grain size constant (SPEC §9) ─────────────────────────────────────
 // Minimum frontier-section count per worker before the GC BFS fans out across
 // ws-deque threads. Set high: spawning a thread scope and idle-spinning on
@@ -725,7 +753,7 @@ pub fn compute_layout(
     symbols: &SymbolTable,
     got_syms: &[SymbolId],
     plt_syms: &[SymbolId],
-    live: Option<&FxHashSet<(usize, usize)>>,
+    live: SectionFilter<'_>,
     dynamic: Option<&DynamicInfo>,
     config: &LayoutConfig,
     tls: &TlsGotInfo,
@@ -746,7 +774,7 @@ pub fn compute_layout_icf(
     symbols: &SymbolTable,
     got_syms: &[SymbolId],
     plt_syms: &[SymbolId],
-    live: Option<&FxHashSet<(usize, usize)>>,
+    live: SectionFilter<'_>,
     dynamic: Option<&DynamicInfo>,
     config: &LayoutConfig,
     tls: &TlsGotInfo,
@@ -1055,11 +1083,9 @@ pub fn compute_layout_icf(
             if sec.size == 0 && !symbol_anchored.contains(&(obj_idx, sec.index.0)) {
                 continue;
             }
-            // --gc-sections: skip sections not reachable from the roots.
-            if let Some(live) = live {
-                if !live.contains(&(obj_idx, sec.index.0)) {
-                    continue;
-                }
+            // --gc-sections / COMDAT dedup: skip sections the filter excludes.
+            if !live.emits(&(obj_idx, sec.index.0)) {
+                continue;
             }
             // --icf: a folded duplicate contributes no bytes; its references are
             // redirected to the canonical section after addresses are assigned.
@@ -1789,11 +1815,8 @@ pub fn compute_layout_icf(
                 if sec.name.as_slice() != passthrough.as_slice() || sec.data.is_empty() {
                     continue;
                 }
-                if let Some(live) = live {
-                    // `.comment` is often local/unreferenced; keep it regardless,
-                    // but honour GC exclusion for anything explicitly dropped.
-                    let _ = live;
-                }
+                // Passthrough non-alloc sections (e.g. `.comment`) are kept
+                // regardless of the GC/COMDAT filter, matching prior behaviour.
                 let align = sec.align.max(1);
                 max_align = max_align.max(align);
                 off = align_up(off, align);
