@@ -135,6 +135,9 @@ pub struct DynBlobs {
     pub gnu_version_r: Vec<u8>,
     /// Number of verneed entries (DT_VERNEEDNUM).
     pub verneed_num: u64,
+    /// GLOB_DAT relocations, assembled into `rela_dyn` after the RELATIVE
+    /// entries by `Layout::append_relative_relocs`.
+    pub rela_glob_dat: Vec<u8>,
 }
 
 /// A merged output section with a full section-header plan.
@@ -245,37 +248,72 @@ impl Layout {
     /// glibc's DT_RELACOUNT fast path stays valid). `relative.len()` must not
     /// exceed the reserved `n_relative`; any unused prefix stays `R_X86_64_NONE`.
     pub fn append_relative_relocs(&mut self, relative: &[(u64, u64)]) {
-        let entry = elf::RELA_SIZE as usize;
+        // Assemble RELATIVE entries first, then the stashed GLOB_DATs — no type-0
+        // gap between or after them (BFD/eu-elflint reject NONE in .rela.dyn).
+        let cap = self.rela_dyn_section_size() as usize;
+        let mut bytes = Vec::with_capacity(cap);
         let mut written = 0u64;
-        for (i, &(site, target)) in relative.iter().enumerate() {
-            let base = i * entry;
-            if base + entry > self.dyn_blobs.rela_dyn.len() {
-                break; // never overflow the reserved prefix
+        for &(site, target) in relative {
+            if bytes.len() + elf::RELA_SIZE as usize > cap - self.dyn_blobs.rela_glob_dat.len() {
+                break; // never crowd out the GLOB_DAT suffix
             }
             let r_info = elf::R_X86_64_RELATIVE as u64; // symbol index 0
-            self.dyn_blobs.rela_dyn[base..base + 8].copy_from_slice(&site.to_le_bytes());
-            self.dyn_blobs.rela_dyn[base + 8..base + 16].copy_from_slice(&r_info.to_le_bytes());
-            self.dyn_blobs.rela_dyn[base + 16..base + 24]
-                .copy_from_slice(&(target as i64).to_le_bytes());
+            bytes.extend_from_slice(&site.to_le_bytes());
+            bytes.extend_from_slice(&r_info.to_le_bytes());
+            bytes.extend_from_slice(&(target as i64).to_le_bytes());
             written += 1;
         }
-        // The reserved prefix may exceed the actual relative count (some locals
-        // were dropped by GC/COMDAT). Correct DT_RELACOUNT to the real number so
-        // glibc's fast path does not read a trailing NONE entry as RELATIVE.
+        let glob = std::mem::take(&mut self.dyn_blobs.rela_glob_dat);
+        bytes.extend_from_slice(&glob);
+        let actual_sz = bytes.len() as u64;
+        self.dyn_blobs.rela_dyn = bytes;
+        // Correct DT_RELACOUNT (leading relatives) and DT_RELASZ (actual bytes),
+        // and shrink the .rela.dyn section header to the real content so there
+        // are no trailing NONE entries.
         self.patch_dt_relacount(written);
+        self.patch_dt_relasz(actual_sz);
+        self.set_rela_dyn_size(actual_sz);
     }
 
-    /// Overwrite the `DT_RELACOUNT` value in the `.dynamic` blob.
+    /// The reserved `.rela.dyn` section size from layout (full prefix + globs).
+    fn rela_dyn_section_size(&self) -> u64 {
+        self.output_sections
+            .iter()
+            .find(|s| s.source == SecSource::RelaDyn)
+            .map(|s| s.sh_size)
+            .unwrap_or(0)
+    }
+
+    /// Shrink the `.rela.dyn` section header size to the actual content.
+    fn set_rela_dyn_size(&mut self, size: u64) {
+        if let Some(s) = self
+            .output_sections
+            .iter_mut()
+            .find(|s| s.source == SecSource::RelaDyn)
+        {
+            s.sh_size = size;
+        }
+    }
+
+    fn patch_dt_relasz(&mut self, size: u64) {
+        self.patch_dt_tag(elf::DT_RELASZ, size);
+    }
+
     fn patch_dt_relacount(&mut self, count: u64) {
+        self.patch_dt_tag(elf::DT_RELACOUNT, count);
+    }
+
+    /// Overwrite the value of a `DT_*` entry in the `.dynamic` blob.
+    fn patch_dt_tag(&mut self, tag: i64, value: u64) {
         let dynbytes = &mut self.dyn_blobs.dynamic;
         let mut i = 0;
         while i + 16 <= dynbytes.len() {
-            let tag = i64::from_le_bytes(dynbytes[i..i + 8].try_into().unwrap());
-            if tag == elf::DT_RELACOUNT {
-                dynbytes[i + 8..i + 16].copy_from_slice(&count.to_le_bytes());
+            let t = i64::from_le_bytes(dynbytes[i..i + 8].try_into().unwrap());
+            if t == tag {
+                dynbytes[i + 8..i + 16].copy_from_slice(&value.to_le_bytes());
                 return;
             }
-            if tag == elf::DT_NULL {
+            if t == elf::DT_NULL {
                 return;
             }
             i += 16;
@@ -545,16 +583,27 @@ pub fn compute_layout(
             let out_name = output_section_name(&sec.name);
             let is_nobits = matches!(sec.kind, SectionKind::Bss | SectionKind::Tbss);
             let b = builders.entry(out_name.clone()).or_insert_with(|| {
+                // Preserve the meaningful section flags, including SHF_TLS so the
+                // loader maps `.tdata`/`.tbss` as the static TLS template.
+                let flag_mask = elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_EXECINSTR | elf::SHF_TLS;
+                // Init/fini arrays carry function pointers and have dedicated
+                // section types the loader/linters expect.
+                let sh_type = if is_nobits {
+                    elf::SHT_NOBITS
+                } else {
+                    match out_name.as_str() {
+                        ".init_array" => elf::SHT_INIT_ARRAY,
+                        ".fini_array" => elf::SHT_FINI_ARRAY,
+                        ".preinit_array" => elf::SHT_PREINIT_ARRAY,
+                        _ => elf::SHT_PROGBITS,
+                    }
+                };
                 order.push(out_name.clone());
                 Builder {
                     name: out_name.clone(),
                     kind: sec.kind,
-                    sh_flags: sec.flags & (elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_EXECINSTR),
-                    sh_type: if is_nobits {
-                        elf::SHT_NOBITS
-                    } else {
-                        elf::SHT_PROGBITS
-                    },
+                    sh_flags: sec.flags & flag_mask,
+                    sh_type,
                     align,
                     size: 0,
                     perm: perm_of(sec.flags),
@@ -1067,11 +1116,10 @@ pub fn compute_layout(
         // `.rela.dyn` layout: R_X86_64_RELATIVE entries MUST come first, because
         // glibc's `elf_machine_rela_relative` fast path processes the leading
         // DT_RELACOUNT entries assuming they are all RELATIVE (and asserts it).
-        // We reserve a zero-filled prefix for the relatives (filled post-layout
-        // by `append_relative_relocs`) and place the GLOB_DATs after it.
-        let rel_prefix = dynj.n_relative * elf::RELA_SIZE as usize;
-        let mut rela = vec![0u8; rel_prefix];
-        rela.reserve(n_glob_dat * elf::RELA_SIZE as usize);
+        // The GLOB_DATs are built here and stashed; `append_relative_relocs`
+        // (post-layout) prepends the actual relatives and appends these, with no
+        // type-0 gap in between (which `eu-elflint`/BFD reject).
+        let mut glob = Vec::with_capacity(n_glob_dat * elf::RELA_SIZE as usize);
         for (i, id) in got_syms.iter().enumerate() {
             let Some(name) = symbols.name_by_id(*id) else {
                 continue;
@@ -1083,12 +1131,15 @@ pub fn compute_layout(
             let dynidx = *import_dynsym.get(name).unwrap_or(&0);
             let r_offset = got_base + (i as u64) * 8;
             let r_info = ((dynidx as u64) << 32) | (elf::R_X86_64_GLOB_DAT as u64);
-            rela.extend_from_slice(&r_offset.to_le_bytes());
-            rela.extend_from_slice(&r_info.to_le_bytes());
-            rela.extend_from_slice(&0i64.to_le_bytes()); // r_addend
+            glob.extend_from_slice(&r_offset.to_le_bytes());
+            glob.extend_from_slice(&r_info.to_le_bytes());
+            glob.extend_from_slice(&0i64.to_le_bytes()); // r_addend
         }
-        let rela_sz = rela.len() as u64;
-        dyn_blobs.rela_dyn = rela;
+        // Reserve the full section (relatives + glob_dats); the actual content is
+        // assembled post-layout. Section size stays `(n_relative+n_glob_dat)*ent`.
+        let rela_sz = ((dynj.n_relative + n_glob_dat) as u64) * elf::RELA_SIZE;
+        dyn_blobs.rela_glob_dat = glob;
+        dyn_blobs.rela_dyn = Vec::new();
 
         // PLT: `jmp *slot(%rip)` stubs, `.got.plt` slots, JUMP_SLOT relocs.
         let gotplt_base = va_of(SecSource::GotPlt);

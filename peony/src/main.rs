@@ -299,10 +299,15 @@ fn main() -> Result<()> {
     finalize_symbols(&mut symbols, &layout);
     check_undefined(&symbols).context("unresolved symbols")?;
 
-    // PIE: now that symbol VAs are final, materialise the R_X86_64_RELATIVE
-    // dynamic relocations and append them to `.rela.dyn` (after the GLOB_DATs).
-    if args.pie {
-        let relative = peony_reloc::collect_relative(&objects, &symbols, &layout);
+    // Assemble `.rela.dyn` now that symbol VAs are final: the R_X86_64_RELATIVE
+    // entries (PIE only) come first, then the GLOB_DATs. For a non-PIE dynamic
+    // executable there are no relatives, so this just materialises the GLOB_DATs.
+    if dynamic.is_some() {
+        let relative = if args.pie {
+            peony_reloc::collect_relative(&objects, &symbols, &layout)
+        } else {
+            Vec::new()
+        };
         layout.append_relative_relocs(&relative);
     }
 
