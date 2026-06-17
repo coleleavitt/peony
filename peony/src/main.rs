@@ -292,7 +292,6 @@ fn main() -> Result<()> {
     if args.shared {
         args.pie = false;
     }
-    init_thread_pool(args.threads)?;
 
     // A PIE or shared object is loaded at a kernel/loader-chosen bias, so it is
     // laid out from base 0 (ET_DYN). Only a fixed-address ET_EXEC uses a base.
@@ -317,13 +316,19 @@ fn main() -> Result<()> {
     };
 
     // Incremental fast-path: if every input and the previous output are
-    // byte-identical to the last link, the existing output is already correct.
+    // unchanged since the last link, the existing output is already correct.
+    // This runs BEFORE the thread pool is spun up — a no-change relink must be a
+    // handful of stat()s, not a full link (the whole point of beating mold on
+    // the edit–rebuild loop). The thread pool is only initialised once we know a
+    // real link is needed.
     if args.incremental
         && peony_cache::try_reuse(&args.output, &inputs).context("incremental cache")?
     {
         tracing::info!(output = %args.output.display(), "incremental: inputs unchanged, reused cached output");
         return Ok(());
     }
+
+    init_thread_pool(args.threads)?;
 
     let Resolved {
         objects,

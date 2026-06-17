@@ -466,3 +466,45 @@ _start:
         "exit code must be preserved across cache hit"
     );
 }
+
+/// Incremental cache invalidation: when an input changes, the `--incremental`
+/// relink must NOT reuse the stale output — it must fall back to a full link and
+/// produce the new (correct) binary. This is the conservative-correctness
+/// guarantee: a cache that ever serves stale bytes is worse than no cache.
+#[test]
+fn incremental_cache_invalidates_on_input_change() {
+    let dir = workdir("incr_inval");
+    let out = dir.join("incr.out");
+
+    let exit_55 = "\
+        .text\n.globl _start\n_start:\n    mov $60, %rax\n    mov $55, %rdi\n    syscall\n";
+    let exit_42 = "\
+        .text\n.globl _start\n_start:\n    mov $60, %rax\n    mov $42, %rdi\n    syscall\n";
+
+    // First link with the 55 variant, priming the cache.
+    let obj = assemble(&dir, "incr", exit_55);
+    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    assert_eq!(run(&out), 55);
+
+    // Overwrite the SAME object path with a different program. A correct
+    // incremental linker must detect the change (size/mtime) and re-link.
+    // Sleep a hair to guarantee a distinct mtime on coarse-grained filesystems.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let obj2 = assemble(&dir, "incr", exit_42);
+    assert_eq!(obj, obj2, "assemble must reuse the same object path");
+    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    assert_eq!(
+        run(&out),
+        42,
+        "incremental relink must reflect the changed input, not serve stale bytes"
+    );
+
+    // And a third link with no further change is a clean cache hit again.
+    let b_after = fs::read(&out).unwrap();
+    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        b_after,
+        "no-change relink after invalidation must be byte-identical"
+    );
+}

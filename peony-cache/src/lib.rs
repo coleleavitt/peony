@@ -50,7 +50,7 @@ pub enum CacheError {
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 /// Bump when the manifest format changes incompatibly.
-pub const CACHE_VERSION: u32 = 2;
+pub const CACHE_VERSION: u32 = 3;
 
 /// Sentinel for "no next entry" in the relocation reverse index.
 pub const NO_ENTRY: u32 = u32::MAX;
@@ -58,7 +58,7 @@ pub const NO_ENTRY: u32 = u32::MAX;
 // ── Fingerprints ────────────────────────────────────────────────────────────
 
 /// Length + FNV-1a-64 content hash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Fingerprint {
     pub len: u64,
     pub hash: u64,
@@ -85,6 +85,38 @@ impl Fingerprint {
             source: e,
         })?;
         Ok(Self::of_bytes(&data))
+    }
+}
+
+/// A cheap change-detector: (size, mtime-nanos, inode). Comparing these is a
+/// single `stat()` per file — no read, no content hash. The incremental
+/// no-change fast path must be O(stat) not O(bytes); hashing every input's full
+/// content (the old `Fingerprint::of_file`) made a no-change relink SLOWER than
+/// a mold full link, defeating the purpose. A content `Fingerprint` is still
+/// kept in the manifest for red-green section coloring, but the gate that
+/// decides "can we skip the link entirely" uses this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FastFingerprint {
+    pub len: u64,
+    pub mtime_ns: u64,
+    pub inode: u64,
+}
+
+impl FastFingerprint {
+    pub fn of_file(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).map_err(|e| CacheError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Ok(FastFingerprint {
+            len: m.len(),
+            // nanosecond mtime; falls back to 0 if the platform lacks it.
+            mtime_ns: (m.mtime() as u64)
+                .wrapping_mul(1_000_000_000)
+                .wrapping_add(m.mtime_nsec() as u64),
+            inode: m.ino(),
+        })
     }
 }
 
@@ -271,10 +303,16 @@ pub struct Manifest {
     pub version: u32,
     /// Epoch key at time of last link (QUAD Definition 6.2).
     pub epoch_key: u64,
-    /// (input path, fingerprint) in input order.
+    /// (input path, content fingerprint) in input order. The content hash is
+    /// used by red-green section coloring; the no-change gate uses `fast_inputs`.
     pub inputs: Vec<(String, Fingerprint)>,
-    /// Fingerprint of the produced output binary.
+    /// (input path, cheap stat fingerprint) in input order — the O(stat)
+    /// no-change detector consulted by [`try_reuse`].
+    pub fast_inputs: Vec<(String, FastFingerprint)>,
+    /// Content fingerprint of the produced output binary.
     pub output: Fingerprint,
+    /// Cheap stat fingerprint of the output (detects external modification).
+    pub fast_output: FastFingerprint,
     /// Per-output-section records for red-green coloring.
     pub sections: Vec<SectionRecord>,
     /// Cached symbol addresses for detecting moved symbols.
@@ -314,23 +352,25 @@ pub fn try_reuse(output: &Path, inputs: &[PathBuf]) -> Result<bool> {
         return Ok(false);
     }
 
-    // Same inputs, same order.
-    if manifest.inputs.len() != inputs.len() {
+    // Same inputs, same order — compared with the CHEAP stat fingerprint
+    // (size + mtime + inode), one `stat()` per input, no content read. This is
+    // what makes a no-change relink O(#inputs) syscalls instead of O(bytes).
+    if manifest.fast_inputs.len() != inputs.len() {
         return Ok(false);
     }
-    for ((rec_path, rec_fp), cur) in manifest.inputs.iter().zip(inputs) {
+    for ((rec_path, rec_fp), cur) in manifest.fast_inputs.iter().zip(inputs) {
         if rec_path != &cur.display().to_string() {
             return Ok(false);
         }
-        match Fingerprint::of_file(cur) {
+        match FastFingerprint::of_file(cur) {
             Ok(fp) if fp == *rec_fp => {}
             _ => return Ok(false),
         }
     }
 
-    // Output unmodified since we wrote it.
-    match Fingerprint::of_file(output) {
-        Ok(fp) if fp == manifest.output => Ok(true),
+    // Output unmodified since we wrote it (cheap stat check).
+    match FastFingerprint::of_file(output) {
+        Ok(fp) if fp == manifest.fast_output => Ok(true),
         _ => Ok(false),
     }
 }
@@ -356,17 +396,38 @@ pub fn record_link_with_sections(
         source: e,
     })?;
 
-    let mut input_fps = Vec::with_capacity(inputs.len());
+    // Cheap stat fingerprints for the no-change gate (always recorded).
+    let mut fast_inputs = Vec::with_capacity(inputs.len());
     for p in inputs {
-        input_fps.push((p.display().to_string(), Fingerprint::of_file(p)?));
+        fast_inputs.push((p.display().to_string(), FastFingerprint::of_file(p)?));
     }
+    // Content fingerprints feed red-green section coloring, which is not yet
+    // wired into the driver; recording them would re-hash every input's full
+    // bytes on every link (the cost we just removed from the reuse path). Record
+    // them only when section records are actually being produced.
+    let input_fps = if sections.is_empty() {
+        Vec::new()
+    } else {
+        let mut v = Vec::with_capacity(inputs.len());
+        for p in inputs {
+            v.push((p.display().to_string(), Fingerprint::of_file(p)?));
+        }
+        v
+    };
+    let output_fp = if sections.is_empty() {
+        Fingerprint::default()
+    } else {
+        Fingerprint::of_file(output)?
+    };
 
     let epoch_key = compute_epoch_key(inputs, 0);
     let manifest = Manifest {
         version: CACHE_VERSION,
         epoch_key,
         inputs: input_fps,
-        output: Fingerprint::of_file(output)?,
+        fast_inputs,
+        output: output_fp,
+        fast_output: FastFingerprint::of_file(output)?,
         sections: sections.to_vec(),
         symbols: symbols.to_vec(),
     };
