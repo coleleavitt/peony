@@ -60,6 +60,7 @@ pub mod r_x86_64 {
     pub const PC16: u32 = 13;
     pub const R8: u32 = 14;
     pub const PC8: u32 = 15;
+    pub const DTPMOD64: u32 = 16; // TLS module id (GD/LDM GOT slot0), loader-filled
     pub const DTPOFF64: u32 = 17;
     pub const TPOFF64: u32 = 18;
     pub const TLSGD: u32 = 19; // General-Dynamic: relaxed to Local-Exec in an exe
@@ -100,10 +101,19 @@ fn needs_got(r_type: u32) -> bool {
 
 // ── Synthetic slots ─────────────────────────────────────────────────────────
 
+pub use peony_layout::TlsRef;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntheticSlot {
     Got(SymbolId),
     Plt(SymbolId),
+    /// General-Dynamic TLS GOT *pair* (DTPMOD64 + DTPOFF) for a TLS symbol. Only
+    /// allocated when producing a shared object (an executable relaxes GD→LE).
+    TlsGd(TlsRef),
+    /// Initial-Exec TLS GOT slot (GOTTPOFF → TPOFF64) for a TLS symbol, in a `.so`.
+    TlsIe(TlsRef),
+    /// The module's single Local-Dynamic (LDM) TLS GOT pair (DTPMOD64 + 0).
+    TlsLdm,
 }
 
 /// Result of the relocation scan: the GOT/PLT slots required, in stable order.
@@ -134,7 +144,7 @@ impl RelocScanResult {
             .iter()
             .filter_map(|s| match s {
                 SyntheticSlot::Got(id) => Some(*id),
-                SyntheticSlot::Plt(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -145,9 +155,38 @@ impl RelocScanResult {
             .iter()
             .filter_map(|s| match s {
                 SyntheticSlot::Plt(id) => Some(*id),
-                SyntheticSlot::Got(_) => None,
+                _ => None,
             })
             .collect()
+    }
+
+    /// TLS refs needing a General-Dynamic GOT pair, in slot order (shared).
+    pub fn tls_gd_refs(&self) -> Vec<TlsRef> {
+        self.slots
+            .iter()
+            .filter_map(|s| match s {
+                SyntheticSlot::TlsGd(r) => Some(*r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// TLS refs needing an Initial-Exec GOT slot, in slot order (shared).
+    pub fn tls_ie_refs(&self) -> Vec<TlsRef> {
+        self.slots
+            .iter()
+            .filter_map(|s| match s {
+                SyntheticSlot::TlsIe(r) => Some(*r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the module needs a Local-Dynamic (LDM) TLS GOT pair (shared).
+    pub fn needs_tls_ldm(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| matches!(s, SyntheticSlot::TlsLdm))
     }
 }
 
@@ -188,11 +227,18 @@ pub fn assign_weak_got_ids(objects: &[InputObject], symbols: &mut SymbolTable) {
 
 // ── Scan phase (parallel) ────────────────────────────────────────────────────
 
-/// Scan all relocations to determine the required GOT and PLT slots.
-pub fn scan_relocations(objects: &[InputObject], symbols: &SymbolTable) -> RelocScanResult {
+/// Scan all relocations to determine the required GOT and PLT slots. `shared`
+/// selects shared-object TLS handling (GD/LD/IE GOT slots + `__tls_get_addr`
+/// PLT) instead of the executable's GD/LD→Local-Exec relaxation.
+pub fn scan_relocations(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    shared: bool,
+) -> RelocScanResult {
     let per_object: Vec<Vec<SyntheticSlot>> = objects
         .par_iter()
-        .map(|obj| scan_object(obj, symbols))
+        .enumerate()
+        .map(|(obj_id, obj)| scan_object(obj, obj_id, symbols, shared))
         .collect();
 
     let mut result = RelocScanResult::new();
@@ -204,16 +250,51 @@ pub fn scan_relocations(objects: &[InputObject], symbols: &SymbolTable) -> Reloc
     result
 }
 
-fn scan_object(obj: &InputObject, symbols: &SymbolTable) -> Vec<SyntheticSlot> {
+fn scan_object(
+    obj: &InputObject,
+    obj_id: usize,
+    symbols: &SymbolTable,
+    shared: bool,
+) -> Vec<SyntheticSlot> {
     let mut slots = Vec::new();
     for sec in &obj.sections {
         for reloc in &sec.relocs {
-            let Some(sym) = obj
-                .symbols
-                .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-            else {
+            let Some(sym_pos) = obj.symbol_map.get(&reloc.symbol.0).copied() else {
                 continue;
             };
+            let Some(sym) = obj.symbols.get(sym_pos) else {
+                continue;
+            };
+            // A helper to key a TLS reference (locals are file-scoped).
+            let tls_ref = |sym: &peony_object::InputSymbol| -> TlsRef {
+                if sym.binding == Binding::Local {
+                    TlsRef::Local(obj_id, sym_pos)
+                } else {
+                    match symbols.lookup(&sym.name) {
+                        Some(r) => TlsRef::Global(r.id),
+                        None => TlsRef::Local(obj_id, sym_pos),
+                    }
+                }
+            };
+            // Initial-Exec (`GOTTPOFF`) ALWAYS needs a GOT slot holding the TP
+            // offset — in BOTH an executable (filled statically, the offset is
+            // known) and a shared object (filled at load via R_X86_64_TPOFF64).
+            // The `mov x@gottpoff(%rip),%reg` access is kept in both cases.
+            if reloc.r_type == r_x86_64::GOTTPOFF {
+                slots.push(SyntheticSlot::TlsIe(tls_ref(sym)));
+                continue;
+            }
+            // General-/Local-Dynamic: only a shared object keeps them (an
+            // executable relaxes GD/LD → Local-Exec, needing no GOT slot).
+            if shared && matches!(reloc.r_type, r_x86_64::TLSGD | r_x86_64::TLSLD) {
+                match reloc.r_type {
+                    r_x86_64::TLSGD => slots.push(SyntheticSlot::TlsGd(tls_ref(sym))),
+                    r_x86_64::TLSLD => slots.push(SyntheticSlot::TlsLdm),
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+
             // Slots are keyed by global SymbolId; local refs are handled directly.
             let Some(res) = symbols.lookup(&sym.name) else {
                 continue;
@@ -225,12 +306,15 @@ fn scan_object(obj: &InputObject, symbols: &SymbolTable) -> Vec<SyntheticSlot> {
                 && (res.is_defined() || res.import || res.binding == Binding::Weak)
             {
                 slots.push(SyntheticSlot::Got(res.id));
-            } else if reloc.r_type == r_x86_64::PLT32 && res.import && sym.name != b"__tls_get_addr"
-            {
+            } else if reloc.r_type == r_x86_64::PLT32 {
                 // A direct `call foo@PLT` to an imported function needs a PLT
-                // stub — except `__tls_get_addr`, whose GD/LD call sites are
-                // relaxed to Local-Exec (the import is dropped entirely).
-                slots.push(SyntheticSlot::Plt(res.id));
+                // stub. In a shared object `__tls_get_addr` is a real import
+                // (the GD/LD call is kept), so it DOES need a PLT slot; in an
+                // executable the GD/LD calls are relaxed away, so it does not.
+                let tls_helper = sym.name == b"__tls_get_addr";
+                if res.import && (shared || !tls_helper) {
+                    slots.push(SyntheticSlot::Plt(res.id));
+                }
             }
         }
     }
@@ -385,6 +469,152 @@ pub fn collect_dynamic_data_relocs(
     (out, ifunc)
 }
 
+/// One TLS dynamic relocation for `.rela.dyn`: `(site_va, r_type, sym_index,
+/// addend)`. `sym_index` is the `.dynsym` index (0 for module-relative locals).
+pub type TlsDynReloc = (u64, u32, u32, i64);
+
+/// The TLS GOT region's filled contents for a shared object:
+/// * `relocs` — dynamic relocations (DTPMOD64 on each GD/LDM slot0, TPOFF64 on
+///   each IE slot, and DTPOFF64 for any *imported* GD symbol).
+/// * `static_writes` — `(got_va, value)` bytes written directly into `.got`
+///   (the DTPOFF in a locally-defined GD pair's slot1, and the LDM slot1 = 0).
+#[derive(Debug, Default)]
+pub struct TlsGotContents {
+    pub relocs: Vec<TlsDynReloc>,
+    pub static_writes: Vec<(u64, u64)>,
+}
+
+/// Resolve a [`TlsRef`]'s offset within this module's TLS block, plus whether it
+/// is an *imported* (undefined-here) TLS symbol. Returns `None` if it cannot be
+/// resolved (e.g. dropped section).
+fn tls_ref_offset(
+    tref: TlsRef,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+) -> Option<(u64, bool)> {
+    match tref {
+        TlsRef::Local(obj_id, sym_pos) => {
+            let sym = objects.get(obj_id)?.symbols.get(sym_pos)?;
+            let si = sym.section?;
+            let base = layout.tls_offset(obj_id, si.0)?;
+            Some((base + sym.value, false))
+        }
+        TlsRef::Global(id) => {
+            let name = symbols.name_by_id(id)?;
+            let res = symbols.lookup(name)?;
+            match (res.defined_in, res.section_index) {
+                (Some(def), Some(si)) => {
+                    let base = layout.tls_offset(def.0 as usize, si)?;
+                    Some((base + res.value, false))
+                }
+                // Imported / undefined-here TLS symbol: offset filled by loader.
+                _ => Some((0, true)),
+            }
+        }
+    }
+}
+
+/// Build the TLS GOT region's dynamic relocations and static slot writes from
+/// the addresses the layout assigned. Must run post-layout. `shared` selects
+/// dynamic (GD/LD/IE with loader-filled module ids / TP offsets) vs the
+/// executable case (Initial-Exec slots filled statically; GD/LD are relaxed
+/// away in the executable and produce no GOT pairs here).
+pub fn collect_tls_got(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    tls: &peony_layout::TlsGotInfo,
+    shared: bool,
+) -> TlsGotContents {
+    let mut c = TlsGotContents::default();
+    if shared {
+        // General-Dynamic pairs: slot0 = DTPMOD64, slot1 = DTPOFF.
+        for tref in &tls.gd {
+            let Some(&pair) = layout.tls_gd_addr.get(tref) else {
+                continue;
+            };
+            let (offset, imported) =
+                tls_ref_offset(*tref, objects, symbols, layout).unwrap_or((0, true));
+            if imported {
+                // Imported TLS: both module id and offset are resolved at load.
+                let dynidx = tls_ref_dynidx(*tref, symbols);
+                c.relocs.push((pair, r_x86_64::DTPMOD64, dynidx, 0));
+                c.relocs.push((pair + 8, r_x86_64::DTPOFF64, dynidx, 0));
+            } else {
+                // Locally-defined: DTPMOD64 (module, loader-filled) + static DTPOFF.
+                c.relocs.push((pair, r_x86_64::DTPMOD64, 0, 0));
+                c.static_writes.push((pair + 8, offset));
+            }
+        }
+        // Module Local-Dynamic pair: slot0 = DTPMOD64, slot1 = 0 (static).
+        if let Some(ldm) = layout.tls_ldm_addr {
+            c.relocs.push((ldm, r_x86_64::DTPMOD64, 0, 0));
+            c.static_writes.push((ldm + 8, 0));
+        }
+    }
+    // Initial-Exec slots hold the TP-relative offset of the symbol.
+    for tref in &tls.ie {
+        let Some(&slot) = layout.tls_ie_addr.get(tref) else {
+            continue;
+        };
+        let (offset, imported) =
+            tls_ref_offset(*tref, objects, symbols, layout).unwrap_or((0, true));
+        if shared && imported {
+            // Imported IE TLS: loader fills the slot (TPOFF64 against the symbol).
+            let dynidx = tls_ref_dynidx(*tref, symbols);
+            c.relocs.push((slot, r_x86_64::TPOFF64, dynidx, 0));
+        } else if shared {
+            // Locally-defined IE in a .so: loader fills the slot (module-relative
+            // addend) since the TP offset isn't known until load.
+            c.relocs.push((slot, r_x86_64::TPOFF64, 0, offset as i64));
+        } else {
+            // EXECUTABLE: the TP offset is fixed (TP is the end of the static TLS
+            // block), so write it statically — `offset - tls_size`, negative.
+            let tp = (offset as i64).wrapping_sub(layout.tls_size as i64);
+            c.static_writes.push((slot, tp as u64));
+        }
+    }
+    c
+}
+
+/// `.dynsym` index for an imported TLS symbol (0 if not an import / unknown).
+fn tls_ref_dynidx(tref: TlsRef, symbols: &SymbolTable) -> u32 {
+    if let TlsRef::Global(id) = tref {
+        if let Some(name) = symbols.name_by_id(id) {
+            if let Some(r) = symbols.lookup(name) {
+                return r.dynsym_index;
+            }
+        }
+    }
+    0
+}
+
+/// Count the TLS dynamic relocations a shared object's TLS GOT will need, to
+/// size `.rela.dyn` before layout. Each GD pair contributes 1 (local) or 2
+/// (imported), the LDM pair 1, each IE slot 1.
+pub fn count_tls_relocs(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    tls: &peony_layout::TlsGotInfo,
+) -> usize {
+    let imported = |tref: &TlsRef| -> bool {
+        match tref {
+            TlsRef::Local(..) => false,
+            TlsRef::Global(id) => symbols
+                .name_by_id(*id)
+                .and_then(|n| symbols.lookup(n))
+                .map(|r| r.defined_in.is_none())
+                .unwrap_or(true),
+        }
+    };
+    let _ = objects;
+    let gd: usize = tls.gd.iter().map(|t| if imported(t) { 2 } else { 1 }).sum();
+    let ie = tls.ie.len();
+    let ldm = usize::from(tls.ldm);
+    gd + ie + ldm
+}
+
 /// Count GOT slots that will need an `R_X86_64_RELATIVE` (defined non-import
 /// symbols referenced through the GOT in a PIE). Added to [`count_relative`] by
 /// the driver since GOT slots are known before layout. Includes IFUNC GOT slots
@@ -462,6 +692,9 @@ pub fn count_irelative(
 pub struct ApplyCtx<'a> {
     pub symbols: &'a SymbolTable,
     pub layout: &'a Layout,
+    /// Producing a shared object: keep General-/Local-Dynamic TLS (GOT pairs +
+    /// `__tls_get_addr`) instead of relaxing to Local-Exec.
+    pub shared: bool,
 }
 
 /// Addresses used when computing a relocation value.
@@ -476,6 +709,10 @@ struct RelocAddrs {
     tls: u64,      // symbol's offset within the static TLS block
     tls_size: u64, // total static TLS block size
     offset: usize,
+    shared: bool, // producing a shared object (GD/LD/IE TLS, no LE relax)
+    tls_gd: u64,  // GD GOT pair base VA for this symbol (shared); 0 if none
+    tls_ie: u64,  // IE GOT slot VA for this symbol (shared); 0 if none
+    tls_ldm: u64, // module LDM GOT pair base VA (shared); 0 if none
 }
 
 /// Apply a single relocation, patching `buf` (the relocated section's bytes).
@@ -500,10 +737,15 @@ pub fn apply_reloc(
         return Ok(());
     };
 
-    // The `call __tls_get_addr@PLT` that follows a GD/LD `lea` is rewritten by
-    // the TLSGD/TLSLD relaxation; its PLT32/PC32 relocation must not run, or it
-    // would corrupt the relaxed Local-Exec instruction bytes.
-    if matches!(reloc.r_type, r_x86_64::PLT32 | r_x86_64::PC32) && sym.name == b"__tls_get_addr" {
+    // In an EXECUTABLE the `call __tls_get_addr@PLT` after a GD/LD `lea` is
+    // rewritten by the TLSGD/TLSLD→LE relaxation, so its PLT32/PC32 relocation
+    // must not run (it would corrupt the relaxed Local-Exec bytes). In a SHARED
+    // object the call is KEPT, so the relocation must run normally (resolve the
+    // real PLT stub) — do not skip it there.
+    if !ctx.shared
+        && matches!(reloc.r_type, r_x86_64::PLT32 | r_x86_64::PC32)
+        && sym.name == b"__tls_get_addr"
+    {
         return Ok(());
     }
 
@@ -554,6 +796,28 @@ pub fn apply_reloc(
         0
     };
 
+    // TLS GOT addresses for this reference, keyed by `TlsRef` exactly as the
+    // scan allocated them. IE (GOTTPOFF) slots exist in BOTH exe and shared
+    // outputs; GD/LDM pairs only in a shared object.
+    let (tls_gd, tls_ie) = {
+        let sym_pos = obj.symbol_map.get(&reloc.symbol.0).copied();
+        let tref = match sym_pos {
+            Some(pos) if sym.binding == Binding::Local => Some(TlsRef::Local(obj_id, pos)),
+            Some(pos) => match ctx.symbols.lookup(&sym.name) {
+                Some(r) => Some(TlsRef::Global(r.id)),
+                None => Some(TlsRef::Local(obj_id, pos)),
+            },
+            None => None,
+        };
+        let gd = tref
+            .and_then(|t| ctx.layout.tls_gd_addr.get(&t).copied())
+            .unwrap_or(0);
+        let ie = tref
+            .and_then(|t| ctx.layout.tls_ie_addr.get(&t).copied())
+            .unwrap_or(0);
+        (gd, ie)
+    };
+
     let addrs = RelocAddrs {
         s,
         a: reloc.addend,
@@ -565,6 +829,10 @@ pub fn apply_reloc(
         tls,
         tls_size: ctx.layout.tls_size,
         offset: reloc.offset as usize,
+        shared: ctx.shared,
+        tls_gd,
+        tls_ie,
+        tls_ldm: ctx.layout.tls_ldm_addr.unwrap_or(0),
     };
 
     patch_buf(buf, reloc.r_type, &addrs, &obj.path)
@@ -666,16 +934,44 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
                 .wrapping_add(a.a)
                 .wrapping_sub(a.tls_size as i64) as u64,
         ),
-        // Local-Dynamic TLS: offset from the start of the TLS block.
-        DTPOFF32 => write_i32(
-            buf,
-            off,
-            (a.tls as i64).wrapping_add(a.a),
-            r_type,
-            object,
-            off as u64,
-        )?,
-        DTPOFF64 => write_u64(buf, off, (a.tls as i64).wrapping_add(a.a) as u64),
+        // DTPOFF: offset of the symbol within its module's TLS block.
+        //
+        // In a SHARED object the matching `lea x@tlsld(%rip)` + `call
+        // __tls_get_addr` is KEPT, and the helper returns the module's TLS block
+        // base, so DTPOFF stays module-relative (`tls + addend`).
+        //
+        // In an EXECUTABLE peony relaxes the Local-Dynamic sequence to
+        // Local-Exec (`mov %fs:0,%rax`), so the base register now holds the
+        // thread pointer (the END of the static TLS block). The per-symbol
+        // DTPOFF access must therefore become TP-relative (`tls + addend -
+        // tls_size`, i.e. negative) to match — exactly like TPOFF. Leaving it
+        // module-relative yields a positive `%fs:0 + off` that corrupts the TCB.
+        DTPOFF32 => {
+            let base = (a.tls as i64).wrapping_add(a.a);
+            let v = if a.shared {
+                base
+            } else {
+                base.wrapping_sub(a.tls_size as i64)
+            };
+            tracing::trace!(
+                tls_block_off = a.tls,
+                addend = a.a,
+                tls_size = a.tls_size,
+                shared = a.shared,
+                dtpoff = v,
+                "DTPOFF32"
+            );
+            write_i32(buf, off, v, r_type, object, off as u64)?
+        }
+        DTPOFF64 => {
+            let base = (a.tls as i64).wrapping_add(a.a);
+            let v = if a.shared {
+                base
+            } else {
+                base.wrapping_sub(a.tls_size as i64)
+            };
+            write_u64(buf, off, v as u64)
+        }
 
         // ── TLS access-model relaxation (executable ⇒ Local-Exec) ────────────
         //
@@ -683,6 +979,20 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
         // Local-Dynamic accesses are relaxed to Local-Exec, eliminating the
         // runtime `__tls_get_addr` call. We rewrite the fixed instruction
         // sequence the compiler emits and patch the TP-relative offset.
+        // In a shared object the General-Dynamic access is KEPT (the static TLS
+        // offset is unknown when dlopen'd): patch the `lea x@tlsgd(%rip),%rdi`
+        // displacement to point at the symbol's GD GOT pair (GOTPCREL math) and
+        // leave the `call __tls_get_addr@PLT` intact.
+        TLSGD if a.shared => {
+            let v = (a.tls_gd as i64).wrapping_add(a.a).wrapping_sub(p);
+            tracing::trace!(
+                off,
+                gd_pair = format_args!("{:#x}", a.tls_gd),
+                disp = v,
+                "TLSGD (shared, General-Dynamic, kept)"
+            );
+            write_i32(buf, off, v, r_type, object, off as u64)?
+        }
         TLSGD => {
             // GD→LE relaxation (x86-64 psABI). The input 16-byte sequence is:
             //   66 48 8d 3d <disp32>      data16 lea x@tlsgd(%rip),%rdi
@@ -729,6 +1039,19 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
                 );
             }
         }
+        // Shared object: Local-Dynamic kept — patch `lea x@tlsld(%rip),%rdi` to
+        // the module LDM GOT pair; the per-symbol offset is added by the
+        // (static) DTPOFF32 relocations. The `call __tls_get_addr` is kept.
+        TLSLD if a.shared => {
+            let v = (a.tls_ldm as i64).wrapping_add(a.a).wrapping_sub(p);
+            tracing::trace!(
+                off,
+                ldm_pair = format_args!("{:#x}", a.tls_ldm),
+                disp = v,
+                "TLSLD (shared, Local-Dynamic, kept)"
+            );
+            write_i32(buf, off, v, r_type, object, off as u64)?
+        }
         TLSLD => {
             // LD→LE relaxation. The input sequence is:
             //   48 8d 3d <disp32>     lea x@tlsld(%rip),%rdi   (reloc at off, lea at off-3)
@@ -755,10 +1078,32 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
                 );
             }
         }
-        // Initial-Exec: GOT slot holds the TP offset; here we keep the GOT
-        // mechanism and write the slot value as a Local-Exec offset.
+        // Initial-Exec, shared object: reference the dedicated IE GOT slot, which
+        // the loader fills via an R_X86_64_TPOFF64 dynamic relocation (the TP
+        // offset is unknown until load). `mov x@gottpoff(%rip),%reg` is kept.
+        GOTTPOFF if a.shared => {
+            let v = (a.tls_ie as i64).wrapping_add(a.a).wrapping_sub(p);
+            tracing::trace!(
+                off,
+                ie_slot = format_args!("{:#x}", a.tls_ie),
+                disp = v,
+                "GOTTPOFF (shared, Initial-Exec, kept)"
+            );
+            write_i32(buf, off, v, r_type, object, off as u64)?
+        }
+        // Initial-Exec, executable: reference the dedicated IE GOT slot (filled
+        // statically by `collect_tls_got` with the fixed TP offset). The
+        // `mov x@gottpoff(%rip),%reg` access is kept; this patches its
+        // displacement to the slot (GOTPCREL math). Using a real slot (not the
+        // scalar GOT) is required — a missing slot would resolve to address 0.
         GOTTPOFF => {
-            let v = (a.g as i64).wrapping_add(a.a).wrapping_sub(p);
+            let v = (a.tls_ie as i64).wrapping_add(a.a).wrapping_sub(p);
+            tracing::trace!(
+                off,
+                ie_slot = format_args!("{:#x}", a.tls_ie),
+                disp = v,
+                "GOTTPOFF (executable, Initial-Exec GOT slot)"
+            );
             write_i32(buf, off, v, r_type, object, off as u64)?
         }
 

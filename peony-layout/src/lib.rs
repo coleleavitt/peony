@@ -140,6 +140,9 @@ pub struct DynamicInfo {
     /// (sizes drive layout), so names+metadata are provided here and the final
     /// `st_value`/`st_shndx` are resolved at emit time by name.
     pub exports: Vec<ExportSym>,
+    /// Number of TLS dynamic relocations (`R_X86_64_DTPMOD64`/`DTPOFF64`/
+    /// `TPOFF64`) the shared-object TLS GOT region needs, to size `.rela.dyn`.
+    pub n_tls_reloc: usize,
 }
 
 /// One exported symbol of a shared object, destined for `.dynsym`.
@@ -150,6 +153,41 @@ pub struct ExportSym {
     pub info: u8,
     /// `st_other` = visibility.
     pub other: u8,
+}
+
+/// TLS GOT requirements discovered by the relocation scan, for a shared object.
+/// peony appends a dedicated TLS region to `.got`: General-Dynamic pairs
+/// (DTPMOD64 + DTPOFF, 16 bytes each), one module Local-Dynamic pair
+/// (DTPMOD64 + 0, 16 bytes), and Initial-Exec slots (TPOFF64, 8 bytes each).
+/// Identity of a TLS symbol for GOT-slot keying. TLS statics are frequently
+/// `STB_LOCAL` (file-scoped), so they have no global `SymbolId`; a local TLS
+/// reference is keyed by `(object_id, input_symbol_index)`, a global one by its
+/// resolved `SymbolId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TlsRef {
+    Local(usize, usize),
+    Global(SymbolId),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TlsGotInfo {
+    /// TLS refs needing a GD pair, in slot order.
+    pub gd: Vec<TlsRef>,
+    /// TLS refs needing an IE slot, in slot order.
+    pub ie: Vec<TlsRef>,
+    /// Whether a module-wide LDM pair is needed.
+    pub ldm: bool,
+}
+
+impl TlsGotInfo {
+    /// Total bytes the TLS GOT region occupies (GD pairs + LDM pair + IE slots).
+    pub fn byte_size(&self) -> u64 {
+        (self.gd.len() as u64) * 16 + if self.ldm { 16 } else { 0 } + (self.ie.len() as u64) * 8
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.gd.is_empty() && self.ie.is_empty() && !self.ldm
+    }
 }
 
 /// Pre-built byte blobs for the dynamic-linking sections (filled by layout,
@@ -262,6 +300,20 @@ pub struct Layout {
     pub tls_size: u64,
     /// (object_id, input_section_index) → offset within the TLS block.
     pub tls_offsets: FxHashMap<(usize, usize), u64>,
+    /// Shared-object TLS GOT addresses: General-Dynamic pair base VA per TLS ref
+    /// (slot0 = DTPMOD64, slot1 = DTPOFF).
+    pub tls_gd_addr: FxHashMap<TlsRef, u64>,
+    /// Initial-Exec TLS GOT slot VA per TLS ref (holds the TPOFF64).
+    pub tls_ie_addr: FxHashMap<TlsRef, u64>,
+    /// Module Local-Dynamic (LDM) GOT pair base VA (slot0 = DTPMOD64), if any.
+    pub tls_ldm_addr: Option<u64>,
+    /// Producing a shared object: TLS uses GD/LD/IE (not Local-Exec relaxation).
+    pub shared: bool,
+    /// Static writes into the TLS GOT region: `(got_va, value)`. The DTPOFF in a
+    /// locally-defined GD pair's slot1 and the LDM pair's slot1 (= 0) are known
+    /// at link time and written directly (not via a dynamic reloc). Applied by
+    /// emit after the scalar GOT slots.
+    pub tls_got_writes: Vec<(u64, u64)>,
 }
 
 impl Layout {
@@ -289,19 +341,29 @@ impl Layout {
         self.append_dynamic_relocs(relative, &[]);
     }
 
-    /// Assemble `.rela.dyn`: `R_X86_64_RELATIVE` entries first (covered by
-    /// `DT_RELACOUNT`), then `R_X86_64_IRELATIVE` IFUNC entries, then the stashed
-    /// `R_X86_64_GLOB_DAT` imports — with no type-0 gap anywhere (BFD/eu-elflint
-    /// reject `NONE` records in `.rela.dyn`). `irelative` is `(got_slot_va,
-    /// resolver_va)`; the loader runs the resolver and stores its result.
     pub fn append_dynamic_relocs(&mut self, relative: &[(u64, u64)], irelative: &[(u64, u64)]) {
+        self.append_all_dynamic_relocs(relative, irelative, &[]);
+    }
+
+    /// Assemble `.rela.dyn`: `R_X86_64_RELATIVE` entries first (covered by
+    /// `DT_RELACOUNT`), then `R_X86_64_IRELATIVE` IFUNC entries, then TLS
+    /// (`DTPMOD64`/`DTPOFF64`/`TPOFF64`) entries, then the stashed
+    /// `R_X86_64_GLOB_DAT` imports — with no type-0 gap anywhere (BFD/eu-elflint
+    /// reject `NONE` records). `irelative` is `(got_slot_va, resolver_va)`; `tls`
+    /// is `(site_va, r_type, dynsym_index, addend)`.
+    pub fn append_all_dynamic_relocs(
+        &mut self,
+        relative: &[(u64, u64)],
+        irelative: &[(u64, u64)],
+        tls: &[(u64, u32, u32, i64)],
+    ) {
         let cap = self.rela_dyn_section_size() as usize;
         let glob_len = self.dyn_blobs.rela_glob_dat.len();
         let mut bytes = Vec::with_capacity(cap);
         let mut written = 0u64;
         for &(site, target) in relative {
             if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
-                break; // never crowd out the IRELATIVE/GLOB_DAT suffixes
+                break; // never crowd out the IRELATIVE/TLS/GLOB_DAT suffixes
             }
             let r_info = elf::R_X86_64_RELATIVE as u64; // symbol index 0
             bytes.extend_from_slice(&site.to_le_bytes());
@@ -321,8 +383,6 @@ impl Layout {
             bytes.extend_from_slice(&(resolver as i64).to_le_bytes());
             written_irel += 1;
         }
-        // Dropping an IRELATIVE silently breaks IFUNC resolution; the section is
-        // sized for all of them, so surface a sizing regression loudly.
         if written_irel != irelative.len() {
             tracing::error!(
                 wrote = written_irel,
@@ -330,6 +390,26 @@ impl Layout {
                 "BUG: .rela.dyn too small for all IRELATIVE entries — IFUNC resolution broken"
             );
             debug_assert_eq!(written_irel, irelative.len(), "IRELATIVE entries dropped");
+        }
+        // TLS: DTPMOD64 / DTPOFF64 / TPOFF64 GOT-pair relocations (shared object).
+        let mut written_tls = 0usize;
+        for &(site, r_type, dynidx, addend) in tls {
+            if bytes.len() + elf::RELA_SIZE as usize > cap - glob_len {
+                break;
+            }
+            let r_info = ((dynidx as u64) << 32) | (r_type as u64);
+            bytes.extend_from_slice(&site.to_le_bytes());
+            bytes.extend_from_slice(&r_info.to_le_bytes());
+            bytes.extend_from_slice(&addend.to_le_bytes());
+            written_tls += 1;
+        }
+        if written_tls != tls.len() {
+            tracing::error!(
+                wrote = written_tls,
+                wanted = tls.len(),
+                "BUG: .rela.dyn too small for all TLS entries — thread-locals broken"
+            );
+            debug_assert_eq!(written_tls, tls.len(), "TLS dyn relocs dropped");
         }
         let glob = std::mem::take(&mut self.dyn_blobs.rela_glob_dat);
         bytes.extend_from_slice(&glob);
@@ -538,6 +618,7 @@ pub fn compute_layout(
     live: Option<&FxHashSet<(usize, usize)>>,
     dynamic: Option<&DynamicInfo>,
     config: &LayoutConfig,
+    tls: &TlsGotInfo,
 ) -> Result<Layout> {
     let page = config.page_size.max(1);
     let base = config.base_address;
@@ -856,15 +937,19 @@ pub fn compute_layout(
     rw_pb.sort_by(|a, b| a.name.cmp(&b.name));
     rw_bss.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Synthesise .got (RW progbits) from the scan.
-    if !got_syms.is_empty() {
+    // Synthesise .got (RW progbits) from the scan. The scalar GOT (one 8-byte
+    // slot per `got_syms` entry) is followed by the TLS GOT region (GD pairs,
+    // the LDM pair, then IE slots) for a shared object.
+    let scalar_got_bytes = (got_syms.len() as u64) * 8;
+    let got_total = scalar_got_bytes + tls.byte_size();
+    if got_total > 0 {
         rw_pb.push(Builder {
             name: ".got".to_string(),
             kind: SectionKind::Data,
             sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE,
             sh_type: elf::SHT_PROGBITS,
             align: 8,
-            size: (got_syms.len() as u64) * 8,
+            size: got_total,
             perm: Perm::Rw,
             is_nobits: false,
             contributions: Vec::new(),
@@ -979,7 +1064,7 @@ pub fn compute_layout(
                 ".rela.dyn",
                 elf::SHT_RELA,
                 8,
-                ((n_glob_dat + dynj.n_relative) as u64) * elf::RELA_SIZE,
+                ((n_glob_dat + dynj.n_relative + dynj.n_tls_reloc) as u64) * elf::RELA_SIZE,
             ),
         ];
         for (name, sh_type, align, size) in ro_dyn {
@@ -1042,7 +1127,7 @@ pub fn compute_layout(
             .iter()
             .filter(|b| b.name == ".init_array" || b.name == ".fini_array")
             .count();
-        let has_rela = n_glob_dat + dynj.n_relative > 0;
+        let has_rela = n_glob_dat + dynj.n_relative + dynj.n_tls_reloc > 0;
         // FLAGS entries: PIE or shared → DT_FLAGS + DT_FLAGS_1 (2; both eager-bind
         // ET_DYN, though shared omits DF_1_PIE); else PLT-only → DT_FLAGS (1).
         let n_flags = if dynj.pie || dynj.shared {
@@ -1397,6 +1482,37 @@ pub fn compute_layout(
         .map(|s| s.sh_addr)
         .unwrap_or(0);
 
+    // ── TLS GOT region (shared object) ───────────────────────────────────────
+    // Laid out after the scalar GOT: GD pairs, the LDM pair, then IE slots.
+    let mut tls_gd_addr: FxHashMap<TlsRef, u64> = FxHashMap::default();
+    let mut tls_ie_addr: FxHashMap<TlsRef, u64> = FxHashMap::default();
+    let mut tls_ldm_addr: Option<u64> = None;
+    {
+        let mut cur = got_base + scalar_got_bytes;
+        for r in &tls.gd {
+            tls_gd_addr.insert(*r, cur);
+            cur += 16; // DTPMOD64 + DTPOFF
+        }
+        if tls.ldm {
+            tls_ldm_addr = Some(cur);
+            cur += 16;
+        }
+        for r in &tls.ie {
+            tls_ie_addr.insert(*r, cur);
+            cur += 8;
+        }
+        if !tls.is_empty() {
+            tracing::debug!(
+                gd = tls.gd.len(),
+                ie = tls.ie.len(),
+                ldm = tls.ldm,
+                tls_got_base = format_args!("{:#x}", got_base + scalar_got_bytes),
+                tls_got_end = format_args!("{cur:#x}"),
+                "TLS GOT region laid out"
+            );
+        }
+    }
+
     // ── TLS layout: assign offsets within the static TLS block (.tdata, .tbss) ─
     let mut tls_offsets: FxHashMap<(usize, usize), u64> = FxHashMap::default();
     let mut tls_off = 0u64;
@@ -1550,8 +1666,10 @@ pub fn compute_layout(
         push_dyn(elf::DT_SYMTAB, va_of(SecSource::DynSym));
         push_dyn(elf::DT_STRSZ, dyn_blobs.dynstr.len() as u64);
         push_dyn(elf::DT_SYMENT, 24);
-        // RELA group covers GLOB_DAT (imports) + RELATIVE (PIE base) entries.
-        let total_rela = (n_glob_dat + dynj.n_relative) as u64 * elf::RELA_SIZE;
+        // RELA group covers GLOB_DAT (imports) + RELATIVE (ET_DYN base) + TLS
+        // (DTPMOD64/DTPOFF64/TPOFF64) entries. The exact assembled size is
+        // corrected post-layout by `append_dynamic_relocs`.
+        let total_rela = (n_glob_dat + dynj.n_relative + dynj.n_tls_reloc) as u64 * elf::RELA_SIZE;
         if total_rela > 0 {
             push_dyn(elf::DT_RELA, va_of(SecSource::RelaDyn));
             push_dyn(elf::DT_RELASZ, total_rela);
@@ -1938,6 +2056,11 @@ pub fn compute_layout(
         plt_base,
         tls_size,
         tls_offsets,
+        tls_gd_addr,
+        tls_ie_addr,
+        tls_ldm_addr,
+        shared: config.shared,
+        tls_got_writes: Vec::new(), // filled post-layout by the driver
     })
 }
 

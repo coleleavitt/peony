@@ -232,12 +232,20 @@ fn main() -> Result<()> {
     peony_reloc::assign_weak_got_ids(&objects, &mut symbols);
 
     tracing::info!("scanning relocations");
-    let scan = scan_relocations(&objects, &symbols);
+    let scan = scan_relocations(&objects, &symbols, args.shared);
     let got_syms = scan.got_symbols();
     let plt_syms = scan.plt_symbols();
+    let tls_got = peony_layout::TlsGotInfo {
+        gd: scan.tls_gd_refs(),
+        ie: scan.tls_ie_refs(),
+        ldm: scan.needs_tls_ldm(),
+    };
     tracing::info!(
         got_slots = got_syms.len(),
         plt_slots = plt_syms.len(),
+        tls_gd = tls_got.gd.len(),
+        tls_ie = tls_got.ie.len(),
+        tls_ldm = tls_got.ldm,
         "relocation scan complete"
     );
 
@@ -327,6 +335,14 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    // TLS dynamic relocations the TLS GOT will need (sizes `.rela.dyn`). A shared
+    // object needs GD/LD/IE relocs; an executable relaxes GD/LD to Local-Exec and
+    // fills IE slots statically, so it needs none.
+    let n_tls_reloc = if args.shared {
+        peony_reloc::count_tls_relocs(&objects, &symbols, &tls_got)
+    } else {
+        0
+    };
     // Dynamic sections are needed for any import, any PIE, or a shared object.
     let dynamic = (!imports.is_empty() || et_dyn).then(|| peony_layout::DynamicInfo {
         imports,
@@ -339,6 +355,7 @@ fn main() -> Result<()> {
         shared: args.shared,
         soname,
         exports,
+        n_tls_reloc,
     });
     if dynamic.is_some() {
         tracing::info!(
@@ -372,6 +389,7 @@ fn main() -> Result<()> {
         live.as_ref(),
         dynamic.as_ref(),
         &config,
+        &tls_got,
     )
     .context("layout computation failed")?;
     tracing::info!(
@@ -409,7 +427,26 @@ fn main() -> Result<()> {
                 "emitting R_X86_64_IRELATIVE relocations"
             );
         }
-        layout.append_dynamic_relocs(&relative, &irelative);
+        // TLS GOT contents: a shared object emits DTPMOD64/DTPOFF64/TPOFF64
+        // dynamic relocs (+ static DTPOFF in GD/LDM slot1); an executable writes
+        // its Initial-Exec slots statically (no relocs). Always run when there
+        // are TLS GOT slots so exe IE slots get filled.
+        let tls_dyn: Vec<(u64, u32, u32, i64)>;
+        if !tls_got.is_empty() {
+            let contents =
+                peony_reloc::collect_tls_got(&objects, &symbols, &layout, &tls_got, args.shared);
+            tracing::info!(
+                tls_relocs = contents.relocs.len(),
+                tls_static = contents.static_writes.len(),
+                shared = args.shared,
+                "emitting TLS GOT (GD/LD/IE)"
+            );
+            layout.tls_got_writes = contents.static_writes;
+            tls_dyn = contents.relocs;
+        } else {
+            tls_dyn = Vec::new();
+        }
+        layout.append_all_dynamic_relocs(&relative, &irelative, &tls_dyn);
     }
 
     emit_full(

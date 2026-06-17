@@ -1,5 +1,5 @@
 {
-  "next_id": 34,
+  "next_id": 40,
   "tasks": {
     "t16": {
       "id": "t16",
@@ -10,6 +10,18 @@
       "blockedBy": [],
       "created_at_ms": 1781456926459,
       "kind": "task"
+    },
+    "t35": {
+      "id": "t35",
+      "subject": "peony -shared: full GD/LD/IE TLS (parent)",
+      "description": "Full shared-object TLS in peony. In -shared mode do NOT relax TLSGD/TLSLD→LE; emit proper dynamic TLS. Parent task; see subtasks for GD, LD, IE, plumbing, and tests.",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781671864196,
+      "verification_command": "rustc --crate-type=cdylib /tmp/tls_so.rs -Clinker-flavor=ld -Clinker=/home/cole/RustProjects/active/peony/target/release/peony -Clink-self-contained=no -o /tmp/libtls_so.so && /tmp/tls_dltest /tmp/libtls_so.so",
+      "priority": 0,
+      "effort": "high"
     },
     "t23": {
       "id": "t23",
@@ -109,6 +121,42 @@
       "created_at_ms": 1781447272214,
       "kind": "task"
     },
+    "t39": {
+      "id": "t39",
+      "subject": "TLS Local-Dynamic in shared objects",
+      "description": "In -shared, handle R_X86_64_TLSLD without relaxation: point lea@tlsld at a single shared LDM GOT pair (DTPMOD64 + DTPOFF64=0), keep __tls_get_addr call. DTPOFF32 accesses (already supported) compute offset within the module's TLS block. Verify the LDM pair has exactly one DTPMOD64.",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781672152427,
+      "parent_id": "t35",
+      "priority": 1,
+      "effort": "high"
+    },
+    "t40": {
+      "id": "t40",
+      "subject": "TLS plumbing: shared flag + TLS GOT model in scan/layout/reloc",
+      "description": "Foundational plumbing for shared TLS. Add a `shared`/`output_kind` flag to ApplyCtx and the relocation scan so apply_reloc and scan_object branch on exe-vs-shared. Introduce a TLS GOT region: per-symbol GD pairs (DTPMOD64+DTPOFF64, 16 bytes), one LDM pair (DTPMOD64+0, 16 bytes), and IE slots (TPOFF64, 8 bytes). Extend SyntheticSlot + Layout to carry TLS GOT slot addresses (tls_gd_address per symbol, tls_ldm_base, tls_ie per symbol). Emit the corresponding dynamic relocations into .rela.dyn.",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781672152428,
+      "parent_id": "t35",
+      "priority": 0,
+      "effort": "high"
+    },
+    "t36": {
+      "id": "t36",
+      "subject": "TLS shared-object tests + self-host + jfc install",
+      "description": "Add peony integration tests: cdylib with thread_local!+destructor loads via dlopen and TLS read/write is correct; GD/LD/IE reloc shapes asserted via readelf. Verify rustc loads peony-linked proc-macros (serde_derive/thiserror/tracing). Verify peony self-hosts through the peony cargo config. Run cargo install --path crates/jfc and confirm jfc --version rc=0. Full cargo test --workspace + rocq clean.",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781672152426,
+      "parent_id": "t35",
+      "priority": 3,
+      "effort": "high"
+    },
     "t10": {
       "id": "t10",
       "subject": "Deep codebase analysis — Wild + raddebugger",
@@ -164,6 +212,18 @@
       "verification_command": "readelf --dyn-syms /tmp/libpmtest.so | grep -q ' add$'",
       "parent_id": "t29",
       "priority": 0,
+      "effort": "high"
+    },
+    "t37": {
+      "id": "t37",
+      "subject": "TLS Initial-Exec (GOTTPOFF) in shared objects",
+      "description": "In -shared, R_X86_64_GOTTPOFF must reference a GOT slot holding the TP offset, filled at load via R_X86_64_TPOFF64 dynamic reloc (not a static LE value, which is only valid in the main exe / IE-in-exe). Allocate the IE GOT slot, emit TPOFF64 dynamic reloc. Keep exe behaviour (static slot) unchanged.",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781672152427,
+      "parent_id": "t35",
+      "priority": 2,
       "effort": "high"
     },
     "t34": {
@@ -363,6 +423,18 @@
       "blockedBy": [],
       "created_at_ms": 1781456926459,
       "kind": "task"
+    },
+    "t38": {
+      "id": "t38",
+      "subject": "TLS General-Dynamic in shared objects",
+      "description": "In -shared, handle R_X86_64_TLSGD without relaxation: point the lea@tlsgd disp32 at the symbol's GD GOT pair (GOTPCREL-style), allocate the pair, emit R_X86_64_DTPMOD64 on slot 0 and write DTPOFF (st offset within module TLS block) into slot 1 (statically, since defined locally) or via R_X86_64_DTPOFF64 reloc for imported TLS. Keep the __tls_get_addr import + PLT. Verify against readelf: lea+call preserved, DTPMOD64 present.",
+      "status": "pending",
+      "blocks": [],
+      "blockedBy": [],
+      "created_at_ms": 1781672152427,
+      "parent_id": "t35",
+      "priority": 0,
+      "effort": "high"
     }
   }
 }

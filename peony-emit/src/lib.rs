@@ -127,6 +127,10 @@ pub fn emit_full(
     // Uses ws-deque's Chase-Lev work-stealing deque for load-balanced dispatch.
     write_section_data_parallel(&mut mmap, objects, symbols, layout, output_path)?;
 
+    // Shared-object TLS GOT static slots (DTPOFF in GD/LDM pair slot1) — written
+    // directly by VA→file-offset mapping through the `.got` section.
+    write_tls_got(&mut mmap, layout);
+
     // `.eh_frame_hdr` must be built from the RELOCATED `.eh_frame` bytes (the FDE
     // `PC begin` fields are set by R_X86_64_PC32 relocations applied above), so
     // it runs after section data + relocations are written.
@@ -161,6 +165,43 @@ pub fn emit_full(
 }
 
 // ── .eh_frame_hdr (built from the relocated .eh_frame) ───────────────────────
+
+/// Write the shared-object TLS GOT static slots (`layout.tls_got_writes`): each
+/// `(got_va, value)` is the DTPOFF in a locally-defined General-Dynamic pair's
+/// slot1 (or the Local-Dynamic pair's slot1 = 0), known at link time. Maps the
+/// VA to a file offset via the `.got` section, since these slots live in the TLS
+/// GOT region appended to `.got`.
+fn write_tls_got(buf: &mut [u8], layout: &Layout) {
+    if layout.tls_got_writes.is_empty() {
+        return;
+    }
+    let Some(got) = layout
+        .output_sections
+        .iter()
+        .find(|s| s.source == SecSource::Got)
+    else {
+        return;
+    };
+    let (lo, hi) = (got.sh_addr, got.sh_addr + got.sh_size);
+    for &(va, value) in &layout.tls_got_writes {
+        if va < lo || va + 8 > hi {
+            tracing::warn!(
+                va = format_args!("{va:#x}"),
+                "TLS GOT static write outside .got — skipping"
+            );
+            continue;
+        }
+        let file_off = (got.sh_offset + (va - got.sh_addr)) as usize;
+        if file_off + 8 <= buf.len() {
+            buf[file_off..file_off + 8].copy_from_slice(&value.to_le_bytes());
+            tracing::trace!(
+                va = format_args!("{va:#x}"),
+                value,
+                "TLS GOT static write (DTPOFF)"
+            );
+        }
+    }
+}
 
 /// Build `.eh_frame_hdr` from the already-relocated `.eh_frame` bytes in `buf`.
 ///
@@ -407,7 +448,11 @@ fn write_section_data_parallel(
     // Phase 2: Parallel input section copy + relocation apply.
     let buf_ptr = buf.as_mut_ptr() as usize;
     let buf_len = buf.len();
-    let ctx = ApplyCtx { symbols, layout };
+    let ctx = ApplyCtx {
+        symbols,
+        layout,
+        shared: layout.shared,
+    };
     let work_items = collect_input_work_items(layout);
     dispatch_parallel(work_items, objects, buf_ptr, buf_len, ctx, output_path)
 }
