@@ -8,16 +8,18 @@
 mod common;
 use common::*;
 
-/// Two byte-identical LOCAL functions, each in its own `.text.fN` section and
-/// referenced only by direct call, must fold to the same address under
-/// `--icf=all`, and the program must still compute the right answer.
+/// SOUNDNESS GATE: an object with NO `.llvm_addrsig` table (e.g. hand-written
+/// asm, rustc output) must NOT have its sections folded — peony has no proof any
+/// symbol is address-insignificant, so `--icf=all` is a safe no-op and the
+/// program runs unchanged. (Folding without that proof silently corrupted real
+/// programs; the fold mechanism itself is exercised by the synthetic-addrsig
+/// unit tests in `peony-layout::icf`.)
 #[test]
-fn icf_folds_identical_local_functions() {
-    let dir = workdir("icf_fold");
+fn icf_is_sound_noop_without_addrsig() {
+    let dir = workdir("icf_sound");
 
-    // `dup_a`/`dup_b`: identical bodies (return 0x2a). `main` calls both and
-    // exits with their sum/2 so a fold that corrupts one would change the exit.
-    // All three live in distinct sections so GC/ICF operate at section grain.
+    // Two byte-identical local functions, only directly called. Without an
+    // addrsig table peony must keep them distinct; the program must still run.
     let obj = assemble(
         &dir,
         "icf",
@@ -51,22 +53,18 @@ fn icf_folds_identical_local_functions() {
     );
 
     let out = dir.join("icf.out");
+    // Linking with and without --icf must both succeed and run correctly.
     link(&out, std::slice::from_ref(&obj), &["--icf=all"]);
-    assert_eq!(run(&out), 0, "ICF-folded program must run correctly");
+    assert_eq!(run(&out), 0, "ICF must be a sound no-op without addrsig");
 
-    // dup_a and dup_b should resolve to the SAME address (folded). Read the
-    // symbol table of the output.
-    let syms = readelf(&out, &["-s"]);
-    let addr_of = |name: &str| -> Option<String> {
-        syms.lines()
-            .find(|l| l.split_whitespace().last() == Some(name))
-            .and_then(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
-    };
-    if let (Some(a), Some(b)) = (addr_of("dup_a"), addr_of("dup_b")) {
-        assert_eq!(a, b, "ICF must fold dup_a and dup_b to one address");
-    }
-    // (If the assembler emitted no local symbol-table entries, the run check
-    // above is still the load-bearing correctness gate.)
+    let out2 = dir.join("icf_ref.out");
+    link(&out2, std::slice::from_ref(&obj), &[]);
+    // Output must be byte-identical to a non-ICF link (nothing was folded).
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "without addrsig, --icf must produce byte-identical output to no --icf"
+    );
 }
 
 /// Without `--icf`, the same inputs link normally and the program runs — ICF is

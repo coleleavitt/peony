@@ -49,8 +49,16 @@ fn reloc_takes_address(r_type: u32) -> bool {
     !matches!(r_type, 0 | 2 | 4)
 }
 
-/// The address-significance information inferred from how symbols/sections are
-/// referenced (the sound substitute for a compiler `.llvm_addrsig` table).
+/// SHT_LLVM_ADDRSIG — the compiler's explicit list of address-significant
+/// symbols. ICF is sound ONLY for symbols the compiler proves are NOT
+/// address-significant, which is exactly "has an `.llvm_addrsig` section AND the
+/// symbol is not listed in it." Inferring this from relocations is unsound
+/// (rustc references foldable functions through section+addend and runtime-built
+/// tables that a static scan cannot see — folding ripgrep's flag handlers that
+/// way silently corrupted its output), so we REQUIRE the addrsig table.
+const SHT_LLVM_ADDRSIG: u32 = 0x6fff_4c03;
+
+/// The address-significance information.
 #[derive(Default)]
 struct AddrTaint {
     /// Symbol NAMES whose address is taken via a named-symbol relocation.
@@ -61,6 +69,31 @@ struct AddrTaint {
     /// functions this way, so a name-only scan misses them — we must exclude the
     /// whole referenced section.
     by_section: rustc_hash::FxHashSet<(usize, usize)>,
+    /// Object ids that carry an `.llvm_addrsig` section. A section is ONLY ever
+    /// folded if its object is in this set (otherwise we have no proof any
+    /// symbol is address-insignificant, so we fold nothing — sound).
+    objects_with_addrsig: rustc_hash::FxHashSet<usize>,
+    /// (object_id, symbol-position) explicitly marked address-significant by an
+    /// `.llvm_addrsig` table.
+    addrsig_syms: rustc_hash::FxHashSet<(usize, usize)>,
+}
+
+/// Decode an unsigned LEB128 from `data` at `*pos`, advancing `*pos`.
+fn read_uleb128(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *data.get(*pos)?;
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
 }
 
 /// Build the address-taint set: every symbol/section whose address is taken by a
@@ -75,8 +108,28 @@ fn address_taint(objects: &[InputObject]) -> AddrTaint {
                 taint_one_reloc(&mut t, obj, obj_id, r);
             }
         }
+        parse_addrsig(&mut t, obj, obj_id);
     }
     t
+}
+
+/// Parse this object's `.llvm_addrsig` section (if present): record that the
+/// object HAS the table, and which of its symbols are address-significant. The
+/// table is a sequence of ULEB128 ELF symbol-table indices.
+fn parse_addrsig(t: &mut AddrTaint, obj: &InputObject, obj_id: usize) {
+    let Some(sec) = obj.sections.iter().find(|s| s.sh_type == SHT_LLVM_ADDRSIG) else {
+        return;
+    };
+    t.objects_with_addrsig.insert(obj_id);
+    let mut pos = 0usize;
+    while pos < sec.data.len() {
+        let Some(sym_idx) = read_uleb128(&sec.data, &mut pos) else {
+            break;
+        };
+        if let Some(&sym_pos) = obj.symbol_map.get(&(sym_idx as usize)) {
+            t.addrsig_syms.insert((obj_id, sym_pos));
+        }
+    }
 }
 
 /// Record the address-taint contribution of a single relocation.
@@ -121,18 +174,30 @@ fn defines_address_significant(
     let Some(sec) = obj.sections.get(sec_pos) else {
         return true;
     };
+    // HARD REQUIREMENT: only fold sections from objects that carry an
+    // `.llvm_addrsig` table. Without it we have no sound proof that any symbol is
+    // address-INsignificant (relocation inference is unsound — see the module
+    // header), so we decline to fold. This makes ICF a safe no-op on rustc output
+    // (no addrsig) while still folding clang/LLVM `-faddrsig` C/C++.
+    if !taint.objects_with_addrsig.contains(&obj_id) {
+        return true;
+    }
     let sidx = sec.index.0;
     // The section itself is the target of a section-relative address-taking
     // reloc (Rust vtable / function-pointer table pointing `section + addend`).
     if taint.by_section.contains(&(obj_id, sidx)) {
         return true;
     }
-    for sym in &obj.symbols {
+    for (sym_pos, sym) in obj.symbols.iter().enumerate() {
         if sym.section.map(|s| s.0) != Some(sidx) {
             continue;
         }
         if sym.is_undefined {
             continue;
+        }
+        // The compiler explicitly marked this symbol address-significant.
+        if taint.addrsig_syms.contains(&(obj_id, sym_pos)) {
+            return true;
         }
         // Nameless section symbols (STT_SECTION) don't constitute an
         // address-significant *function* identity; ignore them here.
@@ -279,7 +344,46 @@ mod tests {
         }
     }
 
+    /// An `.llvm_addrsig` section whose body is the ULEB128 list of the given raw
+    /// symbol indices (the address-significant ones). Empty list = the object
+    /// opts into ICF with nothing address-significant.
+    fn addrsig_section(index: usize, sig_sym_indices: &[u64]) -> InputSection {
+        let mut data = Vec::new();
+        for &i in sig_sym_indices {
+            // single-byte ULEB128 is enough for small test indices
+            assert!(i < 0x80);
+            data.push(i as u8);
+        }
+        InputSection {
+            index: SectionIndex(index),
+            name: b".llvm_addrsig".to_vec(),
+            kind: SectionKind::Other,
+            sh_type: super::SHT_LLVM_ADDRSIG,
+            size: data.len() as u64,
+            data,
+            align: 1,
+            flags: 0,
+            relocs: Vec::new(),
+        }
+    }
+
+    /// Build an object that OPTS INTO ICF (carries an empty `.llvm_addrsig`).
     fn obj(path: &str, sections: Vec<InputSection>, symbols: Vec<InputSymbol>) -> InputObject {
+        obj_addrsig(path, sections, symbols, Some(&[]))
+    }
+
+    /// Build an object; `addrsig` is `Some(significant indices)` to include an
+    /// `.llvm_addrsig` table, or `None` to omit it entirely (ICF must decline).
+    fn obj_addrsig(
+        path: &str,
+        mut sections: Vec<InputSection>,
+        symbols: Vec<InputSymbol>,
+        addrsig: Option<&[u64]>,
+    ) -> InputObject {
+        if let Some(sig) = addrsig {
+            let idx = sections.iter().map(|s| s.index.0).max().unwrap_or(0) + 1;
+            sections.push(addrsig_section(idx, sig));
+        }
         let mut section_map = FxHashMap::default();
         for (pos, s) in sections.iter().enumerate() {
             section_map.insert(s.index.0, pos);
@@ -357,5 +461,53 @@ mod tests {
             vec![local_sym(b"_ZTV1B", 1)],
         );
         assert!(compute_fold_map(&[o0, o1]).is_empty());
+    }
+
+    #[test]
+    fn does_not_fold_without_addrsig_table() {
+        // Objects with NO `.llvm_addrsig` section must never fold — we have no
+        // proof any symbol is address-insignificant. This is what makes ICF a
+        // safe no-op on rustc output (which omits the table).
+        let o0 = obj_addrsig(
+            "a.o",
+            vec![text_section(1, &[0xc3, 0x90])],
+            vec![local_sym(b"f", 1)],
+            None,
+        );
+        let o1 = obj_addrsig(
+            "b.o",
+            vec![text_section(1, &[0xc3, 0x90])],
+            vec![local_sym(b"g", 1)],
+            None,
+        );
+        assert!(
+            compute_fold_map(&[o0, o1]).is_empty(),
+            "no .llvm_addrsig ⇒ ICF must decline to fold"
+        );
+    }
+
+    #[test]
+    fn does_not_fold_addrsig_listed_symbol() {
+        // The symbol at raw index 0 is marked address-significant by the table.
+        let mut s0 = local_sym(b"f", 1);
+        s0.index = SymbolIndex(0);
+        let mut s1 = local_sym(b"g", 1);
+        s1.index = SymbolIndex(0);
+        let o0 = obj_addrsig(
+            "a.o",
+            vec![text_section(1, &[0xc3, 0x90])],
+            vec![s0],
+            Some(&[0]),
+        );
+        let o1 = obj_addrsig(
+            "b.o",
+            vec![text_section(1, &[0xc3, 0x90])],
+            vec![s1],
+            Some(&[0]),
+        );
+        assert!(
+            compute_fold_map(&[o0, o1]).is_empty(),
+            "addrsig-listed symbol's section must not fold"
+        );
     }
 }
