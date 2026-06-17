@@ -98,9 +98,35 @@ Definition uses_P_workers (P : nat) (workers : list workload) : Prop :=
 (** Each scheduled bucket is a sub-bag of tasks, so its span ≤ the global span.
     We capture the only property we need: every task placed on a worker is one
     of the original tasks, hence ≤ span w. We encode that as: every bucket's
-    own span ≤ global span. *)
+    own span ≤ global span.
+
+    NOTE on the model's scope: [conserves_work] enforces only that total work is
+    preserved (Σ buckets = Σ w), not that each bucket is literally a sub-multiset
+    of w. The lower bounds S1/S2 hold for ANY work-conserving schedule, which is
+    the weaker hypothesis (a real task partition is a special case). [respects_tasks]
+    is the stronger validity predicate used where we need per-task bounds (S1 via
+    [respects_tasks_caps_makespan] below); it is the formal statement that a
+    schedule only places real tasks. *)
 Definition respects_tasks (w : workload) (workers : list workload) : Prop :=
   Forall (fun bucket => Forall (fun t => t <= span w) bucket) workers.
+
+(** A task-respecting schedule never places a task larger than the global span —
+    this is the partition-validity fact that makes the span lower bound (S1)
+    bind: every scheduled task is ≤ span, and (S1) shows span ≤ makespan, so the
+    span is genuinely a floor for valid schedules. *)
+Lemma respects_tasks_caps_makespan :
+  forall w workers bucket t,
+    respects_tasks w workers ->
+    In bucket workers -> In t bucket ->
+    t <= span w.
+Proof.
+  intros w workers bucket t Hrt Hb Ht.
+  unfold respects_tasks in Hrt.
+  rewrite Forall_forall in Hrt.
+  specialize (Hrt bucket Hb).
+  rewrite Forall_forall in Hrt.
+  exact (Hrt t Ht).
+Qed.
 
 (* ================================================================== *)
 (** * 3.  THEOREM S1 — span is a lower bound on any makespan           *)

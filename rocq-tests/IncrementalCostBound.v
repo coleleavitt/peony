@@ -266,9 +266,9 @@ Proof.
   assert (Hneq : s_content s <> s_content s').
   { subst s s'. simpl. intro H. inversion H. }
   assert (Hpre_len : length pre = n)
-    by (subst pre; rewrite length_map, seq_length; reflexivity).
+    by (subst pre; rewrite length_map, length_seq; reflexivity).
   assert (Hpost_len : length post = n)
-    by (subst post; rewrite length_map, seq_length; reflexivity).
+    by (subst post; rewrite length_map, length_seq; reflexivity).
   repeat split.
   - rewrite length_app, Hpost_len. simpl. lia.
   - apply single_edit_cost_is_one; assumption.

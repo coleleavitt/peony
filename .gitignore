@@ -23,3 +23,5 @@ core.*
 # benchmark corpora inputs (large, reproducible via bench/capture.sh) + generated results
 bench/corpora/*/inputs/
 bench/results/
+rust_out
+

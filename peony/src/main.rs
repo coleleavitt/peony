@@ -194,7 +194,11 @@ fn parse_args() -> Result<Args> {
             "-soname" | "-h" | "--soname" => a.soname = Some(take(&argv, &mut i, arg)?),
             "--version-script" => a.version_script = Some(PathBuf::from(take(&argv, &mut i, arg)?)),
             _ if IGNORE_WITH_VALUE.contains(&arg) => {
-                let _ = take(&argv, &mut i, arg); // consume and ignore the value
+                // A recognised-but-ignored flag that carries a value (e.g.
+                // `--hash-style gnu`): skip its value argument. A missing value
+                // at end-of-argv is harmless here — there is simply nothing to
+                // skip — so we advance the index directly rather than erroring.
+                i += 1;
             }
             _ if arg.starts_with("--entry=") => {
                 a.entry = arg[8..].to_string();

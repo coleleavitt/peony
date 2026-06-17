@@ -22,9 +22,12 @@
               comparison iff a folded function is address-significant.
     THEOREM I3 (soundness): if no folded function is address-significant, the
               folded program is observationally equivalent to the original.
-    THEOREM I4 (partition refinement is a fixpoint): the ICF equivalence is the
-              greatest fixpoint of the content-refinement operator (bisimulation),
-              matching Hopcroft partition refinement.
+    THEOREM I4 (partition-refinement soundness): the ICF equivalence REFINES
+              content-equality — any two functions folded together are
+              content-equal (icf_rel_refines_content) — so a Hopcroft-style
+              refinement that only splits classes yields a sound, never-wrongly-
+              merging ICF partition. (We prove the refinement direction only; we
+              do NOT claim the converse / greatest-fixpoint maximality.)
 
     Compiles clean under Rocq/Coq 9.1.0.
 *)
