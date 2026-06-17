@@ -995,6 +995,18 @@ pub fn apply_reloc(
         return Ok(());
     }
 
+    // Resolve the global symbol's record ONCE (a name-keyed hash lookup) and
+    // reuse it for the address/GOT/PLT, the TLS offset, and the TLS-GOT keying
+    // below. apply_reloc runs per relocation, and this `sym` is the same across
+    // all three uses, so hashing the mangled name once instead of up to 3× is a
+    // free, local win (no behaviour change — guarded by the byte-identical
+    // determinism tests). Locals never enter the global table.
+    let res = if sym.binding == Binding::Local {
+        None
+    } else {
+        ctx.symbols.lookup(&sym.name)
+    };
+
     // Resolve the symbol's address (S), GOT slot (G), PLT (L), size (Z).
     let (s, g, l, z) = if sym.binding == Binding::Local {
         let s = match sym.section {
@@ -1006,7 +1018,7 @@ pub fn apply_reloc(
         };
         (s, 0, 0, sym.size)
     } else {
-        match ctx.symbols.lookup(&sym.name) {
+        match res {
             Some(r) if r.is_defined() => (r.virtual_address, r.got_address, r.plt_address, r.size),
             // Weak-undefined: address resolves to 0, but a GOT reference still
             // uses the symbol's allocated GOT slot (which holds 0). Passing the
@@ -1030,7 +1042,7 @@ pub fn apply_reloc(
                 .and_then(|si| ctx.layout.tls_offset(obj_id, si.0))
                 .map(|b| b + sym.value)
         } else {
-            ctx.symbols.lookup(&sym.name).and_then(|r| {
+            res.and_then(|r| {
                 let def = r.defined_in?;
                 r.section_index
                     .and_then(|si| ctx.layout.tls_offset(def.0 as usize, si))
@@ -1049,7 +1061,7 @@ pub fn apply_reloc(
         let sym_pos = obj.symbol_map.get(&reloc.symbol.0).copied();
         let tref = match sym_pos {
             Some(pos) if sym.binding == Binding::Local => Some(TlsRef::Local(obj_id, pos)),
-            Some(pos) => match ctx.symbols.lookup(&sym.name) {
+            Some(pos) => match res {
                 Some(r) => Some(TlsRef::Global(r.id)),
                 None => Some(TlsRef::Local(obj_id, pos)),
             },
