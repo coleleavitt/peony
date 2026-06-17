@@ -396,6 +396,7 @@ fn write_section_data_parallel(
             }
             // `.eh_frame_hdr` is filled by `write_eh_frame_hdr` after relocations.
             SecSource::EhFrameHdr => {}
+            SecSource::GnuHash => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.gnu_hash),
             SecSource::Dynamic => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.dynamic),
             SecSource::Plt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.plt),
             SecSource::GotPlt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.got_plt),

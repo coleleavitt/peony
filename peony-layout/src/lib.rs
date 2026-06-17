@@ -97,6 +97,8 @@ pub enum SecSource {
     GnuVersionR,
     /// `.eh_frame_hdr` — sorted FDE binary-search table (PT_GNU_EH_FRAME).
     EhFrameHdr,
+    /// `.gnu.hash` — GNU-style dynamic symbol hash table (DT_GNU_HASH).
+    GnuHash,
 }
 
 /// Inputs needed to lay out a dynamic executable.
@@ -146,6 +148,8 @@ pub struct DynBlobs {
     pub rela_glob_dat: Vec<u8>,
     /// `.eh_frame_hdr` bytes, built post-layout by `Layout::build_eh_frame_hdr`.
     pub eh_frame_hdr: Vec<u8>,
+    /// `.gnu.hash` GNU-style dynamic symbol hash table.
+    pub gnu_hash: Vec<u8>,
 }
 
 /// A merged output section with a full section-header plan.
@@ -601,9 +605,26 @@ pub fn compute_layout(
         for _ in 0..nchain {
             hash.extend_from_slice(&0u32.to_le_bytes()); // chain[]
         }
+
+        // GNU hash table. The executable's `.dynsym` contains only undefined
+        // imports (no exported definitions), so the hashable range is empty:
+        //   nbuckets=1, symoffset=nsyms (all symbols are below symoffset and
+        //   thus excluded from the hash), bloom_size=1 (one all-zero word),
+        //   bloom_shift=0. bucket[0]=0 (no chain). This is the minimal valid
+        //   GNU hash glibc accepts; ld.so prefers DT_GNU_HASH when present.
+        let nsyms = (dynj.imports.len() + 1) as u32; // incl. null symbol
+        let mut gnu_hash = Vec::new();
+        gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // nbuckets
+        gnu_hash.extend_from_slice(&nsyms.to_le_bytes()); // symoffset (all excluded)
+        gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // bloom_size (words)
+        gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bloom_shift
+        gnu_hash.extend_from_slice(&0u64.to_le_bytes()); // bloom[0] = 0 (matches nothing)
+        gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bucket[0] = 0 (empty)
+
         dyn_blobs.dynstr = dynstr;
         dyn_blobs.dynsym = dynsym;
         dyn_blobs.hash = hash;
+        dyn_blobs.gnu_hash = gnu_hash;
         dyn_blobs.interp = elf::DEFAULT_INTERP.to_vec();
         // Only attach versym/verneed when there is something to version.
         if verneed_num > 0 {
@@ -812,6 +833,12 @@ pub fn compute_layout(
                 dyn_blobs.interp.len() as u64,
             ),
             (".hash", elf::SHT_HASH, 8, dyn_blobs.hash.len() as u64),
+            (
+                ".gnu.hash",
+                elf::SHT_GNU_HASH,
+                8,
+                dyn_blobs.gnu_hash.len() as u64,
+            ),
             (".dynsym", elf::SHT_DYNSYM, 8, dyn_blobs.dynsym.len() as u64),
             (".dynstr", elf::SHT_STRTAB, 1, dyn_blobs.dynstr.len() as u64),
             (
@@ -908,6 +935,7 @@ pub fn compute_layout(
         let n_fini = rx.iter().filter(|b| b.name == ".fini").count();
         dyn_entries = dynj.needed.len()
             + 5                                  // HASH,STRTAB,SYMTAB,STRSZ,SYMENT
+            + 1                                  // DT_GNU_HASH
             + if has_rela { 3 } else { 0 }       // DT_RELA, DT_RELASZ, DT_RELAENT
             + if dynj.n_relative > 0 { 1 } else { 0 } // DT_RELACOUNT
             + if n_plt > 0 { 4 } else { 0 }      // PLTGOT,PLTRELSZ,PLTREL,JMPREL
@@ -1138,7 +1166,7 @@ pub fn compute_layout(
                     s.sh_link = dynstr_shndx;
                     s.sh_info = 1; // first global dynsym index
                 }
-                SecSource::Hash | SecSource::RelaDyn | SecSource::RelaPlt => {
+                SecSource::Hash | SecSource::GnuHash | SecSource::RelaDyn | SecSource::RelaPlt => {
                     s.sh_link = dynsym_shndx
                 }
                 SecSource::Dynamic => s.sh_link = dynstr_shndx,
@@ -1311,6 +1339,7 @@ pub fn compute_layout(
             push_dyn(elf::DT_NEEDED, off as u64);
         }
         push_dyn(elf::DT_HASH, va_of(SecSource::Hash));
+        push_dyn(elf::DT_GNU_HASH, va_of(SecSource::GnuHash));
         push_dyn(elf::DT_STRTAB, va_of(SecSource::DynStr));
         push_dyn(elf::DT_SYMTAB, va_of(SecSource::DynSym));
         push_dyn(elf::DT_STRSZ, dyn_blobs.dynstr.len() as u64);
@@ -1949,6 +1978,7 @@ fn place(
                 ".note.gnu.build-id" => SecSource::NoteBuildId,
                 ".interp" => SecSource::Interp,
                 ".hash" => SecSource::Hash,
+                ".gnu.hash" => SecSource::GnuHash,
                 ".dynsym" => SecSource::DynSym,
                 ".dynstr" => SecSource::DynStr,
                 ".rela.dyn" => SecSource::RelaDyn,
