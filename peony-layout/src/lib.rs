@@ -763,6 +763,8 @@ pub fn compute_layout(
         // come before globals; imports are UND globals, exports are defined
         // globals — both are non-local, so `sh_info` = 1 (first global = index 1).
         let mut dynsym = vec![0u8; 24]; // null symbol
+        // `(dynsym_index, name)` of each copy-reloc import, for hashing below.
+        let mut copy_import_indices: Vec<(u32, Vec<u8>)> = Vec::new();
         for (i, &off) in import_name_off.iter().enumerate() {
             let name = &dynj.imports[i];
             let res = symbols.lookup(name);
@@ -775,6 +777,9 @@ pub fn compute_layout(
                     e[16..24].copy_from_slice(&r.size.to_le_bytes());
                     copy_patch.push((r.id, dynsym.len()));
                 }
+                // Copy-reloc imports become executable-defined symbols and MUST
+                // be indexed in `.hash`/`.gnu.hash` (dynsym index = i + 1).
+                copy_import_indices.push(((i + 1) as u32, name.clone()));
             }
             // st_other = 0, st_shndx/st_value are 0 for normal undefined imports.
             dynsym.extend_from_slice(&e);
@@ -893,14 +898,31 @@ pub fn compute_layout(
 
         // SysV `.hash` (DT_HASH). The chain is parallel-indexed with `.dynsym`
         // (nchain == total dynsym entries, incl. the null symbol). Exported
-        // defined symbols are inserted so `dlsym` can find them; imports (UND)
-        // are not looked up *in this object*, so they stay out of the buckets.
-        // `.dynsym` index of export i = 1 + imports + i.
+        // defined symbols are inserted so `dlsym` can find them; plain imports
+        // (UND) are not looked up *in this object*, so they stay out of the
+        // buckets. `.dynsym` index of export i = 1 + imports + i.
+        //
+        // COPY-relocated imports are the exception: a symbol like `_ZSt4cout`
+        // lives in the executable's BSS (copy-reloc storage), and the providing
+        // library (libstdc++) must bind ITS references to the executable's copy
+        // for the single-instance semantics C++ globals require. The dynamic
+        // loader only finds the executable's copy if the symbol is INDEXED in
+        // the executable's hash table — so copy-reloc imports must be hashed,
+        // even though they occupy import-range `.dynsym` slots. Omitting them
+        // makes libstdc++ bind cout to its own uninitialised copy → NULL vtable
+        // → crash in `std::ostream::sentry`.
+        let n_hashed = dynj.exports.len() + copy_import_indices.len();
         let total_dynsym = 1 + dynj.imports.len() + dynj.exports.len();
-        let nbucket = (dynj.exports.len().max(1)) as u32; // ≥1 (avoid div-by-zero)
+        let nbucket = (n_hashed.max(1)) as u32; // ≥1 (avoid div-by-zero)
         let mut buckets = vec![0u32; nbucket as usize];
         let mut chain = vec![0u32; total_dynsym];
         let import_base = 1 + dynj.imports.len();
+        // Hash the copy-reloc imports at their import-range dynsym indices.
+        for &(sym_idx, ref name) in &copy_import_indices {
+            let h = elf_sysv_hash(name) % nbucket;
+            chain[sym_idx as usize] = buckets[h as usize];
+            buckets[h as usize] = sym_idx;
+        }
         for (i, ex) in dynj.exports.iter().enumerate() {
             let sym_idx = (import_base + i) as u32;
             let h = elf_sysv_hash(&ex.name) % nbucket;
@@ -929,9 +951,15 @@ pub fn compute_layout(
         // stub would make `dlsym` silently fail. We therefore only build (and
         // later tag) `.gnu.hash` when there are no exports; `.hash` (DT_HASH)
         // covers the export case fully (glibc falls back to it).
+        // Only emit the stub `.gnu.hash` when there is genuinely nothing to look
+        // up in this object: no exports AND no copy-reloc imports. If a copy-reloc
+        // symbol exists (it is hashed into `.hash` above so libstdc++ binds to the
+        // executable's copy), a stub `.gnu.hash` would be PREFERRED by glibc and
+        // would find nothing — breaking the interposition. In that case omit
+        // `.gnu.hash` entirely so glibc falls back to the populated DT_HASH.
         let nsyms = (dynj.imports.len() + 1) as u32; // incl. null symbol
         let mut gnu_hash = Vec::new();
-        if dynj.exports.is_empty() {
+        if dynj.exports.is_empty() && copy_import_indices.is_empty() {
             gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // nbuckets
             gnu_hash.extend_from_slice(&nsyms.to_le_bytes()); // symoffset (all excluded)
             gnu_hash.extend_from_slice(&1u32.to_le_bytes()); // bloom_size (words)
