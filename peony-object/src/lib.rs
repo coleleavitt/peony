@@ -24,7 +24,10 @@ use std::path::Path;
 
 use memmap2::Mmap;
 use object::read::elf::{ElfFile64, SectionHeader};
-use object::{Endianness, Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolIndex};
+use object::{Endianness, Object, ObjectSection, ObjectSymbol};
+// Re-export the index newtypes so downstream crates (and their tests) can name
+// the types of `InputSection::index` / `InputSymbol::section` / `InputReloc::symbol`.
+pub use object::{SectionIndex, SymbolIndex};
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 

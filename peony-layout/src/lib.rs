@@ -28,6 +28,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 use ws_deque::{Steal, Worker};
 
+pub mod icf;
+
 // ── S3-GC grain size constant (SPEC §9) ─────────────────────────────────────
 // Minimum frontier-section count per worker before the GC BFS fans out across
 // ws-deque threads. Set high: spawning a thread scope and idle-spinning on
@@ -727,6 +729,27 @@ pub fn compute_layout(
     config: &LayoutConfig,
     tls: &TlsGotInfo,
 ) -> Result<Layout> {
+    compute_layout_icf(
+        objects, symbols, got_syms, plt_syms, live, dynamic, config, tls, None,
+    )
+}
+
+/// As [`compute_layout`], but with an optional ICF fold map: folded (duplicate)
+/// input sections are excluded from emission and their addresses are aliased to
+/// the canonical section's, so every reference to a folded section resolves to
+/// the surviving copy.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_layout_icf(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    got_syms: &[SymbolId],
+    plt_syms: &[SymbolId],
+    live: Option<&FxHashSet<(usize, usize)>>,
+    dynamic: Option<&DynamicInfo>,
+    config: &LayoutConfig,
+    tls: &TlsGotInfo,
+    fold_map: Option<&icf::FoldMap>,
+) -> Result<Layout> {
     let page = config.page_size.max(1);
     let base = config.base_address;
 
@@ -1033,6 +1056,13 @@ pub fn compute_layout(
             // --gc-sections: skip sections not reachable from the roots.
             if let Some(live) = live {
                 if !live.contains(&(obj_idx, sec.index.0)) {
+                    continue;
+                }
+            }
+            // --icf: a folded duplicate contributes no bytes; its references are
+            // redirected to the canonical section after addresses are assigned.
+            if let Some(fm) = fold_map {
+                if fm.contains_key(&(obj_idx, sec.index.0)) {
                     continue;
                 }
             }
@@ -1528,6 +1558,23 @@ pub fn compute_layout(
             &mut sec_to_out,
         );
         rw_seg = Some((start, file_end, va));
+    }
+
+    // --icf address aliasing: a folded duplicate emitted no bytes, but symbols
+    // and relocations still reference it by (object, section). Point each
+    // duplicate at its canonical section's base address; because the duplicate is
+    // byte-identical, a symbol at offset N in the duplicate has the same meaning
+    // as offset N in the canonical, so `canonical_base + N` is correct. The
+    // duplicate also shares the canonical's output-section index (for st_shndx).
+    if let Some(fm) = fold_map {
+        for (&dup, &canon) in fm {
+            if let Some(&canon_va) = addresses.get(&canon) {
+                addresses.insert(dup, canon_va);
+            }
+            if let Some(&canon_out) = sec_to_out.get(&canon) {
+                sec_to_out.insert(dup, canon_out);
+            }
+        }
     }
 
     // End of file-backed allocatable content (excludes .bss).

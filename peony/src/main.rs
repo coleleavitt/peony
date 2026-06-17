@@ -39,7 +39,6 @@ use peony_layout::{
     ScriptLayout,
     ScriptOutputSection,
     check_undefined,
-    compute_layout,
     finalize_symbols,
 };
 use peony_object::{Binding, InputObject, iter_archive_members, parse_bytes, parse_object};
@@ -69,6 +68,7 @@ struct Args {
     entry: String,
     entry_explicit: bool,
     gc_sections: bool,
+    icf: bool,
     defsym: Vec<String>,
     linker_scripts: Vec<PathBuf>,
     plugin: Option<PathBuf>,
@@ -103,6 +103,7 @@ impl Default for Args {
             entry: "_start".to_string(),
             entry_explicit: false,
             gc_sections: false,
+            icf: false,
             defsym: Vec::new(),
             linker_scripts: Vec::new(),
             plugin: None,
@@ -176,6 +177,9 @@ fn parse_args() -> Result<Args> {
             }
             "--gc-sections" => a.gc_sections = true,
             "--no-gc-sections" => a.gc_sections = false,
+            // Identical Code Folding. `=all`/`=safe` accepted; `=none` disables.
+            "--icf=all" | "--icf=safe" | "--icf" => a.icf = true,
+            "--icf=none" | "--no-icf" => a.icf = false,
             "--build-id" => a.build_id = true,
             "--incremental" => a.incremental = true,
             "-s" | "--strip-all" => {
@@ -526,7 +530,17 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     tracing::info!("computing layout");
-    let mut layout = compute_layout(
+    // --icf: fold byte+reloc-identical, non-address-significant .text sections.
+    let fold_map = if args.icf {
+        let fm = peony_layout::icf::compute_fold_map(&objects);
+        if !fm.is_empty() {
+            tracing::info!(folded = fm.len(), "ICF: folded identical sections");
+        }
+        Some(fm)
+    } else {
+        None
+    };
+    let mut layout = peony_layout::compute_layout_icf(
         &objects,
         &symbols,
         &got_syms,
@@ -535,6 +549,7 @@ fn main() -> Result<()> {
         dynamic.as_ref(),
         &config,
         &tls_got,
+        fold_map.as_ref(),
     )
     .context("layout computation failed")?;
     tracing::info!(
