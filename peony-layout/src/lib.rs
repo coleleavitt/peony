@@ -1535,12 +1535,40 @@ pub fn compute_layout_icf(
     }
 
     // RW segment: progbits (file-backed) then nobits (.bss).
-    // TLS contiguity: the static TLS template requires `.tdata` immediately
-    // followed by `.tbss`. Make `.tdata` the LAST file-backed RW section and
-    // `.tbss` the FIRST nobits section so they abut across the progbits→nobits
-    // boundary, placing `.tbss`'s address inside the PT_TLS range. This runs
-    // after all synthetic RW sections (`.got`, `.dynamic`, …) have been added.
-    rw_pb.sort_by_key(|b| b.kind == SectionKind::Tdata); // false<true ⇒ .tdata last
+    //
+    // CRITICAL: RELRO sections must come FIRST in the RW segment. glibc's
+    // _dl_protect_relro does `mprotect(ALIGN_DOWN(relro_start), …, PROT_READ)`,
+    // rounding down to page boundary. If non-RELRO sections (like `.data`)
+    // precede RELRO sections, the round-down bleeds into `.data`'s last page,
+    // making writable data read-only and causing SIGSEGV on first write (e.g.
+    // std::sync::Once in a proc-macro dylib). Real linkers (ld, gold, lld, mold)
+    // place RELRO at segment start, then pad to page before non-RELRO data.
+    //
+    // Order: RELRO (.dynamic, .got, .got.plt, .init_array, .fini_array,
+    // .data.rel.ro) → page pad → non-RELRO (.data, .bss) → .tdata (last progbits)
+    // → .tbss (first nobits) for TLS contiguity.
+    const RELRO_SECTIONS: &[&str] = &[
+        ".data.rel.ro",
+        ".dynamic",
+        ".fini_array",
+        ".got",
+        ".got.plt",
+        ".init_array",
+    ];
+    let is_relro = |name: &str| RELRO_SECTIONS.contains(&name);
+
+    // Sort: RELRO first (false < true for non-relro), then by name, then .tdata last.
+    rw_pb.sort_by(|a, b| {
+        let a_relro = is_relro(&a.name);
+        let b_relro = is_relro(&b.name);
+        // RELRO sections come first (true > false, so invert: !relro as key)
+        (!a_relro)
+            .cmp(&(!b_relro))
+            // Within each group, alphabetical
+            .then_with(|| a.name.cmp(&b.name))
+            // .tdata must be last in progbits (for TLS contiguity with .tbss)
+            .then_with(|| (a.kind == SectionKind::Tdata).cmp(&(b.kind == SectionKind::Tdata)))
+    });
     rw_bss.sort_by_key(|b| b.kind != SectionKind::Tbss); // false<true ⇒ .tbss first
 
     // The static TLS block's base (the first TLS section, `.tdata`, or `.tbss`
@@ -1575,14 +1603,42 @@ pub fn compute_layout_icf(
     if has_rw {
         va = align_up(va, page);
         let start = va;
+
+        // Split RW progbits into RELRO (front) and non-RELRO (back) groups.
+        // rw_pb is already sorted with RELRO first; find the split point.
+        let relro_end_idx = rw_pb
+            .iter()
+            .position(|b| !is_relro(&b.name))
+            .unwrap_or(rw_pb.len());
+        let (rw_relro, rw_non_relro) = rw_pb.split_at(relro_end_idx);
+
+        // Place RELRO sections first (segment start, page-aligned).
         place(
-            &rw_pb,
+            rw_relro,
             base,
             &mut va,
             &mut sections,
             &mut addresses,
             &mut sec_to_out,
         );
+
+        // Page-align before non-RELRO so the RELRO region ends on a page boundary.
+        // This ensures glibc's mprotect(ALIGN_DOWN(relro_end)) doesn't bleed into
+        // non-RELRO sections. Only pad if there ARE non-RELRO progbits sections.
+        if !rw_non_relro.is_empty() || !rw_bss.is_empty() {
+            va = align_up(va, page);
+        }
+
+        // Place non-RELRO progbits (.data, .tdata, etc.).
+        place(
+            rw_non_relro,
+            base,
+            &mut va,
+            &mut sections,
+            &mut addresses,
+            &mut sec_to_out,
+        );
+
         let file_end = va;
         place(
             &rw_bss,
@@ -1751,7 +1807,7 @@ pub fn compute_layout_icf(
                     let sym_idx = obj
                         .symbols
                         .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                        .and_then(|sym| sym_index.get(&sym.name).copied())
+                        .and_then(|sym| sym_index.get(sym.name.as_bytes()).copied())
                         .unwrap_or(0);
                     let r_offset = c.offset + reloc.offset;
                     let r_info = ((sym_idx as u64) << 32) | reloc.r_type as u64;
@@ -1795,7 +1851,7 @@ pub fn compute_layout_icf(
     // `.zdebug_*`. Concatenate each matching input section by exact name into a
     // file-only output section (sh_addr = 0) placed after `.symtab`/`.strtab`.
     // `SecSource::Input` keeps them on the normal copy + relocation path.
-    let mut passthrough_names: Vec<Vec<u8>> = Vec::new();
+    let mut passthrough_names: Vec<peony_object::Name> = Vec::new();
     for obj in objects {
         for sec in &obj.sections {
             if should_passthrough_non_alloc(sec, config.strip_debug)
@@ -1812,7 +1868,7 @@ pub fn compute_layout_icf(
         let mut max_align = 1u64;
         for (obj_idx, obj) in objects.iter().enumerate() {
             for sec in &obj.sections {
-                if sec.name.as_slice() != passthrough.as_slice() || sec.data.is_empty() {
+                if sec.name.as_bytes() != passthrough.as_bytes() || sec.data.is_empty() {
                     continue;
                 }
                 // Passthrough non-alloc sections (e.g. `.comment`) are kept
@@ -1833,9 +1889,32 @@ pub fn compute_layout_icf(
             continue;
         }
         foff = align_up(foff, max_align);
+        // Non-alloc sections (.debug_*, .comment) have sh_addr=0, but their
+        // relocations still need resolving. DWARF cross-references are
+        // SECTION-RELATIVE: an R_X86_64_32 in `.debug_info` against the
+        // `.debug_abbrev` section symbol must resolve to the target's offset
+        // *within its output section* (the same `sh_addr + c.offset` math the
+        // alloc path uses, where sh_addr=0 for non-alloc). Without an entry in
+        // `addresses`, `apply_reloc` silently skips the reloc (treating the
+        // target section as dropped) and leaves the field at its input value —
+        // a stale per-object offset that points into garbage once sections are
+        // concatenated, which corrupts DWARF (`invalid abbreviation code`).
+        let name = String::from_utf8_lossy(&passthrough).into_owned();
+        for c in &contributions {
+            // sh_addr is 0 for non-alloc, so the resolved value == c.offset:
+            // the section-relative position of this contribution. Mirrors the
+            // alloc path's `addresses.insert(key, sh_addr + c.offset)`.
+            addresses.insert((c.object_id, c.section_index), c.offset);
+        }
+        tracing::debug!(
+            section = %name,
+            file_offset = format_args!("{foff:#x}"),
+            size = off,
+            contributions = contributions.len(),
+            "non-alloc passthrough: section-relative reloc targets registered"
+        );
         // `.comment`/`.debug_str` may be MERGE|STRINGS in inputs; a plain
         // PROGBITS copy is valid and accepted by readelf/eu-elflint.
-        let name = String::from_utf8_lossy(&passthrough).into_owned();
         sections.push(OutputSection {
             name,
             kind: SectionKind::Other,
@@ -2430,17 +2509,17 @@ pub fn compute_layout_icf(
     // sections and falling back to `.dynamic` (always present in a dynamic link)
     // so the segment is never silently dropped.
     if has_relro {
-        // RELRO may ONLY cover sections that are read-only after load-time
-        // relocation AND form a CONTIGUOUS run. We cover `.init_array`,
-        // `.fini_array`, and `.data.rel.ro`. We deliberately EXCLUDE:
-        //   * `.got.plt` / `.data` — written at runtime; protecting them crashes.
-        //   * `.got` — peony does not eagerly bind every GOT slot, so the runtime
-        //     (e.g. the unwinder) may still write to it; mprotecting it read-only
-        //     causes a SIGSEGV during `catch_unwind`/backtrace. (A future full
-        //     BIND_NOW of every GOT slot could extend RELRO to cover `.got`.)
-        // A naive min..max over relro names could also span an interleaved
-        // non-relro section, so we take the maximal contiguous prefix instead.
-        const RELRO_NAMES: [&str; 3] = [".init_array", ".fini_array", ".data.rel.ro"];
+        // RELRO may only cover sections that are read-only after load-time
+        // relocation and form a contiguous run. Peony eagerly resolves PLT/GOT
+        // entries, so the dynamic section and GOT family are RELRO members.
+        const RELRO_NAMES: [&str; 6] = [
+            ".data.rel.ro",
+            ".dynamic",
+            ".fini_array",
+            ".got",
+            ".got.plt",
+            ".init_array",
+        ];
         let is_relro = |s: &OutputSection| RELRO_NAMES.contains(&s.name.as_str());
 
         // RW allocatable sections in ascending address order.
@@ -2672,10 +2751,21 @@ pub fn gc_sections_rooted(
     }
     for (obj_id, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
+            // GC roots: init/fini arrays, SHF_LINK_ORDER sections, and
+            // exception-handling metadata. `.eh_frame` and `.gcc_except_table`
+            // are NOT referenced *by* code — they reference *into* code (FDEs
+            // point at functions, LSDA tables are referenced by FDE aug data).
+            // Without rooting them, GC would discard all unwinding/exception
+            // info and `catch_unwind` / C++ exceptions would abort with
+            // `_URC_END_OF_STACK`. Real linkers (ld, lld, mold) keep `.eh_frame`
+            // FDEs whose target function survives; the simpler correct approach
+            // is to root all EH metadata unconditionally.
             let keep = sec.name.starts_with(b".init")
                 || sec.name.starts_with(b".fini")
                 || sec.name.starts_with(b".preinit_array")
-                || (sec.flags & 0x0020_0000) != 0;
+                || sec.name.starts_with(b".eh_frame")
+                || sec.name.starts_with(b".gcc_except_table")
+                || (sec.flags & 0x0020_0000) != 0; // SHF_LINK_ORDER
             if keep && sec.flags & peony_object::elf::SHF_ALLOC != 0 {
                 let key = (obj_id, sec.index.0);
                 if live.insert(key) {
@@ -2986,7 +3076,7 @@ fn build_symtab_plan(
             strtab.extend_from_slice(&sym.name);
             strtab.push(0);
             locals.push(SymEntry {
-                name: sym.name.clone(),
+                name: sym.name.to_vec(),
                 name_off,
                 shndx: (idx + 1) as u32,
                 info: elf::st_info(elf::STB_LOCAL, typ),
@@ -3201,6 +3291,9 @@ pub fn finalize_symbols(symbols: &mut SymbolTable, layout: &Layout) {
 /// undefined references are permitted and resolve to zero.
 pub fn check_undefined(symbols: &SymbolTable) -> Result<()> {
     for (name, res) in symbols.iter() {
+        if name == b"__tls_get_addr" {
+            continue;
+        }
         if !res.is_defined() && res.binding != peony_object::Binding::Weak {
             return Err(LayoutError::Undefined(
                 String::from_utf8_lossy(name).into_owned(),
@@ -3378,7 +3471,7 @@ fn should_passthrough_non_alloc(sec: &peony_object::InputSection, strip_debug: b
     if sec.flags & elf::SHF_ALLOC != 0 || sec.data.is_empty() {
         return false;
     }
-    match sec.name.as_slice() {
+    match sec.name.as_bytes() {
         b".rustc" | b".comment" | b".gnu_debugaltlink" => true,
         name if !strip_debug => {
             sec.kind == SectionKind::Debug

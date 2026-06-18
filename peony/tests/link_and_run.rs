@@ -2,6 +2,7 @@
 //! fixtures, links with peony, executes, and asserts the exit code.
 
 mod common;
+
 use common::*;
 
 /// Freestanding `exit(42)` — no relocations. Validates header/segment/entry.
@@ -108,6 +109,25 @@ fn static_archive() {
     );
     let unused = assemble(&dir, "unused", ".text\n.globl never\nnever:\n ret\n");
     let ar = archive(&dir, "libstuff", &[used, unused]);
+    let exe = dir.join("a.out");
+    link(&exe, &[main, ar], &[]);
+    assert_eq!(run(&exe), 42);
+}
+
+#[test]
+fn weak_undefined_does_not_pull_archive_member() {
+    let dir = workdir("archive_weak_undef");
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n.weak foo\n",
+    );
+    let unused = assemble(
+        &dir,
+        "unused",
+        ".text\n.globl foo\nfoo:\n ret\n.globl _start\n_start:\n movl $1,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let ar = archive(&dir, "libweak", &[unused]);
     let exe = dir.join("a.out");
     link(&exe, &[main, ar], &[]);
     assert_eq!(run(&exe), 42);

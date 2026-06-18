@@ -2,6 +2,8 @@
 //! system `ld.so` resolve the imports at load, and check the program runs.
 
 mod common;
+use std::process::Command;
+
 use common::*;
 
 /// Import a data symbol from a shared library (resolved via `R_X86_64_GLOB_DAT`).
@@ -72,6 +74,128 @@ fn dynamic_function_import() {
     let exe = dir.join("a.out");
     let dir_str = dir.to_str().unwrap();
     link(&exe, &[m], &["-L", dir_str, "-l", "bar"]);
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn dynamic_executable_emits_non_empty_relro_segment() {
+    let dir = workdir("dyn_relro");
+    compile_shared(&dir, "relro", "int get_answer(void){ return 42; }\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n call get_answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(&exe, &[m], &["-L", dir_str, "-l", "relro"]);
+
+    let phdrs = readelf(&exe, &["-lW"]);
+    let relro = phdrs
+        .lines()
+        .find(|line| line.contains("GNU_RELRO"))
+        .unwrap_or_else(|| panic!("missing GNU_RELRO program header:\n{phdrs}"));
+    let fields = relro.split_whitespace().collect::<Vec<_>>();
+    assert_ne!(
+        fields.get(4),
+        Some(&"0x000000"),
+        "zero RELRO filesz:\n{phdrs}"
+    );
+    assert_ne!(
+        fields.get(5),
+        Some(&"0x000000"),
+        "zero RELRO memsz:\n{phdrs}"
+    );
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn executable_imported_initial_exec_tls_gets_tpoff_relocation() {
+    let dir = workdir("dyn_tls_ie");
+    compile_shared(&dir, "tlsshared", "__thread int tls_answer = 42;\n");
+
+    let bindir = dir.join("ldbin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    std::fs::copy(PEONY, bindir.join("ld")).unwrap();
+    let src = dir.join("main.c");
+    std::fs::write(
+        &src,
+        "extern __thread int tls_answer __attribute__((tls_model(\"initial-exec\")));\n\
+         int main(void) { return tls_answer; }\n",
+    )
+    .unwrap();
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    let status = Command::new("cc")
+        .arg(format!("-B{}/", bindir.display()))
+        .args(["-fpie", "-pie", "-o"])
+        .arg(&exe)
+        .arg(&src)
+        .args(["-L", dir_str, "-l", "tlsshared"])
+        .status()
+        .expect("run cc through peony");
+    assert!(status.success(), "cc/peony link failed");
+
+    let relocs = readelf(&exe, &["-rW"]);
+    assert!(
+        relocs.contains("R_X86_64_TPOFF64") && relocs.contains("tls_answer"),
+        "missing imported TLS TPOFF64 relocation:\n{relocs}"
+    );
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn executable_imported_general_dynamic_tls_relaxes_to_initial_exec() {
+    let dir = workdir("dyn_tls_gd_ie");
+    compile_shared(&dir, "tlsgd", "__thread int tls_answer = 42;\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n\
+         .byte 0x66\n\
+         leaq tls_answer@tlsgd(%rip), %rdi\n\
+         .word 0x6666\n\
+         rex64\n\
+         call __tls_get_addr@plt\n\
+         movl (%rax), %edi\n\
+         movl $60, %eax\n\
+         syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(&exe, &[m], &["-L", dir_str, "-l", "tlsgd"]);
+
+    let relocs = readelf(&exe, &["-rW"]);
+    assert!(
+        relocs.contains("R_X86_64_TPOFF64") && relocs.contains("tls_answer"),
+        "missing GD→IE imported TLS relocation:\n{relocs}"
+    );
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn executable_imported_tlsdesc_relaxes_to_initial_exec() {
+    let dir = workdir("dyn_tlsdesc_ie");
+    compile_shared(&dir, "tlsdesc", "__thread int tls_answer = 42;\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n\
+         leaq tls_answer@tlsdesc(%rip), %rax\n\
+         call *tls_answer@tlscall(%rax)\n\
+         movl %fs:(%rax), %edi\n\
+         movl $60, %eax\n\
+         syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(&exe, &[m], &["-L", dir_str, "-l", "tlsdesc"]);
+
+    let relocs = readelf(&exe, &["-rW"]);
+    assert!(
+        relocs.contains("R_X86_64_TPOFF64") && relocs.contains("tls_answer"),
+        "missing TLSDESC→IE imported TLS relocation:\n{relocs}"
+    );
     assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
 }
 

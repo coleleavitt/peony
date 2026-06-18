@@ -18,6 +18,7 @@
 # Usage:
 #   bench/bench.sh [--runs N] [--warmup N] [--pin "0-7"] [--threads N]
 #                  [--only peony,mold,lld,bfd] [--corpus NAME] [--out DIR]
+#                  [--strict-env]
 set -Eeuo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +26,7 @@ repo="$(cd "$here/.." && pwd)"
 corp="$repo/bench/corpora"
 peony_bin="$repo/target/release/peony"
 
-runs=15 warmup=3 pin="" threads="" only="" want_corpus="" outdir="$repo/bench/results"
+runs=15 warmup=3 pin="" threads="" only="" want_corpus="" outdir="$repo/bench/results" strict_env=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --runs)    runs="$2"; shift 2 ;;
@@ -35,7 +36,8 @@ while [[ $# -gt 0 ]]; do
     --only)    only="$2"; shift 2 ;;       # comma list: peony,mold,lld,bfd
     --corpus)  want_corpus="$2"; shift 2 ;;
     --out)     outdir="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --strict-env) strict_env=1; shift ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -148,8 +150,16 @@ run_corpus() {
   "${args[@]}" || echo "  (hyperfine returned nonzero)"
 }
 
-echo "host: $(uname -srm)   cores: $(nproc)   governor: $(governor_note)"
-[ "$(governor_note)" = performance ] || echo "⚠ governor is not 'performance' — numbers will be noisier. See BENCHMARKING.md."
+gov="$(governor_note)"
+echo "host: $(uname -srm)   cores: $(nproc)   governor: $gov"
+if [ "$gov" != performance ]; then
+  if [ "$strict_env" = 1 ]; then
+    echo "fatal: --strict-env requires CPU governor 'performance' (current: $gov). See BENCHMARKING.md." >&2
+    exit 3
+  fi
+  echo "⚠ governor is not 'performance' — numbers will be noisier. See BENCHMARKING.md."
+fi
+[ "$strict_env" = 0 ] || [ -n "$pin" ] || echo "⚠ --strict-env without --pin still allows scheduler migration noise." >&2
 echo "linkers:"; for L in "${linkers[@]}"; do echo "  $L -> ${LD_PATH[$L]}"; done
 
 shopt -s nullglob

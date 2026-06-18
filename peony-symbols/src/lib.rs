@@ -21,7 +21,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use peony_object::{Binding, InputObject, InputSymbol};
+use peony_object::{Binding, InputObject, InputSymbol, Name};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use thiserror::Error;
 
@@ -179,9 +179,9 @@ impl SymbolResolution {
 /// The global symbol table built from all input objects.
 pub struct SymbolTable {
     /// Map from raw symbol name bytes → resolution.
-    resolutions: FxHashMap<Vec<u8>, SymbolResolution>,
+    resolutions: FxHashMap<Name, SymbolResolution>,
     /// Dense list of all symbol names in ID order (for reverse lookup).
-    names: Vec<Vec<u8>>,
+    names: Vec<Name>,
     /// Names of input objects (for error messages).
     object_paths: Vec<String>,
 }
@@ -504,7 +504,7 @@ impl SymbolTable {
         for (i, name) in exports.iter().enumerate() {
             // An undefined reference satisfied by the shared library.
             let satisfy = matches!(
-                self.resolutions.get(name),
+                self.resolutions.get(name.as_slice()),
                 Some(r) if r.defined_in.is_none() && !r.import
             );
             if !satisfy {
@@ -512,9 +512,9 @@ impl SymbolTable {
             }
             // Imports need a real SymbolId so they participate in GOT/.dynsym.
             let id = SymbolId(self.names.len() as u32);
-            self.names.push(name.clone());
+            self.names.push(Name::from_slice(name));
             let ver = versions.get(i).cloned().flatten();
-            let r = self.resolutions.get_mut(name).unwrap();
+            let r = self.resolutions.get_mut(name.as_slice()).unwrap();
             r.import = true;
             r.copy_reloc = false;
             r.id = id;
@@ -535,15 +535,15 @@ impl SymbolTable {
         let mut n = 0;
         for ex in exports {
             let satisfy = matches!(
-                self.resolutions.get(&ex.name),
+                self.resolutions.get(ex.name.as_slice()),
                 Some(r) if r.defined_in.is_none() && !r.import
             );
             if !satisfy {
                 continue;
             }
             let id = SymbolId(self.names.len() as u32);
-            self.names.push(ex.name.clone());
-            let r = self.resolutions.get_mut(&ex.name).unwrap();
+            self.names.push(Name::from_slice(&ex.name));
+            let r = self.resolutions.get_mut(ex.name.as_slice()).unwrap();
             r.import = true;
             r.copy_reloc = false;
             r.id = id;
@@ -578,7 +578,7 @@ impl SymbolTable {
         let needs = matches!(self.resolutions.get(name), Some(r) if r.id.0 == u32::MAX);
         if needs {
             let id = SymbolId(self.names.len() as u32);
-            self.names.push(name.to_vec());
+            self.names.push(Name::from_slice(name));
             self.resolutions.get_mut(name).unwrap().id = id;
             Some(id)
         } else {
@@ -591,7 +591,7 @@ impl SymbolTable {
     pub fn define_absolute(&mut self, name: &[u8], value: u64) {
         let e = self
             .resolutions
-            .entry(name.to_vec())
+            .entry(Name::from_slice(name))
             .or_insert_with(Self::make_undefined_resolution);
         e.defined_in = Some(ObjectId(0));
         e.section_index = None;
@@ -601,12 +601,12 @@ impl SymbolTable {
 
     /// The name bytes for a [`SymbolId`] (only valid for *defined* symbols).
     pub fn name_by_id(&self, id: SymbolId) -> Option<&[u8]> {
-        self.names.get(id.0 as usize).map(|v| v.as_slice())
+        self.names.get(id.0 as usize).map(Name::as_bytes)
     }
 
     /// Iterate over all resolutions.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &SymbolResolution)> {
-        self.resolutions.iter().map(|(k, v)| (k.as_slice(), v))
+        self.resolutions.iter().map(|(k, v)| (k.as_bytes(), v))
     }
 
     /// Mutable iteration over all resolutions (for address write-back).

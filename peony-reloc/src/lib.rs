@@ -249,10 +249,13 @@ pub fn assign_weak_got_ids(objects: &[InputObject], symbols: &mut SymbolTable) {
                 else {
                     continue;
                 };
+                if sym.binding != Binding::Weak {
+                    continue;
+                }
                 // Only weak, currently-undefined, non-import symbols need this.
                 let is_weak_undef = matches!(
                     symbols.lookup(&sym.name),
-                    Some(r) if !r.is_defined() && !r.import && sym.binding == Binding::Weak
+                    Some(r) if !r.is_defined() && !r.import
                 );
                 if is_weak_undef {
                     symbols.ensure_id(&sym.name);
@@ -336,7 +339,7 @@ pub fn copy_reloc_symbols(objects: &[InputObject], symbols: &SymbolTable) -> Vec
                 if res.size == 0 && res.st_type != peony_object::elf::STT_OBJECT {
                     continue;
                 }
-                out.entry(res.id).or_insert_with(|| sym.name.clone());
+                out.entry(res.id).or_insert_with(|| sym.name.to_vec());
             }
         }
     }
@@ -418,6 +421,14 @@ fn scan_object(
                 slots.push(SyntheticSlot::TlsIe(tls_ref(sym)));
                 continue;
             }
+            if !shared
+                && matches!(reloc.r_type, r_x86_64::TLSGD | r_x86_64::GOTPC32_TLSDESC)
+                && sym.binding != Binding::Local
+                && symbols.lookup(&sym.name).is_some_and(|r| r.import)
+            {
+                slots.push(SyntheticSlot::TlsIe(tls_ref(sym)));
+                continue;
+            }
             // General-/Local-Dynamic: only a shared object keeps them (an
             // executable relaxes GD/LD → Local-Exec, needing no GOT slot).
             if shared && matches!(reloc.r_type, r_x86_64::TLSGD | r_x86_64::TLSLD) {
@@ -457,6 +468,74 @@ fn scan_object(
         }
     }
     slots
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DynamicRelocCounts {
+    pub relative_total: usize,
+    pub irelative: usize,
+    pub symbolic_data: usize,
+    pub tls: usize,
+}
+
+pub fn count_dynamic_relocs(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    got_syms: &[SymbolId],
+    tls: &peony_layout::TlsGotInfo,
+    shared: bool,
+) -> DynamicRelocCounts {
+    let mut counts = DynamicRelocCounts::default();
+    for obj in objects {
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            for reloc in &sec.relocs {
+                if reloc.r_type != r_x86_64::R64 {
+                    continue;
+                }
+                let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                else {
+                    continue;
+                };
+                if sym.binding == Binding::Local {
+                    if sym.section.is_some() {
+                        counts.relative_total += 1;
+                        counts.irelative += usize::from(sym.is_ifunc);
+                    }
+                    continue;
+                }
+                let Some(res) = symbols.lookup(&sym.name) else {
+                    continue;
+                };
+                if res.import && !res.copy_reloc {
+                    counts.symbolic_data += 1;
+                } else if res.is_defined() {
+                    counts.relative_total += 1;
+                    counts.irelative += usize::from(!res.import && res.is_ifunc);
+                }
+            }
+        }
+    }
+
+    for id in got_syms {
+        let Some(res) = symbols
+            .name_by_id(*id)
+            .and_then(|name| symbols.lookup(name))
+        else {
+            continue;
+        };
+        if (!res.import || res.copy_reloc) && res.is_defined() {
+            counts.relative_total += 1;
+            counts.irelative += usize::from(!res.import && res.is_ifunc);
+        }
+    }
+
+    counts.tls = count_tls_relocs(objects, symbols, tls, shared);
+    counts
 }
 
 /// Count the base-relative R64 data relocations a PIE will need, without
@@ -746,9 +825,8 @@ fn tls_ref_offset(
 
 /// Build the TLS GOT region's dynamic relocations and static slot writes from
 /// the addresses the layout assigned. Must run post-layout. `shared` selects
-/// dynamic (GD/LD/IE with loader-filled module ids / TP offsets) vs the
-/// executable case (Initial-Exec slots filled statically; GD/LD are relaxed
-/// away in the executable and produce no GOT pairs here).
+/// whether GD/LD/TLSDESC are kept or relaxed; imported Initial-Exec TLS remains
+/// loader-filled even in an executable because the provider DSO owns the TLS.
 pub fn collect_tls_got(
     objects: &[InputObject],
     symbols: &SymbolTable,
@@ -804,7 +882,7 @@ pub fn collect_tls_got(
         };
         let (offset, imported) =
             tls_ref_offset(*tref, objects, symbols, layout).unwrap_or((0, true));
-        if shared && imported {
+        if imported {
             // Imported IE TLS: loader fills the slot (TPOFF64 against the symbol).
             let dynidx = tls_ref_dynidx(*tref, symbols);
             c.relocs.push((slot, r_x86_64::TPOFF64, dynidx, 0));
@@ -834,13 +912,14 @@ fn tls_ref_dynidx(tref: TlsRef, symbols: &SymbolTable) -> u32 {
     0
 }
 
-/// Count the TLS dynamic relocations a shared object's TLS GOT will need, to
-/// size `.rela.dyn` before layout. Each GD pair contributes 1 (local) or 2
-/// (imported), each TLSDESC pair 1, the LDM pair 1, each IE slot 1.
+/// Count TLS dynamic relocations to size `.rela.dyn` before layout. Shared
+/// objects need GD/LD/TLSDESC plus IE entries; executables still need TPOFF64
+/// entries for imported Initial-Exec TLS slots.
 pub fn count_tls_relocs(
     objects: &[InputObject],
     symbols: &SymbolTable,
     tls: &peony_layout::TlsGotInfo,
+    shared: bool,
 ) -> usize {
     let imported = |tref: &TlsRef| -> bool {
         match tref {
@@ -853,6 +932,9 @@ pub fn count_tls_relocs(
         }
     };
     let _ = objects;
+    if !shared {
+        return tls.ie.len();
+    }
     let gd: usize = tls.gd.iter().map(|t| if imported(t) { 2 } else { 1 }).sum();
     let desc = tls.desc.len();
     let ie = tls.ie.len();
@@ -1010,6 +1092,7 @@ struct RelocAddrs {
     tls_ie: u64,   // IE GOT slot VA for this symbol (shared); 0 if none
     tls_desc: u64, // TLSDESC GOT pair base VA for this symbol (shared); 0 if none
     tls_ldm: u64,  // module LDM GOT pair base VA (shared); 0 if none
+    tls_imported: bool,
 }
 
 /// Apply a single relocation, patching `buf` (the relocated section's bytes).
@@ -1071,7 +1154,25 @@ pub fn apply_reloc(
         let s = match sym.section {
             Some(si) => match ctx.layout.address_of(obj_id, si.0) {
                 Some(va) => va + sym.value,
-                None => return Ok(()), // defined in a dropped section
+                None => {
+                    // No placement for the target section. Normally this means
+                    // the section was GC'd or COMDAT-discarded, so dropping the
+                    // reloc is correct. But a section that survives into the
+                    // output WITHOUT an `addresses` entry (a past bug for
+                    // non-alloc `.debug_*`) silently leaves this field stale and
+                    // corrupts the consumer (DWARF). Trace it so the next such
+                    // regression is visible instead of mysterious.
+                    tracing::debug!(
+                        obj_id,
+                        section_index = si.0,
+                        r_type = reloc.r_type,
+                        reloc_offset = reloc.offset,
+                        sym = %String::from_utf8_lossy(&sym.name),
+                        "reloc skipped: target section has no address (GC'd, \
+                         discarded, or unplaced) — field left unrelocated"
+                    );
+                    return Ok(());
+                }
             },
             None => sym.value, // absolute local
         };
@@ -1112,6 +1213,9 @@ pub fn apply_reloc(
     } else {
         0
     };
+    let tls_imported = is_tls(reloc.r_type)
+        && sym.binding != Binding::Local
+        && res.is_some_and(|r| r.import && r.defined_in.is_none());
 
     // TLS GOT addresses for this reference, keyed by `TlsRef` exactly as the
     // scan allocated them. IE (GOTTPOFF) slots exist in BOTH exe and shared
@@ -1154,6 +1258,7 @@ pub fn apply_reloc(
         tls_ie,
         tls_desc,
         tls_ldm: ctx.layout.tls_ldm_addr.unwrap_or(0),
+        tls_imported,
     };
 
     patch_buf(buf, reloc.r_type, &addrs, &obj.path)
@@ -1314,6 +1419,43 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
             );
             write_i32(buf, off, v, r_type, object, off as u64)?
         }
+        TLSGD if a.tls_imported => {
+            // GD→IE relaxation for preemptible TLS in an executable. The target
+            // DSO owns the TLS block, so the loader fills a TPOFF64 IE GOT slot.
+            let start = off.wrapping_sub(4);
+            if start + 16 <= buf.len() {
+                let disp = (a.tls_ie as i64)
+                    .wrapping_add(a.a)
+                    .wrapping_sub(p)
+                    .wrapping_sub(8);
+                tracing::trace!(
+                    off,
+                    start,
+                    ie_slot = format_args!("{:#x}", a.tls_ie),
+                    disp,
+                    "TLSGD→IE relaxation"
+                );
+                if buf[start] != 0x66 || buf[start + 1] != 0x48 || buf[start + 2] != 0x8d {
+                    tracing::warn!(
+                        start,
+                        got = format_args!("{:02x?}", &buf[start..start + 4]),
+                        "TLSGD: unexpected prologue, skipping IE relaxation"
+                    );
+                } else {
+                    buf[start..start + 16].copy_from_slice(&[
+                        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x03, 0x05, 0,
+                        0, 0, 0,
+                    ]);
+                    buf[start + 12..start + 16].copy_from_slice(&(disp as i32).to_le_bytes());
+                }
+            } else {
+                tracing::warn!(
+                    off,
+                    buf_len = buf.len(),
+                    "TLSGD IE relaxation skipped: out of bounds"
+                );
+            }
+        }
         TLSGD => {
             // GD→LE relaxation (x86-64 psABI). The input 16-byte sequence is:
             //   66 48 8d 3d <disp32>      data16 lea x@tlsgd(%rip),%rdi
@@ -1441,6 +1583,37 @@ fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Resul
                 "GOTPC32_TLSDESC (shared, kept)"
             );
             write_i32(buf, off, v, r_type, object, off as u64)?
+        }
+        GOTPC32_TLSDESC if a.tls_imported => {
+            // TLSDESC→IE for preemptible TLS in an executable: keep the access as
+            // a GOT load, then TLSDESC_CALL turns into a two-byte nop.
+            let start = off.wrapping_sub(3);
+            if start + 7 <= buf.len() {
+                let disp = (a.tls_ie as i64).wrapping_add(a.a).wrapping_sub(p);
+                tracing::trace!(
+                    off,
+                    start,
+                    ie_slot = format_args!("{:#x}", a.tls_ie),
+                    disp,
+                    "TLSDESC→IE relaxation"
+                );
+                if buf[start] != 0x48 || buf[start + 1] != 0x8d {
+                    tracing::warn!(
+                        start,
+                        got = format_args!("{:02x?}", &buf[start..start + 3]),
+                        "TLSDESC: unexpected prologue, skipping IE relaxation"
+                    );
+                } else {
+                    buf[start + 1] = 0x8b;
+                    write_i32(buf, off, disp, r_type, object, off as u64)?;
+                }
+            } else {
+                tracing::warn!(
+                    off,
+                    buf_len = buf.len(),
+                    "TLSDESC IE relaxation skipped: out of bounds"
+                );
+            }
         }
         GOTPC32_TLSDESC => {
             // TLSDESC→LE relaxation for executables. The canonical input is:
@@ -1613,6 +1786,7 @@ mod tests {
             tls_ie: 0,
             tls_desc: 0,
             tls_ldm: 0,
+            tls_imported: false,
         };
 
         patch_buf(&mut buf, r_x86_64::TLSGD, &addrs, "test.o").unwrap();
@@ -1647,6 +1821,7 @@ mod tests {
             tls_ie: 0,
             tls_desc: 0,
             tls_ldm: 0,
+            tls_imported: false,
         };
 
         let call_addrs = RelocAddrs {
@@ -1665,6 +1840,7 @@ mod tests {
             tls_ie: 0,
             tls_desc: 0,
             tls_ldm: 0,
+            tls_imported: false,
         };
 
         patch_buf(&mut buf, r_x86_64::TLSDESC_CALL, &call_addrs, "test.o").unwrap();

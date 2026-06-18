@@ -16,7 +16,7 @@
 //! case (duplicate monomorphisations, identical small helpers) with no chance of
 //! an unsound merge. Anything uncertain is simply not folded.
 
-use peony_object::{InputArena, InputObject, SymbolIndex};
+use peony_object::{InputArena, InputObject, Name, SymbolIndex};
 use rustc_hash::FxHashMap;
 
 /// A canonical key identifying a foldable section's observable content: a
@@ -56,7 +56,7 @@ fn content_digest(bytes: &[u8]) -> u128 {
 /// not folded (conservative).
 fn reloc_target_name(obj: &InputObject, sym: SymbolIndex) -> Option<&[u8]> {
     let pos = *obj.symbol_map.get(&sym.0)?;
-    obj.symbols.get(pos).map(|s| s.name.as_slice())
+    obj.symbols.get(pos).map(|s| s.name.as_bytes())
 }
 
 /// x86-64 relocation types that take a symbol's ADDRESS (as opposed to a direct
@@ -83,7 +83,7 @@ const SHT_LLVM_ADDRSIG: u32 = 0x6fff_4c03;
 #[derive(Default)]
 struct AddrTaint {
     /// Symbol NAMES whose address is taken via a named-symbol relocation.
-    by_name: rustc_hash::FxHashSet<Vec<u8>>,
+    by_name: rustc_hash::FxHashSet<Name>,
     /// (object_id, section_index) of sections whose address is taken via a
     /// SECTION-relative relocation (e.g. a Rust vtable storing `section + addend`
     /// to point at a function inside that section). Rust/C++ reference foldable
@@ -349,7 +349,7 @@ mod tests {
     fn text_section(arena: &mut InputArena, index: usize, data: &[u8]) -> InputSection {
         InputSection {
             index: SectionIndex(index),
-            name: b".text.f".to_vec(),
+            name: peony_object::Name::from_slice(b".text.f"),
             kind: SectionKind::Text,
             sh_type: 1,
             data: arena.intern_bytes(data),
@@ -363,7 +363,7 @@ mod tests {
     fn local_sym(name: &[u8], sec: usize) -> InputSymbol {
         InputSymbol {
             index: SymbolIndex(0),
-            name: name.to_vec(),
+            name: peony_object::Name::from_slice(name),
             binding: Binding::Local,
             is_undefined: false,
             is_common: false,
@@ -392,7 +392,7 @@ mod tests {
         }
         InputSection {
             index: SectionIndex(index),
-            name: b".llvm_addrsig".to_vec(),
+            name: peony_object::Name::from_slice(b".llvm_addrsig"),
             kind: SectionKind::Other,
             sh_type: super::SHT_LLVM_ADDRSIG,
             size: data.len() as u64,

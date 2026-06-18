@@ -110,11 +110,14 @@ peony --stats <args>    # phase breakdown table: parse/resolve/scan/layout/emit
 peony --trace <args>    # call-flow tree: caller→callee by file:line, + events
 ```
 
-`--stats` prints each phase's wall-clock, %, and byte/item counts. `--trace`
-additionally records the nested call flow with source locations and point
-events (e.g. `archive-round: round 2 pulled 7, 3 undef left`), so you can see
-*what happened per line* — this is how the O(N²) archive fixpoint was found and
-fixed. Both are near-zero cost when off (a single atomic load short-circuits).
+`--stats` prints each phase's wall-clock, %, span count, byte/item throughput,
+hot-path counters, and RSS snapshots with deltas. `--trace` additionally records the nested call flow with
+source locations and point events (e.g. `archive-round: round 2: checked 3,
+skipped 1, parsed 1, pulled 7, 3 undef left`), so you can see *what happened per
+line* — this is how the O(N²) archive fixpoint was found and fixed. `--trace-stack`
+adds Rust backtraces to each trace frame/event for deep bug hunts where function
+stack and instruction-address context matter. All modes are near-zero cost when off
+(a single atomic load short-circuits).
 
 ## Benchmarking
 

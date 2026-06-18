@@ -15,6 +15,7 @@ bench/capture.sh cxx        hello-cxx  /tmp/hello.cpp
 
 # 2. correctness-gate + time peony vs mold vs lld vs bfd
 bench/bench.sh --runs 20 --warmup 5
+bench/bench.sh --strict-env --pin 0-7 --threads 8 --runs 20 --warmup 5
 ```
 
 Results land in `bench/results/<corpus>.{json,md}`.
@@ -49,7 +50,8 @@ Results land in `bench/results/<corpus>.{json,md}`.
 ## Reducing variance
 
 - Pin the CPU governor to performance: `sudo cpupower frequency-set -g performance`.
-  `bench.sh` warns if the governor is not `performance`.
+  `bench.sh` warns if the governor is not `performance`; pass `--strict-env` to
+  make that warning fatal for publishable Peony-vs-mold numbers.
 - Pin cores: `bench/bench.sh --pin 0-7` wraps each link in `taskset -c 0-7`.
 - Normalize thread count: `bench/bench.sh --threads 8` passes `--threads`/
   `-Wl,--threads=` to each linker that supports it.

@@ -420,6 +420,8 @@ fn process_item(
     // Zero-copy source: blit straight from the input mmap (via the arena) into
     // the output buffer — no intermediate per-section Vec.
     sec_buf.copy_from_slice(arena.bytes(isec.data));
+    peony_prof::count("sections_emitted", 1);
+    peony_prof::record_bytes("emit", data_len as u64);
 
     if !isec.relocs.is_empty() {
         for reloc in &isec.relocs {
@@ -427,6 +429,7 @@ fn process_item(
                 *error_slot.lock().unwrap() = Some(e);
                 return;
             }
+            peony_prof::count("relocs_applied", 1);
         }
     }
 }
@@ -526,6 +529,7 @@ fn write_section_data_parallel(
         sym_index: Some(&sym_index),
     };
     let work_items = collect_input_work_items(layout);
+    peony_prof::record_items("emit", work_items.len() as u64);
     let _t = peony_prof::trace("emit:section-copy-dispatch");
     dispatch_parallel(
         work_items,
@@ -589,6 +593,10 @@ fn dispatch_parallel(
     // syscall time). Tiny links copy a handful of sections faster serially.
     const PARALLEL_THRESHOLD: usize = 2048;
     if work_items.len() < PARALLEL_THRESHOLD {
+        peony_prof::event(
+            "emit-dispatch",
+            format!("serial: {} work items", work_items.len()),
+        );
         let error_slot = std::sync::Mutex::new(None);
         let ctx_ref = &ctx;
         for item in work_items {
@@ -608,20 +616,37 @@ fn dispatch_parallel(
     // futex/sched_yield churn on ripgrep (1040 sched_yield at the 8-thread cap).
     // Capping to the pool size keeps emit consistent with the rest of the link.
     let num_threads = rayon::current_num_threads().max(1).min(work_items.len());
+    peony_prof::event(
+        "emit-dispatch",
+        format!(
+            "parallel: {} work items, {num_threads} workers",
+            work_items.len()
+        ),
+    );
 
     let error_slot: std::sync::Mutex<Option<peony_reloc::RelocError>> = std::sync::Mutex::new(None);
 
-    // Spin-free lifeline scheduler (ws-deque): each section-copy is an independent
-    // task (disjoint output region), so we seed them all and let idle workers PARK
-    // on a condvar rather than busy-spin on `sched_yield`. The old hand-rolled
-    // Chase-Lev drain spun 24 threads on `spin_loop`/`sched_yield`, which on a
-    // small-but-over-threshold link dominated wall time (85% of syscalls). The
-    // lifeline scheduler wakes a sleeper only when work is pushed to it.
-    ws_deque::scheduler::run(num_threads, work_items, |item, _spawner| {
+    const BATCH_SIZE: usize = 256;
+    let batch_count = work_items.len().div_ceil(BATCH_SIZE);
+    peony_prof::event(
+        "emit-dispatch",
+        format!(
+            "batched: {} work items, {batch_count} batches, {BATCH_SIZE}/batch",
+            work_items.len()
+        ),
+    );
+    let batches: Vec<Vec<WorkItem>> = work_items
+        .chunks(BATCH_SIZE)
+        .map(<[WorkItem]>::to_vec)
+        .collect();
+
+    ws_deque::scheduler::run(num_threads, batches, |batch, _spawner| {
         // Errors are rare (a malformed reloc); record the first and let the rest
         // drain. We do not early-abort the schedule — the surviving sections are
         // still written to disjoint regions, and the error is returned below.
-        process_item(item, arena, objects, buf_ptr, buf_len, &ctx, &error_slot);
+        for item in batch {
+            process_item(item, arena, objects, buf_ptr, buf_len, &ctx, &error_slot);
+        }
     });
 
     if let Some(e) = error_slot.into_inner().ok().flatten() {

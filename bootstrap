@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ./bootstrap [--bin-dir DIR] [--skip-build]
+
+Build and install the current Peony linker release.
+
+Options:
+  --bin-dir DIR   Install directory (default: $CARGO_HOME/bin or ~/.cargo/bin)
+  --skip-build    Reuse target/release/peony instead of building first
+  -h, --help      Print this help
+USAGE
+}
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
+skip_build=0
+
+while (($#)); do
+  case "$1" in
+    --bin-dir)
+      [[ $# -ge 2 ]] || { printf 'missing value for --bin-dir\n' >&2; exit 2; }
+      bin_dir=$2
+      shift 2
+      ;;
+    --skip-build)
+      skip_build=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ((skip_build == 0)); then
+  cargo build --release -q -p peony --manifest-path "$repo/Cargo.toml"
+fi
+
+peony_bin="$repo/target/release/peony"
+[[ -x "$peony_bin" ]] || { printf 'missing executable: %s\n' "$peony_bin" >&2; exit 1; }
+
+mkdir -p "$bin_dir"
+install -m 0755 "$peony_bin" "$bin_dir/peony"
+ln -sfn peony "$bin_dir/ld.peony"
+
+printf 'installed %s\n' "$bin_dir/peony"
+printf 'installed %s -> peony\n' "$bin_dir/ld.peony"
+"$bin_dir/peony" --help >/dev/null

@@ -41,7 +41,14 @@ use peony_layout::{
     check_undefined,
     finalize_symbols,
 };
-use peony_object::{Binding, InputObject, iter_archive_members, parse_owned_member};
+use peony_object::{
+    Binding,
+    InputObject,
+    Name,
+    iter_archive_members,
+    iter_archive_members_matching,
+    parse_owned_member,
+};
 use peony_reloc::scan_relocations;
 use peony_symbols::SymbolTable;
 use rayon::prelude::*;
@@ -71,6 +78,8 @@ struct Args {
     icf: bool,
     stats: bool,
     trace: bool,
+    trace_stack: bool,
+    help: bool,
     defsym: Vec<String>,
     linker_scripts: Vec<PathBuf>,
     plugin: Option<PathBuf>,
@@ -108,6 +117,8 @@ impl Default for Args {
             icf: false,
             stats: false,
             trace: false,
+            trace_stack: false,
+            help: false,
             defsym: Vec::new(),
             linker_scripts: Vec::new(),
             plugin: None,
@@ -183,6 +194,11 @@ fn parse_args() -> Result<Args> {
             "--no-gc-sections" => a.gc_sections = false,
             "--stats" => a.stats = true,
             "--trace" => a.trace = true,
+            "--trace-stack" => {
+                a.trace = true;
+                a.trace_stack = true;
+            }
+            "--help" => a.help = true,
             // Identical Code Folding. `=all`/`=safe` accepted; `=none` disables.
             "--icf=all" | "--icf=safe" | "--icf" => a.icf = true,
             "--icf=none" | "--no-icf" => a.icf = false,
@@ -247,6 +263,12 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
+fn print_help() {
+    println!(
+        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table\n  --trace             Print phase timing and call-flow trace\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Enable incremental cache\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  -shared             Produce a shared object\n  --help              Print this help"
+    );
+}
+
 /// `cc`/`g++`/`rustc` always pass `-plugin .../liblto_plugin.so` even for a
 /// plain (non-LTO) link, so handing the whole link off to `ld.bfd` whenever a
 /// plugin is present meant peony was silently never doing the link. Instead we
@@ -287,15 +309,22 @@ fn main() -> Result<()> {
     }
 
     let mut args = parse_args()?;
+    if args.help {
+        print_help();
+        return Ok(());
+    }
     // `--stats`: turn on the in-linker phase profiler so the breakdown table is
     // printed at the end. `--trace` additionally records the call-flow tree
     // (caller→callee by file:line) for following a bug through the pipeline.
     // Both are cheap no-ops for every normal link.
-    if args.trace {
+    if args.trace_stack {
+        peony_prof::trace_stack_enable();
+    } else if args.trace {
         peony_prof::trace_enable();
     } else if args.stats {
         peony_prof::enable();
     }
+    peony_prof::record_rss("start");
     if maybe_handoff_lto_plugin(&args)? {
         return Ok(());
     }
@@ -332,6 +361,7 @@ fn main() -> Result<()> {
         let inputs = resolve_inputs(&args)?;
         expand_inputs(inputs, &library_search_paths(&args.library_paths))?
     };
+    peony_prof::record_rss("after-inputs");
     // When invoked directly as the linker (e.g. by rustc), the C-runtime startup
     // objects that provide `_start`/`_init` are not passed; inject them as `cc`
     // would for a dynamic/PIE executable. A shared object has no `_start`/crt1.
@@ -371,32 +401,68 @@ fn main() -> Result<()> {
         load_and_resolve(&inputs)?
     };
     peony_prof::record_items("parse+resolve", objects.len() as u64);
+    peony_prof::count("objects_parsed", objects.len() as u64);
+    peony_prof::count("symbols_resolved", symbols.len() as u64);
+    peony_prof::record_items("name-intern", arena.interned_name_count() as u64);
+    peony_prof::record_bytes("name-intern", arena.interned_name_bytes());
+    peony_prof::record_rss("after-parse-resolve");
 
     // Weak-undefined symbols referenced through the GOT (e.g. `__gmon_start__`)
     // need a real SymbolId so their GOT slot gets a recorded address (holding 0).
     // Assign ids before the scan so the slots are tracked.
-    peony_reloc::assign_weak_got_ids(&objects, &mut symbols);
+    {
+        let _p = peony_prof::phase("weak-got-ids");
+        peony_reloc::assign_weak_got_ids(&objects, &mut symbols);
+    }
 
     tracing::info!("scanning relocations");
     let scan = {
         let _p = peony_prof::phase("reloc-scan");
         scan_relocations(&objects, &symbols, args.shared)
     };
+    let input_relocs: usize = objects
+        .iter()
+        .map(|obj| {
+            obj.sections
+                .iter()
+                .map(|sec| sec.relocs.len())
+                .sum::<usize>()
+        })
+        .sum();
+    peony_prof::count("relocs_scanned", input_relocs as u64);
+    peony_prof::record_items("reloc-scan", input_relocs as u64);
+    peony_prof::record_rss("after-reloc-scan");
     // Everything from here to the layout span was previously untimed ("other"):
     // GOT/PLT/TLS slot extraction, copy-reloc marking, import/dynsym assignment,
     // export collection and dynamic-section sizing. Attribute it.
     let _postscan = peony_prof::phase("reloc-postproc");
-    let got_syms = scan.got_symbols();
-    let plt_syms = scan.plt_symbols();
+    let got_syms = {
+        let _t = peony_prof::trace("reloc-postproc:got-symbols");
+        scan.got_symbols()
+    };
+    let plt_syms = {
+        let _t = peony_prof::trace("reloc-postproc:plt-symbols");
+        scan.plt_symbols()
+    };
     let tls_got = peony_layout::TlsGotInfo {
-        gd: scan.tls_gd_refs(),
-        ie: scan.tls_ie_refs(),
-        desc: scan.tls_desc_refs(),
+        gd: {
+            let _t = peony_prof::trace("reloc-postproc:tls-gd");
+            scan.tls_gd_refs()
+        },
+        ie: {
+            let _t = peony_prof::trace("reloc-postproc:tls-ie");
+            scan.tls_ie_refs()
+        },
+        desc: {
+            let _t = peony_prof::trace("reloc-postproc:tls-desc");
+            scan.tls_desc_refs()
+        },
         ldm: scan.needs_tls_ldm(),
     };
     let copy_relocs = if args.shared {
         Vec::new()
     } else {
+        let _t = peony_prof::trace("reloc-postproc:copy-relocs");
         peony_reloc::copy_reloc_symbols(&objects, &symbols)
     };
     let copy_names: Vec<Vec<u8>> = copy_relocs
@@ -416,6 +482,12 @@ fn main() -> Result<()> {
         copy_relocs = copy_relocs.len(),
         "relocation scan complete"
     );
+    peony_prof::count("got_slots", got_syms.len() as u64);
+    peony_prof::count("plt_slots", plt_syms.len() as u64);
+    peony_prof::count("tls_gd_refs", tls_got.gd.len() as u64);
+    peony_prof::count("tls_ie_refs", tls_got.ie.len() as u64);
+    peony_prof::count("tls_desc_refs", tls_got.desc.len() as u64);
+    peony_prof::count("copy_relocs", copy_relocs.len() as u64);
 
     // Combine the GC live-set with COMDAT deduplication into the section filter
     // the layout will apply.
@@ -441,12 +513,17 @@ fn main() -> Result<()> {
     }
 
     // Dynamic mode: any shared-library import → emit a dynamic executable.
-    let mut imports: Vec<Vec<u8>> = symbols
-        .iter()
-        .filter(|(_, r)| r.import)
-        .map(|(n, _)| n.to_vec())
-        .collect();
-    imports.sort();
+    let imports: Vec<Vec<u8>> = {
+        let _t = peony_prof::trace("reloc-postproc:imports");
+        let mut imports: Vec<Vec<u8>> = symbols
+            .iter()
+            .filter(|(_, r)| r.import)
+            .map(|(n, _)| n.to_vec())
+            .collect();
+        imports.sort();
+        imports
+    };
+    peony_prof::count("dynamic_imports", imports.len() as u64);
     // Per-import version requirement, parallel to the sorted `imports`.
     let import_versions: Vec<Option<Vec<u8>>> = imports
         .iter()
@@ -467,14 +544,19 @@ fn main() -> Result<()> {
     // Both PIE and shared objects are ET_DYN and need R_X86_64_RELATIVE dynamic
     // relocations for absolute pointers the loader must bias.
     let et_dyn = args.pie || args.shared;
-    let (n_relative, n_irelative) = if et_dyn {
-        let total = peony_reloc::count_relative(&objects, &symbols)
-            + peony_reloc::count_got_relative(&got_syms, &symbols);
-        let irel = peony_reloc::count_irelative(&objects, &symbols, &got_syms);
-        (total, irel)
+    let dynamic_counts = if et_dyn || args.shared {
+        let _t = peony_prof::trace("reloc-postproc:dynamic-counts");
+        peony_reloc::count_dynamic_relocs(&objects, &symbols, &got_syms, &tls_got, args.shared)
+    } else if !imports.is_empty() {
+        peony_reloc::DynamicRelocCounts {
+            tls: peony_reloc::count_tls_relocs(&objects, &symbols, &tls_got, args.shared),
+            ..Default::default()
+        }
     } else {
-        (0, 0)
+        peony_reloc::DynamicRelocCounts::default()
     };
+    let n_relative = dynamic_counts.relative_total;
+    let n_irelative = dynamic_counts.irelative;
     // A shared object exports its defined, non-hidden global/weak symbols so
     // `dlsym` can find them. When rustc supplies a `--version-script`, it lists
     // exactly the symbols to export (`global:`) and localizes the rest
@@ -485,6 +567,7 @@ fn main() -> Result<()> {
         None => None,
     };
     let exports: Vec<peony_layout::ExportSym> = if args.shared {
+        let _t = peony_prof::trace("reloc-postproc:exports");
         let mut e: Vec<peony_layout::ExportSym> = symbols
             .iter()
             .filter(|(_, r)| r.is_export())
@@ -502,6 +585,7 @@ fn main() -> Result<()> {
             })
             .collect();
         e.sort_by(|a, b| a.name.cmp(&b.name));
+        peony_prof::count("dynamic_exports", e.len() as u64);
         e
     } else {
         Vec::new()
@@ -518,21 +602,13 @@ fn main() -> Result<()> {
         None
     };
     // TLS dynamic relocations the TLS GOT will need (sizes `.rela.dyn`). A shared
-    // object needs GD/LD/IE relocs; an executable relaxes GD/LD to Local-Exec and
-    // fills IE slots statically, so it needs none.
-    let n_tls_reloc = if args.shared {
-        peony_reloc::count_tls_relocs(&objects, &symbols, &tls_got)
-    } else {
-        0
-    };
+    // object needs GD/LD/IE relocs; an executable relaxes GD/LD to Local-Exec but
+    // imported IE slots are still loader-filled TPOFF64 entries.
+    let n_tls_reloc = dynamic_counts.tls;
     // Symbolic R_X86_64_64 dynamic relocs for data sites referencing an imported
     // symbol (gcc's `.data.rel.local.DW.ref.*` EH slots). Sized here, collected
     // post-layout. Meaningful for any ET_DYN (PIE or shared).
-    let n_symbolic_data = if et_dyn {
-        peony_reloc::count_symbolic_data_relocs(&objects, &symbols)
-    } else {
-        0
-    };
+    let n_symbolic_data = dynamic_counts.symbolic_data;
     // Dynamic sections are needed for any import, any PIE, or a shared object.
     let dynamic = (!imports.is_empty() || et_dyn).then(|| peony_layout::DynamicInfo {
         imports,
@@ -557,6 +633,7 @@ fn main() -> Result<()> {
             "dynamic object"
         );
     }
+    peony_prof::record_rss("after-reloc-postproc");
 
     // Predefine linker-provided symbols and `--defsym`s BEFORE layout so they are
     // included in `.symtab`; the layout-dependent addresses are filled in after.
@@ -603,6 +680,11 @@ fn main() -> Result<()> {
     )
     .context("layout computation failed")?;
     drop(layout_span);
+    peony_prof::count("layout_sections", layout.output_sections.len() as u64);
+    peony_prof::count("layout_segments", layout.segments.len() as u64);
+    peony_prof::record_items("layout", layout.output_sections.len() as u64);
+    peony_prof::record_bytes("layout", layout.file_size);
+    peony_prof::record_rss("after-layout");
     tracing::info!(
         sections = layout.output_sections.len(),
         segments = layout.segments.len(),
@@ -617,6 +699,7 @@ fn main() -> Result<()> {
     let _finalize = peony_prof::phase("finalize-syms");
     set_linker_addresses(&mut symbols, &layout, &provided);
     finalize_symbols(&mut symbols, &layout);
+    peony_prof::record_items("finalize-syms", symbols.len() as u64);
     // A shared object may legitimately reference symbols it does not define;
     // they are resolved at load time against the process image. Only enforce
     // full resolution for executables.
@@ -644,8 +727,9 @@ fn main() -> Result<()> {
         }
         // TLS GOT contents: a shared object emits DTPMOD64/DTPOFF64/TPOFF64
         // dynamic relocs (+ static DTPOFF in GD/LDM slot1); an executable writes
-        // its Initial-Exec slots statically (no relocs). Always run when there
-        // are TLS GOT slots so exe IE slots get filled.
+        // local IE slots statically but keeps imported IE as loader TPOFF64
+        // relocs. Always run when there are TLS GOT slots so exe IE slots get
+        // filled or relocated.
         let tls_dyn: Vec<(u64, u32, u32, i64)>;
         if !tls_got.is_empty() {
             let contents =
@@ -676,6 +760,7 @@ fn main() -> Result<()> {
         layout.append_all_dynamic_relocs(&relative, &irelative, &tls_dyn, &symbolic);
     }
     drop(_finalize);
+    peony_prof::record_rss("after-finalize");
 
     let _emit_span = peony_prof::phase("emit");
     emit_full(
@@ -696,6 +781,7 @@ fn main() -> Result<()> {
     }
 
     drop(_emit_span);
+    peony_prof::record_rss("after-emit");
     tracing::info!(output = %args.output.display(), "link complete");
     peony_prof::report();
     Ok(())
@@ -952,7 +1038,7 @@ struct Resolver {
     arena: peony_object::InputArena,
     objects: Vec<InputObject>,
     symbols: SymbolTable,
-    seen_comdat: FxHashSet<Vec<u8>>,
+    seen_comdat: FxHashSet<Name>,
     excluded: FxHashSet<(usize, usize)>,
 }
 
@@ -984,12 +1070,19 @@ impl Resolver {
 struct Member {
     obj: Option<InputObject>,
     /// Global symbol names this member *defines*.
-    defines: HashSet<Vec<u8>>,
+    defines: HashSet<Name>,
 }
 
 fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()> {
     let _t = peony_prof::trace("include_archive_members");
     let mut members: Vec<Member> = Vec::new();
+    let mut undefined: HashSet<Name> = r
+        .symbols
+        .iter()
+        .filter(|(_, res)| !res.is_defined() && res.binding == Binding::Global)
+        .map(|(n, _)| Name::from_slice(n))
+        .collect();
+    peony_prof::count("archive_strong_undefs", undefined.len() as u64);
     // Deduplicate archive paths, keeping first-seen order. `cc`/`rustc` pass the
     // same archive repeatedly (e.g. `-lgcc … -lgcc_s … -lgcc`, four `-lgcc`s) to
     // paper over link-order cycles between libgcc and libc. Reading each archive
@@ -1007,70 +1100,86 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
         .copied()
         .collect();
 
-    // Collect + parse every member serially. NOTE: parallelising the member
-    // parse was MEASURED net-negative (--trace + strace A/B): it cut the parse
-    // sub-phase 8.7→3.1ms but spinning the rayon pool here ADDED ~40 futex +
-    // ~250 sched_yield and raised total syscall time 0.39→0.46s — the Amdahl
-    // wall. The win only materialises once the baseline thread-pool contention
-    // (the futex/sched_yield storm shared with emit) is eliminated, which is the
-    // sharded-resolution/arena work, not this isolated fan-out. Kept serial.
-    for ar in unique {
-        for m in iter_archive_members(ar)
-            .with_context(|| format!("reading archive `{}`", ar.display()))?
-        {
-            let label = format!("{}({})", ar.display(), m.name);
-            // Archive members are parsed from a buffer copied into the arena's
-            // owned store (archives are not zero-copy from the `.a`, a small
-            // non-hot cost; bare objects — the bulk — are zero-copy from mmap).
-            let owned_id = r.arena.push_owned(m.data);
-            // SAFETY: the buffer borrows arena.owned[owned_id], stable for the
-            // arena's life; parse copies nothing out of it.
-            let data: &[u8] = {
-                let b = r.arena.owned_bytes(owned_id);
-                unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
-            };
-            let Ok(obj) = parse_owned_member(&mut r.arena, owned_id, label, data) else {
-                continue;
-            };
-            let defines = obj
-                .symbols
-                .iter()
-                .filter(|s| !s.is_undefined && s.binding != Binding::Local && !s.name.is_empty())
-                .map(|s| s.name.clone())
-                .collect();
-            members.push(Member {
-                obj: Some(obj),
-                defines,
-            });
-        }
-    }
-
     // Fixpoint: include any member that satisfies a currently-undefined symbol.
     // Archive semantics: a member is pulled only to resolve a symbol STILL
     // undefined at that moment. Two archives may define the same symbol (e.g.
     // `__mulsc3` in compiler_builtins.rlib and libgcc.a); only the first is
     // pulled, else a spurious duplicate.
     //
-    // The `undefined` set is maintained INCREMENTALLY instead of rebuilt from the
-    // whole symbol table every round. The old code re-scanned all N symbols each
-    // of up to R rounds — O(R·N), quadratic when many members pull across many
-    // rounds (a big static link is tens of rounds over ~10k symbols = ~100k
-    // wasted scans). Now: build it once, remove names a pulled member defines,
-    // and ADD any new undefined refs that member introduces. Total work is
-    // O(N + Σ member_symbols), and the trace logs each round so the fixpoint's
-    // shape is visible.
-    let mut undefined: HashSet<Vec<u8>> = r
-        .symbols
-        .iter()
-        .filter(|(_, res)| !res.is_defined())
-        .map(|(n, _)| n.to_vec())
-        .collect();
+    // Pending archives are member-parsed lazily when their symbol index matches
+    // the current undefined set. A no-hit link pays only symbol-index reads, but
+    // cross-archive cycles still work because skipped archives are rechecked after
+    // each pulled member adds new undefined refs.
+    let mut pending_archives = unique;
+    let mut parsed_index_offsets: FxHashMap<PathBuf, FxHashSet<u64>> = FxHashMap::default();
     let mut round = 0u32;
     loop {
         if undefined.is_empty() {
             break;
         }
         round += 1;
+        let mut checked_archives = 0u32;
+        let mut skipped_archives = 0u32;
+        let mut parsed_archives = 0u32;
+        let mut next_pending = Vec::new();
+        let mut parsed_indexed = Vec::new();
+        for ar in pending_archives {
+            checked_archives += 1;
+            let seen_offsets = parsed_index_offsets.entry((*ar).clone()).or_default();
+            let (archive_members, used_index) = match iter_archive_members_matching(
+                ar,
+                |name| undefined.contains(name),
+                |offset| seen_offsets.insert(offset),
+            )
+            .with_context(|| format!("reading archive index `{}`", ar.display()))?
+            {
+                Some(members) if members.is_empty() => {
+                    skipped_archives += 1;
+                    next_pending.push(ar);
+                    continue;
+                }
+                Some(members) => (members, true),
+                None => (
+                    iter_archive_members(ar)
+                        .with_context(|| format!("reading archive `{}`", ar.display()))?,
+                    false,
+                ),
+            };
+            parsed_archives += 1;
+            if used_index {
+                parsed_indexed.push(ar);
+            }
+            peony_prof::count("archive_members_seen", archive_members.len() as u64);
+            for m in archive_members {
+                let label = format!("{}({})", ar.display(), m.name);
+                // Archive members are parsed from a buffer copied into the arena's
+                // owned store (archives are not zero-copy from the `.a`, a small
+                // non-hot cost; bare objects — the bulk — are zero-copy from mmap).
+                let owned_id = r.arena.push_owned(m.data);
+                // SAFETY: the buffer borrows arena.owned[owned_id], stable for the
+                // arena's life; parse copies nothing out of it.
+                let data: &[u8] = {
+                    let b = r.arena.owned_bytes(owned_id);
+                    unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
+                };
+                let Ok(obj) = parse_owned_member(&mut r.arena, owned_id, label, data) else {
+                    continue;
+                };
+                peony_prof::count("archive_members_parsed", 1);
+                let defines = obj
+                    .symbols
+                    .iter()
+                    .filter(|s| {
+                        !s.is_undefined && s.binding != Binding::Local && !s.name.is_empty()
+                    })
+                    .map(|s| s.name.clone())
+                    .collect();
+                members.push(Member {
+                    obj: Some(obj),
+                    defines,
+                });
+            }
+        }
         let mut included_any = false;
         let mut pulled = 0u32;
         for m in members.iter_mut() {
@@ -1090,7 +1199,7 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
             // pulled yet have a claimed define dropped (its COMDAT group already
             // seen), in which case that name stays undefined and must remain in
             // the set. Bounded by the member's own symbol count.
-            let touched: Vec<Vec<u8>> = m
+            let touched: Vec<Name> = m
                 .defines
                 .iter()
                 .cloned()
@@ -1103,10 +1212,13 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
                 .collect();
             r.resolve(obj)?;
             for nm in touched {
-                if r.symbols.lookup(&nm).is_some_and(|res| res.is_defined()) {
-                    undefined.remove(&nm);
-                } else {
-                    undefined.insert(nm);
+                match r.symbols.lookup(nm.as_bytes()) {
+                    Some(res) if !res.is_defined() && res.binding == Binding::Global => {
+                        undefined.insert(nm);
+                    }
+                    _ => {
+                        undefined.remove(nm.as_bytes());
+                    }
                 }
             }
             included_any = true;
@@ -1115,11 +1227,18 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
         peony_prof::event(
             "archive-round",
             format!(
-                "round {round}: pulled {pulled}, {} undef left",
+                "round {round}: checked {checked_archives}, skipped {skipped_archives}, parsed {parsed_archives}, pulled {pulled}, {} undef left",
                 undefined.len()
             ),
         );
-        if !included_any {
+        peony_prof::count("archive_index_checks", checked_archives as u64);
+        peony_prof::count("archive_index_skips", skipped_archives as u64);
+        peony_prof::count("archive_members_pulled", pulled as u64);
+        if included_any {
+            next_pending.extend(parsed_indexed);
+        }
+        pending_archives = next_pending;
+        if !included_any && parsed_archives == 0 {
             break;
         }
     }
@@ -1316,6 +1435,10 @@ fn expand_inputs(inputs: Vec<PathBuf>, search: &[PathBuf]) -> Result<Vec<PathBuf
     let mut out = Vec::new();
     let mut work: VecDeque<PathBuf> = inputs.into();
     while let Some(p) = work.pop_front() {
+        if peony_object::classify_file(&p) == peony_object::FileKind::Archive {
+            out.push(p);
+            continue;
+        }
         if !is_linker_script(&p) {
             out.push(p);
             continue;
@@ -1347,7 +1470,10 @@ fn is_linker_script(path: &Path) -> bool {
     let mut magic = [0u8; 8];
     let n = f.read(&mut magic).unwrap_or(0);
     let head = &magic[..n];
-    if head.starts_with(&peony_object::elf::ELFMAG) || head.starts_with(b"!<arch>\n") {
+    if head.starts_with(&peony_object::elf::ELFMAG)
+        || head.starts_with(b"!<arch>\n")
+        || head.starts_with(b"!<thin>\n")
+    {
         return false;
     }
     // Not ELF/archive: read the rest and scan for linker-script directives.
