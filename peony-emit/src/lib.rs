@@ -24,6 +24,8 @@ mod build_id;
 mod eh_frame;
 mod file;
 mod headers;
+mod input_sections;
+mod input_work;
 mod sections;
 
 use build_id::finalize_build_id;
@@ -219,10 +221,7 @@ fn emit_with_filter(
         finalize_build_id(&mut mmap, layout);
     }
 
-    {
-        let _t = peony_prof::trace("emit:flush");
-        mmap.flush().map_err(io)?;
-    }
+    drop(mmap);
 
     chmod_executable(output_path);
 

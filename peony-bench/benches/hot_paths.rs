@@ -22,6 +22,7 @@ use peony_layout::{
 };
 use peony_object::{
     Binding,
+    IndexLookup,
     InputArena,
     InputObject,
     InputReloc,
@@ -153,8 +154,8 @@ fn synthetic_chain(n: usize, reloc_type: u32) -> (Vec<InputObject>, SymbolTable)
         path: "bench.o".to_string(),
         sections,
         symbols,
-        section_map,
-        symbol_map,
+        section_map: IndexLookup::Sparse(section_map),
+        symbol_map: IndexLookup::Sparse(symbol_map),
         comdat_groups: Vec::new(),
     };
     let mut table = SymbolTable::with_capacity(n);

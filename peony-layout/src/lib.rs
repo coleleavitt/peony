@@ -19,18 +19,23 @@
 //! (`section_address + value`) and GOT slot address back into the symbol table,
 //! and [`check_undefined`] rejects unresolved references.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use peony_object::{InputArena, InputObject, SectionKind, elf};
 use peony_symbols::{SymbolId, SymbolTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
-use ws_deque::{Steal, Worker};
 
+mod gc;
 pub mod icf;
 mod script;
 
+pub use gc::{
+    GcOutput,
+    GcStats,
+    LiveSections,
+    gc_sections,
+    gc_sections_rooted,
+    gc_sections_rooted_with_stats,
+};
 pub use script::{ScriptLayout, ScriptOutputSection};
 
 /// Which input sections the layout should emit. Replaces an
@@ -45,6 +50,8 @@ pub enum SectionFilter<'a> {
     All,
     /// Emit only sections in this set (`--gc-sections` reachable set).
     Only(&'a FxHashSet<(usize, usize)>),
+    /// Emit only sections marked in this compact live-section bitset.
+    OnlyLive(&'a LiveSections),
     /// Emit every section EXCEPT those in this set (COMDAT-discarded dups).
     Except(&'a FxHashSet<(usize, usize)>),
 }
@@ -56,18 +63,11 @@ impl SectionFilter<'_> {
         match self {
             SectionFilter::All => true,
             SectionFilter::Only(s) => s.contains(key),
+            SectionFilter::OnlyLive(s) => s.contains(key),
             SectionFilter::Except(s) => !s.contains(key),
         }
     }
 }
-
-// ── S3-GC grain size constant (SPEC §9) ─────────────────────────────────────
-// Minimum frontier-section count per worker before the GC BFS fans out across
-// ws-deque threads. Set high: spawning a thread scope and idle-spinning on
-// futex/sched_yield costs far more than the BFS edge-walk for any link under a
-// few thousand live sections (a typical Rust/C++ exe). Genuinely huge links
-// (Chromium-scale, tens of thousands of sections per level) still parallelize.
-const S3GC_GRAIN_SIZE: usize = 8192;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -98,6 +98,7 @@ pub type Result<T> = std::result::Result<T, LayoutError>;
 pub struct SectionContribution {
     pub object_id: usize,
     pub section_index: usize,
+    pub section_pos: usize,
     /// Offset of this contribution within the output section.
     pub offset: u64,
     pub size: u64,
@@ -379,6 +380,11 @@ pub struct Layout {
     /// PLT stub symbols in slot order, and the `.plt` base address.
     pub plt_slots: Vec<SymbolId>,
     pub plt_base: u64,
+    /// `.rela.plt` IRELATIVE entries for defined IFUNCs reached via a direct
+    /// `call f@PLT`: `(addend byte offset within `dyn_blobs.rela_plt`, IFUNC id)`.
+    /// The addend is the resolver VA, which is only final after
+    /// [`finalize_symbols`], so [`patch_ifunc_plt_relocs`] fills it post-layout.
+    pub ifunc_plt_patches: Vec<(usize, SymbolId)>,
     /// Total size of the static TLS block (aligned); 0 if no TLS.
     pub tls_size: u64,
     /// (object_id, input_section_index) → offset within the TLS block.
@@ -571,10 +577,7 @@ impl Layout {
             let Some(obj) = objects.get(c.object_id) else {
                 continue;
             };
-            let Some(&pos) = obj.section_map.get(&c.section_index) else {
-                continue;
-            };
-            let Some(isec) = obj.sections.get(pos) else {
+            let Some(isec) = obj.sections.get(c.section_pos) else {
                 continue;
             };
             let contrib_va = eh_va + c.offset;
@@ -790,6 +793,31 @@ pub fn compute_layout_icf(
     // `DT_SONAME` string offset in `.dynstr` (shared only).
     let mut soname_dt_off: Option<u32> = None;
     let mut rpath_dt_off: Option<u32> = None;
+    let dynamic_prebuild = peony_prof::trace_fields(
+        "layout:dynamic-prebuild",
+        [
+            peony_prof::TraceField::count(
+                "imports",
+                dynamic.map_or(0, |dynj| dynj.imports.len() as u64),
+            ),
+            peony_prof::TraceField::count(
+                "exports",
+                dynamic.map_or(0, |dynj| dynj.exports.len() as u64),
+            ),
+            peony_prof::TraceField::count(
+                "needed",
+                dynamic.map_or(0, |dynj| dynj.needed.len() as u64),
+            ),
+            peony_prof::TraceField::count(
+                "relative",
+                dynamic.map_or(0, |dynj| dynj.n_relative as u64),
+            ),
+            peony_prof::TraceField::count(
+                "copy_relocs",
+                dynamic.map_or(0, |dynj| dynj.copy_relocs.len() as u64),
+            ),
+        ],
+    );
     if let Some(dynj) = dynamic {
         let copy_imports: FxHashSet<Vec<u8>> = dynj
             .copy_relocs
@@ -1056,6 +1084,7 @@ pub fn compute_layout_icf(
             dyn_blobs.verneed_num = verneed_num;
         }
     }
+    drop(dynamic_prebuild);
     // Number of GOT slots that resolve to dynamic imports (→ GLOB_DAT relocs).
     let n_glob_dat = got_syms
         .iter()
@@ -1068,6 +1097,7 @@ pub fn compute_layout_icf(
         .count();
 
     // ── Pass 5: group allocatable input sections into output sections ────────
+    let layout_group = peony_prof::trace("layout:group-input-sections");
     let mut builders: FxHashMap<String, Builder> = FxHashMap::default();
     // Preserve first-seen order for determinism.
     let mut order: Vec<String> = Vec::new();
@@ -1089,7 +1119,7 @@ pub fn compute_layout_icf(
     }
 
     for (obj_idx, obj) in objects.iter().enumerate() {
-        for sec in &obj.sections {
+        for (section_pos, sec) in obj.sections.iter().enumerate() {
             if !is_allocatable(&sec.name, sec.kind, sec.flags) {
                 continue;
             }
@@ -1117,14 +1147,17 @@ pub fn compute_layout_icf(
                 });
             }
 
-            let out_name = config
+            // Borrowed output-section name (prefix of `sec.name`, or a script
+            // mapping). The map has only ~13 distinct keys but this loop runs
+            // per live section (~21k), so we look up with the borrowed key and
+            // allocate an owned `String` only when inserting a new builder.
+            let out_name: &str = config
                 .script
                 .as_ref()
                 .and_then(|script| script.output_for_input(&sec.name))
-                .map(str::to_string)
                 .unwrap_or_else(|| output_section_name(&sec.name));
             let is_nobits = matches!(sec.kind, SectionKind::Bss | SectionKind::Tbss);
-            let b = builders.entry(out_name.clone()).or_insert_with(|| {
+            if !builders.contains_key(out_name) {
                 // Preserve the meaningful section flags, including SHF_TLS so the
                 // loader maps `.tdata`/`.tbss` as the static TLS template.
                 let flag_mask = elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_EXECINSTR | elf::SHF_TLS;
@@ -1133,7 +1166,7 @@ pub fn compute_layout_icf(
                 let sh_type = if is_nobits {
                     elf::SHT_NOBITS
                 } else {
-                    match out_name.as_str() {
+                    match out_name {
                         ".init_array" => elf::SHT_INIT_ARRAY,
                         ".fini_array" => elf::SHT_FINI_ARRAY,
                         ".preinit_array" => elf::SHT_PREINIT_ARRAY,
@@ -1143,24 +1176,29 @@ pub fn compute_layout_icf(
                         _ => elf::SHT_PROGBITS,
                     }
                 };
-                order.push(out_name.clone());
-                Builder {
-                    name: out_name.clone(),
-                    kind: sec.kind,
-                    sh_flags: sec.flags & flag_mask,
-                    sh_type,
-                    align,
-                    size: 0,
-                    perm: perm_of(sec.flags),
-                    is_nobits,
-                    contributions: Vec::new(),
-                }
-            });
+                order.push(out_name.to_string());
+                builders.insert(
+                    out_name.to_string(),
+                    Builder {
+                        name: out_name.to_string(),
+                        kind: sec.kind,
+                        sh_flags: sec.flags & flag_mask,
+                        sh_type,
+                        align,
+                        size: 0,
+                        perm: perm_of(sec.flags),
+                        is_nobits,
+                        contributions: Vec::new(),
+                    },
+                );
+            }
+            let b = builders.get_mut(out_name).expect("builder just inserted");
 
             let off = align_up(b.size, align);
             b.contributions.push(SectionContribution {
                 object_id: obj_idx,
                 section_index: sec.index.0,
+                section_pos,
                 offset: off,
                 size: sec.size,
             });
@@ -1187,10 +1225,21 @@ pub fn compute_layout_icf(
     rx.sort_by(|a, b| a.name.cmp(&b.name));
     rw_pb.sort_by(|a, b| a.name.cmp(&b.name));
     rw_bss.sort_by(|a, b| a.name.cmp(&b.name));
+    peony_prof::event_fields(
+        "layout:group-result",
+        [
+            peony_prof::TraceField::count("ro", ro.len() as u64),
+            peony_prof::TraceField::count("rx", rx.len() as u64),
+            peony_prof::TraceField::count("rw", rw_pb.len() as u64),
+            peony_prof::TraceField::count("bss", rw_bss.len() as u64),
+        ],
+    );
+    drop(layout_group);
 
     // Synthesise .got (RW progbits) from the scan. The scalar GOT (one 8-byte
     // slot per `got_syms` entry) is followed by the TLS GOT region (GD pairs,
     // the LDM pair, then IE slots) for a shared object.
+    let layout_synthetic = peony_prof::trace("layout:synthetic-builders");
     let scalar_got_bytes = (got_syms.len() as u64) * 8;
     let got_total = scalar_got_bytes + tls.byte_size();
     if got_total > 0 {
@@ -1474,6 +1523,18 @@ pub fn compute_layout_icf(
     sort_builders_by_script(&mut rx, config.script.as_ref());
     sort_builders_by_script(&mut rw_pb, config.script.as_ref());
     sort_builders_by_script(&mut rw_bss, config.script.as_ref());
+    peony_prof::event_fields(
+        "layout:builder-result",
+        [
+            peony_prof::TraceField::count("ro", ro.len() as u64),
+            peony_prof::TraceField::count("rx", rx.len() as u64),
+            peony_prof::TraceField::count("rw", rw_pb.len() as u64),
+            peony_prof::TraceField::count("bss", rw_bss.len() as u64),
+            peony_prof::TraceField::count("dyn_entries", dyn_entries as u64),
+            peony_prof::TraceField::bytes("got", got_total),
+        ],
+    );
+    drop(layout_synthetic);
 
     // ── Determine segment count (needed before we reserve header space) ──────
     let has_rx = !rx.is_empty();
@@ -1518,6 +1579,13 @@ pub fn compute_layout_icf(
     // grow+rehash repeatedly on a large link (profiling showed reserve_rehash on
     // these `(usize,usize)` maps at ~4% of self-time).
     let total_input_sections: usize = objects.iter().map(|o| o.sections.len()).sum();
+    let layout_place = peony_prof::trace_fields(
+        "layout:place-alloc",
+        [
+            peony_prof::TraceField::count("input_sections", total_input_sections as u64),
+            peony_prof::TraceField::count("phdrs", phnum),
+        ],
+    );
     let mut sections: Vec<OutputSection> = Vec::new();
     let mut addresses: FxHashMap<(usize, usize), u64> =
         FxHashMap::with_capacity_and_hasher(total_input_sections, Default::default());
@@ -1693,6 +1761,15 @@ pub fn compute_layout_icf(
         (None, Some((_, end))) => end - base,
         (None, None) => ro_seg_end - base,
     };
+    peony_prof::event_fields(
+        "layout:place-result",
+        [
+            peony_prof::TraceField::count("sections", sections.len() as u64),
+            peony_prof::TraceField::count("addresses", addresses.len() as u64),
+            peony_prof::TraceField::bytes("file_content", file_content_end),
+        ],
+    );
+    drop(layout_place);
 
     // ── Symbol table plan (.symtab / .strtab) ────────────────────────────────
     // `shndx == position + 1` for every alloc section (the null header is 0 and
@@ -1709,18 +1786,28 @@ pub fn compute_layout_icf(
             (rank, s.sh_addr)
         })
         .map(|s| s.sh_addr);
-    let (symtab, strtab, num_locals) =
-        build_symtab_plan(symbols, objects, &addresses, &sec_to_out, tls_base_va);
+    let symtab_plan = peony_prof::trace_fields(
+        "layout:symtab-plan",
+        [
+            peony_prof::TraceField::count("symbols", symbols.len() as u64),
+            peony_prof::TraceField::count("objects", objects.len() as u64),
+            peony_prof::TraceField::count("strip", u64::from(config.strip)),
+        ],
+    );
+    let (symtab_emitted, symtab, strtab, num_locals) = if config.strip {
+        (false, Vec::new(), Vec::new(), 0)
+    } else {
+        let (symtab, strtab, num_locals) =
+            build_symtab_plan(symbols, objects, &addresses, &sec_to_out, tls_base_va);
+        (true, symtab, strtab, num_locals)
+    };
+    drop(symtab_plan);
 
     // ── Place non-allocatable meta sections ──────────────────────────────────
+    let layout_meta = peony_prof::trace("layout:meta-sections");
     // `.symtab`/`.strtab` are omitted under `--strip-all`; `.shstrtab` is always
     // emitted (the section headers reference it).
     let mut foff = align_up(file_content_end, 8);
-    let (symtab_emitted, symtab) = if config.strip {
-        (false, Vec::new())
-    } else {
-        (true, symtab)
-    };
 
     let mut symtab_pos = None;
     let mut strtab_pos = None;
@@ -1816,16 +1903,12 @@ pub fn compute_layout_icf(
                 let Some(obj) = objects.get(c.object_id) else {
                     continue;
                 };
-                let Some(&sec_pos) = obj.section_map.get(&c.section_index) else {
-                    continue;
-                };
-                let Some(sec) = obj.sections.get(sec_pos) else {
+                let Some(sec) = obj.sections.get(c.section_pos) else {
                     continue;
                 };
                 for reloc in &sec.relocs {
                     let sym_idx = obj
-                        .symbols
-                        .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                        .symbol_by_index(reloc.symbol.0)
                         .and_then(|sym| sym_index.get(sym.name.as_bytes()).copied())
                         .unwrap_or(0);
                     let r_offset = c.offset + reloc.offset;
@@ -1886,7 +1969,7 @@ pub fn compute_layout_icf(
         let mut off = 0u64;
         let mut max_align = 1u64;
         for (obj_idx, obj) in objects.iter().enumerate() {
-            for sec in &obj.sections {
+            for (section_pos, sec) in obj.sections.iter().enumerate() {
                 if sec.name.as_bytes() != passthrough.as_bytes() || sec.data.is_empty() {
                     continue;
                 }
@@ -1898,6 +1981,7 @@ pub fn compute_layout_icf(
                 contributions.push(SectionContribution {
                     object_id: obj_idx,
                     section_index: sec.index.0,
+                    section_pos,
                     offset: off,
                     size: sec.data.len() as u64,
                 });
@@ -2040,6 +2124,19 @@ pub fn compute_layout_icf(
     let shnum = (sections.len() + 1) as u64; // + null section
     let shstrndx = sections[shstrtab_pos].shndx as u64;
     let file_size = shoff + shnum * elf::SHDR_SIZE;
+    peony_prof::event_fields(
+        "layout:meta-result",
+        [
+            peony_prof::TraceField::count("sections", sections.len() as u64),
+            peony_prof::TraceField::count("symtab", symtab.len() as u64),
+            peony_prof::TraceField::bytes("strtab", strtab.len() as u64),
+            peony_prof::TraceField::bytes("shstrtab", shstrtab_size),
+            peony_prof::TraceField::bytes("file", file_size),
+        ],
+    );
+    drop(layout_meta);
+
+    let layout_finalize = peony_prof::trace("layout:finalize-blobs");
 
     // ── GOT base ─────────────────────────────────────────────────────────────
     let got_base = sections
@@ -2158,6 +2255,7 @@ pub fn compute_layout_icf(
 
     // ── Dynamic blobs (.rela.dyn, .dynamic) — now that section VAs are known ──
     let mut plt_base = 0u64;
+    let mut ifunc_plt_patches: Vec<(usize, SymbolId)> = Vec::new();
     if let Some(dynj) = dynamic {
         let va_of = |src: SecSource| {
             sections
@@ -2231,14 +2329,34 @@ pub fn compute_layout_icf(
                 stub[2..6].copy_from_slice(&disp.to_le_bytes());
                 plt.extend_from_slice(&stub);
                 gotplt.extend_from_slice(&0u64.to_le_bytes()); // filled eagerly by ld.so
-                let dynidx = symbols
+                // A defined IFUNC reached via `call f@PLT` is resolved at load
+                // time by running its resolver: the `.got.plt` slot takes an
+                // R_X86_64_IRELATIVE (symbol index 0, addend = resolver VA),
+                // exactly like an IFUNC GOT slot, NOT a JUMP_SLOT against a
+                // .dynsym import. The resolver VA is only final after
+                // `finalize_symbols`, so emit a 0 addend now and patch it in
+                // `patch_ifunc_plt_relocs`.
+                let is_ifunc = symbols
                     .name_by_id(*id)
-                    .and_then(|n| import_dynsym.get(n))
-                    .copied()
-                    .unwrap_or(0);
-                let r_info = ((dynidx as u64) << 32) | (elf::R_X86_64_JUMP_SLOT as u64);
+                    .and_then(|n| symbols.lookup(n))
+                    .is_some_and(|r| r.is_ifunc && r.is_defined() && !r.import);
+                let r_info = if is_ifunc {
+                    elf::R_X86_64_IRELATIVE as u64
+                } else {
+                    let dynidx = symbols
+                        .name_by_id(*id)
+                        .and_then(|n| import_dynsym.get(n))
+                        .copied()
+                        .unwrap_or(0);
+                    ((dynidx as u64) << 32) | (elf::R_X86_64_JUMP_SLOT as u64)
+                };
                 relaplt.extend_from_slice(&slot_va.to_le_bytes());
                 relaplt.extend_from_slice(&r_info.to_le_bytes());
+                if is_ifunc {
+                    // Record the addend's byte offset (entry start + 16) so the
+                    // post-layout patch can write the resolver VA.
+                    ifunc_plt_patches.push((relaplt.len(), *id));
+                }
                 relaplt.extend_from_slice(&0i64.to_le_bytes());
             }
             dyn_blobs.plt = plt;
@@ -2387,8 +2505,26 @@ pub fn compute_layout_icf(
             e[16..24].copy_from_slice(&res.size.to_le_bytes());
         }
     }
+    peony_prof::event_fields(
+        "layout:finalize-result",
+        [
+            peony_prof::TraceField::count("tls_offsets", tls_offsets.len() as u64),
+            peony_prof::TraceField::bytes("rela_dyn", dyn_blobs.rela_dyn.len() as u64),
+            peony_prof::TraceField::bytes("dynamic", dyn_blobs.dynamic.len() as u64),
+            peony_prof::TraceField::bytes("plt", dyn_blobs.plt.len() as u64),
+        ],
+    );
+    drop(layout_finalize);
 
     // ── Program headers ──────────────────────────────────────────────────────
+    let layout_phdrs = peony_prof::trace_fields(
+        "layout:program-headers",
+        [
+            peony_prof::TraceField::count("reserved", phnum),
+            peony_prof::TraceField::count("has_tls", u64::from(has_tls)),
+            peony_prof::TraceField::count("has_relro", u64::from(has_relro)),
+        ],
+    );
     let mut segments = Vec::with_capacity(phnum as usize);
     segments.push(ProgramHeader {
         p_type: elf::PT_PHDR,
@@ -2643,6 +2779,7 @@ pub fn compute_layout_icf(
             actual: segments.len() as u64,
         });
     }
+    drop(layout_phdrs);
 
     // ── Linker-defined symbol addresses ──────────────────────────────────────
     let mut image_end = base;
@@ -2693,6 +2830,7 @@ pub fn compute_layout_icf(
         dyn_blobs,
         plt_slots: plt_syms.to_vec(),
         plt_base,
+        ifunc_plt_patches,
         tls_size,
         tls_offsets,
         tls_gd_addr,
@@ -2704,293 +2842,6 @@ pub fn compute_layout_icf(
         emit_relocs,
         gnu_property_note,
     })
-}
-
-/// Compute the set of input sections reachable from the GC roots
-/// (`--gc-sections`). Roots are the entry symbol's section plus init/fini arrays;
-/// edges run from a section to the sections defining the symbols its relocations
-/// reference. Returns the live `(object_id, input_section_index)` set.
-/// S3-GC: Optimal Level-Synchronous Parallel Section Garbage Collection.
-///
-/// Implements QUAD Algorithm 3.1 (Tithi, Fogel, Chowdhury 2022) using
-/// `ws-deque`'s Chase-Lev work-stealing deque for parallel edge expansion:
-///
-/// - Adaptive thread count `Pₗ = min(P, |frontier|)` — never wastes threads
-///   on sparse BFS levels.
-/// - Level-synchronous: barrier between levels via thread join.
-/// - Lock-free hot path: each thread owns a `Worker` deque; thieves steal
-///   across them during imbalanced levels.
-///
-/// Complexity: O((m+n)/P + D·log P) matching the theoretical lower bound.
-pub fn gc_sections(
-    objects: &[InputObject],
-    symbols: &SymbolTable,
-    entry_symbol: &str,
-) -> FxHashSet<(usize, usize)> {
-    gc_sections_rooted(objects, symbols, entry_symbol, false)
-}
-
-/// As [`gc_sections`], but when `export_roots` is set every defined, non-hidden
-/// global/weak symbol is also a GC root. Required for a shared object: its
-/// exported symbols (and everything they reach) must be retained even though no
-/// `_start` references them.
-pub fn gc_sections_rooted(
-    objects: &[InputObject],
-    symbols: &SymbolTable,
-    entry_symbol: &str,
-    export_roots: bool,
-) -> FxHashSet<(usize, usize)> {
-    let resolve_target =
-        |obj_id: usize, sym: &peony_object::InputSymbol| -> Option<(usize, usize)> {
-            if sym.binding == peony_object::Binding::Local {
-                sym.section.map(|s| (obj_id, s.0))
-            } else {
-                let res = symbols.lookup(&sym.name)?;
-                let def = res.defined_in?;
-                res.section_index.map(|si| (def.0 as usize, si))
-            }
-        };
-
-    // Build root set.
-    let mut frontier: Vec<(usize, usize)> = Vec::new();
-    let mut live: FxHashSet<(usize, usize)> = FxHashSet::default();
-
-    if let Some(res) = symbols.lookup(entry_symbol.as_bytes()) {
-        if let (Some(def), Some(si)) = (res.defined_in, res.section_index) {
-            let key = (def.0 as usize, si);
-            if live.insert(key) {
-                frontier.push(key);
-            }
-        }
-    }
-    // Shared-object exports are roots: the section defining each exported symbol
-    // must survive GC so `dlsym` can resolve it to real code/data.
-    if export_roots {
-        for (_, res) in symbols.iter() {
-            if !res.is_export() {
-                continue;
-            }
-            if let (Some(def), Some(si)) = (res.defined_in, res.section_index) {
-                let key = (def.0 as usize, si);
-                if live.insert(key) {
-                    frontier.push(key);
-                }
-            }
-        }
-    }
-    for (obj_id, obj) in objects.iter().enumerate() {
-        for sec in &obj.sections {
-            // GC roots: init/fini arrays, SHF_GNU_RETAIN sections, and
-            // exception-handling metadata. `.eh_frame` and `.gcc_except_table`
-            // are NOT referenced *by* code — they reference *into* code (FDEs
-            // point at functions, LSDA tables are referenced by FDE aug data).
-            // Without rooting them, GC would discard all unwinding/exception
-            // info and `catch_unwind` / C++ exceptions would abort with
-            // `_URC_END_OF_STACK`. Real linkers (ld, lld, mold) keep `.eh_frame`
-            // FDEs whose target function survives; the simpler correct approach
-            // is to root all EH metadata unconditionally.
-            let keep = sec.name.starts_with(b".init")
-                || sec.name.starts_with(b".fini")
-                || sec.name.starts_with(b".preinit_array")
-                || sec.name.starts_with(b".eh_frame")
-                || sec.name.starts_with(b".gcc_except_table")
-                || (sec.flags & peony_object::elf::SHF_GNU_RETAIN) != 0;
-            if keep && sec.flags & peony_object::elf::SHF_ALLOC != 0 {
-                let key = (obj_id, sec.index.0);
-                if live.insert(key) {
-                    frontier.push(key);
-                }
-            }
-        }
-    }
-
-    // S3-GC BFS using ws-deque Chase-Lev workers.
-    // Number of threads: adaptive per level (Pₗ = min(P, |frontier|)).
-    let max_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-
-    while !frontier.is_empty() {
-        // Adaptive: use at most as many threads as frontier items, up to max_threads.
-        let pl = max_threads
-            .min(frontier.len())
-            .min(frontier.len().div_ceil(S3GC_GRAIN_SIZE))
-            .max(1);
-
-        if pl == 1 {
-            // Serial fast path for sparse levels (avoids thread spawn overhead).
-            let mut next: Vec<(usize, usize)> = Vec::new();
-            for &(obj_id, sec_idx) in &frontier {
-                let Some(obj) = objects.get(obj_id) else {
-                    continue;
-                };
-                let Some(&pos) = obj.section_map.get(&sec_idx) else {
-                    continue;
-                };
-                let Some(sec) = obj.sections.get(pos) else {
-                    continue;
-                };
-                for reloc in &sec.relocs {
-                    let Some(sym) = obj
-                        .symbols
-                        .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                    else {
-                        continue;
-                    };
-                    if let Some(key) = resolve_target(obj_id, sym) {
-                        if live.insert(key) {
-                            next.push(key);
-                        }
-                    }
-                }
-            }
-            frontier = next;
-            continue;
-        }
-
-        // Parallel path: distribute frontier across pl Chase-Lev workers.
-        // Each thread owns one Worker and may steal from others via Stealers.
-
-        // One Worker per thread; seed round-robin, then move each into its thread.
-        let workers: Vec<Worker<(usize, usize)>> = (0..pl).map(|_| Worker::new()).collect();
-        // Build stealers before consuming workers.
-        let stealers: Vec<_> = workers.iter().map(|w| w.stealer()).collect();
-
-        for (i, &item) in frontier.iter().enumerate() {
-            workers[i % pl].push(item);
-        }
-        frontier.clear();
-
-        let results: Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        // Quiescence counter: incremented when a thread goes idle, decremented when
-        // it finds work again. When idle_count == pl and a full steal round finds
-        // nothing, the level is exhausted. This is the standard Chase-Lev drain.
-        let idle_count = Arc::new(AtomicUsize::new(0));
-
-        // Move each Worker (owner) into its thread; thieves use cloned Stealers.
-        std::thread::scope(|scope| {
-            for (t, worker) in workers.into_iter().enumerate() {
-                let all_stealers: Vec<_> = stealers.to_vec();
-                let results = Arc::clone(&results);
-                let idle_count = Arc::clone(&idle_count);
-
-                scope.spawn(move || {
-                    let mut local_out: Vec<(usize, usize)> = Vec::new();
-                    let mut is_idle = false;
-
-                    loop {
-                        // Try own deque first.
-                        if let Some(item) = worker.pop() {
-                            if is_idle {
-                                idle_count.fetch_sub(1, Ordering::Release);
-                                is_idle = false;
-                            }
-                            let (obj_id, sec_idx) = item;
-                            let Some(obj) = objects.get(obj_id) else {
-                                continue;
-                            };
-                            let Some(&pos) = obj.section_map.get(&sec_idx) else {
-                                continue;
-                            };
-                            let Some(sec) = obj.sections.get(pos) else {
-                                continue;
-                            };
-                            for reloc in &sec.relocs {
-                                let Some(sym) = obj.symbols.get(
-                                    *obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX),
-                                ) else {
-                                    continue;
-                                };
-                                if let Some(key) = resolve_target(obj_id, sym) {
-                                    local_out.push(key);
-                                }
-                            }
-                            continue;
-                        }
-
-                        // Own deque empty: try stealing from all siblings (including self
-                        // via Retry-safe index skipping).
-                        let mut found = false;
-                        for (i, s) in all_stealers.iter().enumerate() {
-                            if i == t {
-                                continue;
-                            }
-                            match s.steal() {
-                                Steal::Success(item) => {
-                                    if is_idle {
-                                        idle_count.fetch_sub(1, Ordering::Release);
-                                        is_idle = false;
-                                    }
-                                    let (obj_id, sec_idx) = item;
-                                    let Some(obj) = objects.get(obj_id) else {
-                                        continue;
-                                    };
-                                    let Some(&pos) = obj.section_map.get(&sec_idx) else {
-                                        continue;
-                                    };
-                                    let Some(sec) = obj.sections.get(pos) else {
-                                        continue;
-                                    };
-                                    for reloc in &sec.relocs {
-                                        let Some(sym) = obj.symbols.get(
-                                            *obj.symbol_map
-                                                .get(&reloc.symbol.0)
-                                                .unwrap_or(&usize::MAX),
-                                        ) else {
-                                            continue;
-                                        };
-                                        if let Some(key) = resolve_target(obj_id, sym) {
-                                            local_out.push(key);
-                                        }
-                                    }
-                                    found = true;
-                                    break;
-                                }
-                                // Retry = victim non-empty but we lost the CAS; loop again.
-                                Steal::Retry => {
-                                    found = true;
-                                    break;
-                                }
-                                Steal::Empty => {}
-                            }
-                        }
-
-                        if found {
-                            continue;
-                        }
-
-                        // Nothing found — mark idle if not already.
-                        if !is_idle {
-                            idle_count.fetch_add(1, Ordering::Release);
-                            is_idle = true;
-                        }
-
-                        // Quiescence: all threads idle → level is exhausted.
-                        if idle_count.load(Ordering::Acquire) >= pl {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-
-                    if !local_out.is_empty() {
-                        results.lock().unwrap().extend(local_out);
-                    }
-                });
-            }
-            // No done.store() needed — threads self-terminate via quiescence.
-        });
-
-        // Dedup and build next frontier (serial — fast for typical sizes).
-        let candidates = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
-        for key in candidates {
-            if live.insert(key) {
-                frontier.push(key);
-            }
-        }
-    }
-
-    live
 }
 
 /// Place a list of builders contiguously starting at the current `va`, building
@@ -3317,6 +3168,25 @@ pub fn finalize_symbols(symbols: &mut SymbolTable, layout: &Layout) {
     }
 }
 
+/// Fill the `.rela.plt` IRELATIVE addends for defined IFUNCs reached via a direct
+/// `call f@PLT` (sites recorded in [`Layout::ifunc_plt_patches`]). The addend is
+/// the IFUNC resolver's virtual address, which is final only after
+/// [`finalize_symbols`], so this is a post-layout pass. No-op otherwise.
+pub fn patch_ifunc_plt_relocs(layout: &mut Layout, symbols: &SymbolTable) {
+    for i in 0..layout.ifunc_plt_patches.len() {
+        let (addend_off, id) = layout.ifunc_plt_patches[i];
+        let va = symbols
+            .name_by_id(id)
+            .and_then(|n| symbols.lookup(n))
+            .map(|r| r.virtual_address)
+            .unwrap_or(0);
+        let end = addend_off + 8;
+        if end <= layout.dyn_blobs.rela_plt.len() {
+            layout.dyn_blobs.rela_plt[addend_off..end].copy_from_slice(&(va as i64).to_le_bytes());
+        }
+    }
+}
+
 /// Error if any *strong* (non-weak) referenced symbol remained undefined. Weak
 /// undefined references are permitted and resolve to zero.
 pub fn check_undefined(symbols: &SymbolTable) -> Result<()> {
@@ -3539,15 +3409,18 @@ fn sort_builders_by_script(builders: &mut [Builder], script: Option<&ScriptLayou
 
 /// Map an input section name to its output section name
 /// (`.text._ZN…` → `.text`, `.rodata..L__unnamed` → `.rodata`).
-fn output_section_name(name: &[u8]) -> String {
+/// Map an input section name to its output section name (a prefix of the input,
+/// e.g. `.text.foo` -> `.text`), returned as a borrowed slice of `name` so the
+/// hot grouping loop allocates only when it inserts a new output section.
+fn output_section_name(name: &[u8]) -> &str {
     let s = std::str::from_utf8(name).unwrap_or(".unknown");
     if s.starts_with(".note.") {
-        return s.to_string();
+        return s;
     }
     if let Some(dot2) = s.get(1..).and_then(|rest| rest.find('.')) {
-        s[..dot2 + 1].to_string()
+        &s[..dot2 + 1]
     } else {
-        s.to_string()
+        s
     }
 }
 

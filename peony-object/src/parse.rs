@@ -3,7 +3,6 @@ use std::path::Path;
 use memmap2::Mmap;
 use object::read::elf::{ElfFile64, SectionHeader};
 use object::{Endianness, Object, ObjectSection, ObjectSymbol};
-use rustc_hash::FxHashMap;
 
 use crate::section_parse::{
     classify_section,
@@ -15,6 +14,7 @@ use crate::section_parse::{
 use crate::{
     Binding,
     DataSrc,
+    IndexLookup,
     InputArena,
     InputObject,
     InputSection,
@@ -96,13 +96,13 @@ fn parse_backed(
         source: e,
     })?;
 
-    let section_count = elf.sections().count();
+    let sections_iter = elf.sections();
+    let section_count = sections_iter.size_hint().0;
     let mut sections = Vec::with_capacity(section_count);
-    let mut section_map = FxHashMap::default();
-    section_map.reserve(section_count);
+    let mut section_map = IndexLookup::with_dense_len(section_count.saturating_add(1));
     let endian = elf.endian();
 
-    for section in elf.sections() {
+    for section in sections_iter {
         let idx = section.index();
         let sh_type = section.elf_section_header().sh_type(endian);
         let input_name = section.name_bytes().unwrap_or(b"");
@@ -115,10 +115,11 @@ fn parse_backed(
         let kind = classify_section(&name, sh_flags);
 
         let (file_off, file_len) = section.file_range().unwrap_or((0, 0));
-        let is_compressed = matches!(
-            section.compressed_file_range(),
-            Ok(r) if r.format != object::CompressionFormat::None
-        );
+        let is_compressed = is_debug
+            && matches!(
+                section.compressed_file_range(),
+                Ok(r) if r.format != object::CompressionFormat::None
+            );
 
         let mut data_handle: SectionData;
         let mut owned_len: Option<u64> = None;
@@ -198,13 +199,13 @@ fn parse_backed(
         sections.push(isec);
     }
 
-    let symbol_count = elf.symbols().count();
+    let symbols_iter = elf.symbols();
+    let symbol_count = symbols_iter.size_hint().0;
     let mut symbols = Vec::with_capacity(symbol_count);
-    let mut symbol_map = FxHashMap::default();
-    symbol_map.reserve(symbol_count);
+    let mut symbol_map = IndexLookup::with_dense_len(symbol_count);
     let elf_symtab = elf.elf_symbol_table();
 
-    for sym in elf.symbols() {
+    for sym in symbols_iter {
         let idx = sym.index();
         let name = Name::from_slice(sym.name_bytes().unwrap_or(b""));
         let binding = if sym.scope() == object::SymbolScope::Compilation {

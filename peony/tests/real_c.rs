@@ -97,3 +97,27 @@ fn c_computation() {
     };
     assert_eq!(run(&exe), 42);
 }
+
+/// A direct `call ifn()` to a locally-defined IFUNC must route through a PLT stub
+/// whose `.got.plt` slot is filled by an `R_X86_64_IRELATIVE` (the loader runs
+/// the resolver and the call lands on the chosen implementation). Resolving the
+/// `PLT32` straight to the symbol would call the *resolver* itself and return its
+/// `void*` truncated to `int` — garbage. Regression for the IFUNC direct-call PLT
+/// bug (the function-pointer/GOT path already worked; the direct call did not).
+#[test]
+fn c_ifunc_direct_call() {
+    let dir = workdir("c_ifunc");
+    let src = "static int impl(void){ return 42; }\n\
+               static void *resolve(void){ return (void*)impl; }\n\
+               int ifn(void) __attribute__((ifunc(\"resolve\")));\n\
+               int main(void){ return ifn(); }\n";
+    let Some(exe) = cc_b_pie(&dir, "ifn", &[("ifn.c", src)], false) else {
+        eprintln!("skipping: toolchain unavailable");
+        return;
+    };
+    assert_eq!(
+        run(&exe),
+        42,
+        "direct call to a local IFUNC must invoke the resolved impl, not the resolver"
+    );
+}

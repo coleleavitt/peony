@@ -24,11 +24,7 @@ pub(crate) fn open_output_map(
         f
     };
     // SAFETY: we hold the file open exclusively for the duration of the map.
-    let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
-    if !can_overwrite {
-        mmap.iter_mut().for_each(|b| *b = 0);
-    }
-    Ok(mmap)
+    unsafe { MmapMut::map_mut(&file) }
 }
 
 pub(crate) fn chmod_executable(output_path: &Path) {

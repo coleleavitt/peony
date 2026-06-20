@@ -34,7 +34,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use peony_emit::{EmitConfig, emit_full, emit_partial};
-use peony_layout::{LayoutConfig, ScriptLayout, check_undefined, finalize_symbols};
+use peony_layout::{
+    LayoutConfig,
+    ScriptLayout,
+    check_undefined,
+    finalize_symbols,
+    patch_ifunc_plt_relocs,
+};
 use peony_object::{
     Binding,
     InputObject,
@@ -110,8 +116,12 @@ fn main() -> Result<()> {
     // printed at the end. `--trace` additionally records the call-flow tree
     // (caller→callee by file:line) for following a bug through the pipeline.
     // Both are cheap no-ops for every normal link.
-    if args.trace_stack {
+    if args.trace_stack && args.trace_detail {
+        peony_prof::trace_stack_detail_enable();
+    } else if args.trace_stack {
         peony_prof::trace_stack_enable();
+    } else if args.trace_detail {
+        peony_prof::trace_detail_enable();
     } else if args.trace {
         peony_prof::trace_enable();
     } else if args.stats {
@@ -162,10 +172,13 @@ fn main() -> Result<()> {
     // When invoked directly as the linker (e.g. by rustc), the C-runtime startup
     // objects that provide `_start`/`_init` are not passed; inject them as `cc`
     // would for a dynamic/PIE executable. A shared object has no `_start`/crt1.
-    let inputs = if args.shared {
-        inputs
-    } else {
-        inject_crt_objects(inputs, &args)
+    let (inputs, injected_crt) = {
+        let _p = peony_prof::phase("inject-crt");
+        if args.shared {
+            (inputs, Vec::new())
+        } else {
+            inject_crt_objects(inputs, &args)
+        }
     };
     let input_paths = resolved_input_paths(&inputs);
 
@@ -199,7 +212,7 @@ fn main() -> Result<()> {
         needed,
     } = {
         let _p = peony_prof::phase("parse+resolve");
-        load_and_resolve(&inputs, &args.undefined)?
+        load_and_resolve_with_crt_fallback(&inputs, &injected_crt, &args.undefined)?
     };
     peony_prof::record_items("parse+resolve", objects.len() as u64);
     peony_prof::count("objects_parsed", objects.len() as u64);
@@ -292,15 +305,28 @@ fn main() -> Result<()> {
 
     // Combine the GC live-set with COMDAT deduplication into the section filter
     // the layout will apply.
-    let live = compute_live(
-        &objects,
-        args.gc_sections,
-        &symbols,
-        &args.entry,
-        &comdat_excluded,
-        args.shared || args.export_dynamic || !args.export_dynamic_patterns.is_empty(),
-        Some(&script_controls.layout),
-    );
+    let export_roots =
+        args.shared || args.export_dynamic || !args.export_dynamic_patterns.is_empty();
+    let live = {
+        let _t = peony_prof::trace_fields(
+            "reloc-postproc:live-sections",
+            [
+                peony_prof::TraceField::count("objects", objects.len() as u64),
+                peony_prof::TraceField::count("comdat_excluded", comdat_excluded.len() as u64),
+                peony_prof::TraceField::count("gc", u64::from(args.gc_sections)),
+                peony_prof::TraceField::count("export_roots", u64::from(export_roots)),
+            ],
+        );
+        compute_live(
+            &objects,
+            args.gc_sections,
+            &symbols,
+            &args.entry,
+            &comdat_excluded,
+            export_roots,
+            Some(&script_controls.layout),
+        )
+    };
     match &live {
         LiveFilter::Only(l) => {
             tracing::info!(live_sections = l.len(), "section selection complete (gc)")
@@ -497,6 +523,16 @@ fn main() -> Result<()> {
     };
     drop(_postscan);
     let layout_span = peony_prof::phase("layout");
+    let layout_trace = peony_prof::trace_fields(
+        "layout",
+        [
+            peony_prof::TraceField::count("objects", objects.len() as u64),
+            peony_prof::TraceField::count("symbols", symbols.len() as u64),
+            peony_prof::TraceField::count("got", got_syms.len() as u64),
+            peony_prof::TraceField::count("plt", plt_syms.len() as u64),
+            peony_prof::TraceField::count("dynamic", u64::from(dynamic.is_some())),
+        ],
+    );
     let mut layout = peony_layout::compute_layout_icf(
         &arena,
         &objects,
@@ -510,6 +546,7 @@ fn main() -> Result<()> {
         fold_map.as_ref(),
     )
     .context("layout computation failed")?;
+    drop(layout_trace);
     drop(layout_span);
     peony_prof::count("layout_sections", layout.output_sections.len() as u64);
     peony_prof::count("layout_segments", layout.segments.len() as u64);
@@ -530,6 +567,9 @@ fn main() -> Result<()> {
     let _finalize = peony_prof::phase("finalize-syms");
     set_linker_addresses(&mut symbols, &layout, &provided);
     finalize_symbols(&mut symbols, &layout);
+    // Fill `.rela.plt` IRELATIVE addends for direct-call IFUNCs now that resolver
+    // VAs are final (see `patch_ifunc_plt_relocs`).
+    patch_ifunc_plt_relocs(&mut layout, &symbols);
     peony_prof::record_items("finalize-syms", symbols.len() as u64);
     // A shared object may legitimately reference symbols it does not define;
     // they are resolved at load time against the process image. Only enforce
@@ -543,13 +583,15 @@ fn main() -> Result<()> {
     // entries (ET_DYN only) come first, then the GLOB_DATs. For a non-PIE dynamic
     // executable there are no relatives, so this just materialises the GLOB_DATs.
     if dynamic.is_some() {
-        // Partition data relocations into RELATIVE (normal) and IRELATIVE (IFUNC,
-        // resolver run at startup). Meaningful for any ET_DYN (PIE or shared); a
+        // Partition data relocations into RELATIVE (normal), IRELATIVE (IFUNC,
+        // resolver run at startup), and symbolic R64 (imported DSO data) in a
+        // single post-layout walk. Meaningful for any ET_DYN (PIE or shared); a
         // non-PIE dynamic exe has no base-relative data relocs.
-        let (relative, irelative) = if et_dyn {
-            peony_reloc::collect_dynamic_data_relocs(&objects, &symbols, &layout)
+        let (relative, irelative, symbolic) = if et_dyn {
+            let _t = peony_prof::trace("finalize:collect-dyn-relocs");
+            peony_reloc::collect_data_and_symbolic_relocs(&objects, &symbols, &layout)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         if !irelative.is_empty() {
             tracing::info!(
@@ -577,12 +619,8 @@ fn main() -> Result<()> {
         } else {
             tls_dyn = Vec::new();
         }
-        // Symbolic R_X86_64_64 dynamic relocs for imported-symbol data sites.
-        let symbolic = if et_dyn {
-            peony_reloc::collect_symbolic_data_relocs(&objects, &symbols, &layout)
-        } else {
-            Vec::new()
-        };
+        // Symbolic R_X86_64_64 dynamic relocs (imported-symbol data sites) were
+        // collected above alongside the RELATIVE/IRELATIVE lists.
         if !symbolic.is_empty() {
             tracing::info!(
                 symbolic = symbolic.len(),
@@ -820,7 +858,7 @@ fn relocation_reverse_index(
         .filter_map(|c| {
             objects
                 .get(c.object_id)
-                .and_then(|obj| obj.sections.get(c.section_index))
+                .and_then(|obj| obj.sections.get(c.section_pos))
         })
         .map(|sec| sec.relocs.len())
         .sum();
@@ -834,16 +872,13 @@ fn relocation_reverse_index(
             let Some(obj) = objects.get(c.object_id) else {
                 continue;
             };
-            let Some(input_sec) = obj.sections.get(c.section_index) else {
+            let Some(input_sec) = obj.sections.get(c.section_pos) else {
                 continue;
             };
             for reloc in &input_sec.relocs {
                 let reloc_id = reloc_sections.len() as u32;
                 reloc_sections.push(sec.name.clone());
-                if let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                {
+                if let Some(sym) = obj.symbol_by_index(reloc.symbol.0) {
                     if sym.binding != Binding::Local {
                         if let Some(res) = symbols.lookup(&sym.name) {
                             index.insert(res.id.0, reloc_id);
@@ -869,6 +904,116 @@ fn symbol_records(symbols: &SymbolTable) -> Vec<peony_cache::CachedSymbolEntry> 
 }
 
 // ── Loading + resolution ───────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Default)]
+struct ParseStats {
+    sections: u64,
+    alloc_sections: u64,
+    debug_sections: u64,
+    symbols: u64,
+    relocs: u64,
+    input_bytes: u64,
+    owned_buffers: u64,
+    owned_bytes: u64,
+}
+
+impl ParseStats {
+    fn from_parsed(obj: &InputObject, input_bytes: usize, owned: &[Vec<u8>]) -> Self {
+        let mut stats = Self {
+            sections: usize_to_trace_count(obj.sections.len()),
+            symbols: usize_to_trace_count(obj.symbols.len()),
+            input_bytes: usize_to_trace_count(input_bytes),
+            owned_buffers: usize_to_trace_count(owned.len()),
+            owned_bytes: owned
+                .iter()
+                .map(|buf| usize_to_trace_count(buf.len()))
+                .sum(),
+            ..Self::default()
+        };
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC != 0 {
+                stats.alloc_sections += 1;
+            }
+            if sec.kind == peony_object::SectionKind::Debug {
+                stats.debug_sections += 1;
+            }
+            stats.relocs = stats
+                .relocs
+                .saturating_add(usize_to_trace_count(sec.relocs.len()));
+        }
+        stats
+    }
+
+    fn add(&mut self, other: Self) {
+        self.sections = self.sections.saturating_add(other.sections);
+        self.alloc_sections = self.alloc_sections.saturating_add(other.alloc_sections);
+        self.debug_sections = self.debug_sections.saturating_add(other.debug_sections);
+        self.symbols = self.symbols.saturating_add(other.symbols);
+        self.relocs = self.relocs.saturating_add(other.relocs);
+        self.input_bytes = self.input_bytes.saturating_add(other.input_bytes);
+        self.owned_buffers = self.owned_buffers.saturating_add(other.owned_buffers);
+        self.owned_bytes = self.owned_bytes.saturating_add(other.owned_bytes);
+    }
+
+    fn trace_fields(&self, objects: usize) -> [peony_prof::TraceField; 9] {
+        [
+            peony_prof::TraceField::count("objects", usize_to_trace_count(objects)),
+            peony_prof::TraceField::count("sections", self.sections),
+            peony_prof::TraceField::count("alloc_sections", self.alloc_sections),
+            peony_prof::TraceField::count("debug_sections", self.debug_sections),
+            peony_prof::TraceField::count("symbols", self.symbols),
+            peony_prof::TraceField::count("relocs", self.relocs),
+            peony_prof::TraceField::bytes("mapped", self.input_bytes),
+            peony_prof::TraceField::count("owned_buffers", self.owned_buffers),
+            peony_prof::TraceField::bytes("owned", self.owned_bytes),
+        ]
+    }
+}
+
+fn usize_to_trace_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Run [`load_and_resolve`]; if it fails only because the inputs supply their own
+/// `_start` (colliding with the auto-injected CRT `Scrt1.o`), re-link without the
+/// injected CRT objects. This is the freestanding-PIE case (e.g. a hand-written
+/// `_start`). Injecting CRT optimistically and retrying on the rare conflict
+/// avoids pre-scanning every input for `_start` before parse — a per-object cost
+/// that dominated startup on large `cc`-driven links. The common case (no user
+/// `_start`) never retries; the freestanding case re-parses a handful of objects.
+fn load_and_resolve_with_crt_fallback(
+    inputs: &[ResolvedInput],
+    injected_crt: &[PathBuf],
+    forced_undefined: &[String],
+) -> Result<Resolved> {
+    let first = load_and_resolve(inputs, forced_undefined);
+    let Err(err) = first else {
+        return first;
+    };
+    if injected_crt.is_empty() || !is_user_start_vs_crt_conflict(&err) {
+        return Err(err);
+    }
+    tracing::info!(
+        "inputs define their own `_start`; relinking without auto-injected CRT startup objects"
+    );
+    let user_only: Vec<ResolvedInput> = inputs
+        .iter()
+        .filter(|i| !injected_crt.contains(&i.path))
+        .cloned()
+        .collect();
+    load_and_resolve(&user_only, forced_undefined)
+}
+
+/// True if `err` is a duplicate-`_start` resolution error. With CRT injected, the
+/// only `_start` provider among the injected objects is `Scrt1.o`, so a `_start`
+/// duplicate means the user provided its own — the signal to drop CRT. (A genuine
+/// user/user `_start` clash re-surfaces on the CRT-free retry and propagates.)
+fn is_user_start_vs_crt_conflict(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<peony_symbols::SymbolError>(),
+        Some(peony_symbols::SymbolError::DuplicateSymbol { name, .. }) if name == "_start"
+    )
+}
 
 /// Parse all bare objects (in parallel) and pull in archive members lazily,
 /// returning the object list and the resolved global symbol table.
@@ -952,20 +1097,32 @@ fn load_and_resolve(inputs: &[ResolvedInput], forced_undefined: &[String]) -> Re
     // Stage 1: pre-map. `mapped[i]` = (file_id, label) for bare[i]; bytes are
     // fetched from the arena by file_id inside the parse closure.
     let mut mapped: Vec<(u32, String)> = Vec::with_capacity(bare.len());
-    for p in &bare {
-        let label = p.display().to_string();
-        // An empty/unmappable file can't be mmap'd; it is not a valid object and
-        // `parse_bare_parallel` would fail it like the old serial path did. Map
-        // it (reusing the classification map if present) or surface the error.
-        let mmap = match mmap_cache.remove(p.as_path()).flatten() {
-            Some(m) => m.into_mmap(),
-            None => peony_object::MappedInput::open(p)
-                .ok_or_else(|| anyhow::anyhow!("failed to open/map `{}`", p.display()))?
-                .into_mmap(),
-        };
-        let file_id = r.arena.push_mmap(mmap);
-        mapped.push((file_id, label));
+    let mut mapped_bytes = 0u64;
+    {
+        let _t = peony_prof::trace("parse-bare:map-inputs");
+        for p in &bare {
+            let label = p.display().to_string();
+            // An empty/unmappable file can't be mmap'd; it is not a valid object and
+            // `parse_bare_parallel` would fail it like the old serial path did. Map
+            // it (reusing the classification map if present) or surface the error.
+            let mmap = match mmap_cache.remove(p.as_path()).flatten() {
+                Some(m) => m.into_mmap(),
+                None => peony_object::MappedInput::open(p)
+                    .ok_or_else(|| anyhow::anyhow!("failed to open/map `{}`", p.display()))?
+                    .into_mmap(),
+            };
+            mapped_bytes = mapped_bytes.saturating_add(usize_to_trace_count(mmap.len()));
+            let file_id = r.arena.push_mmap(mmap);
+            mapped.push((file_id, label));
+        }
     }
+    peony_prof::event_fields(
+        "parse-bare:mapped",
+        [
+            peony_prof::TraceField::count("objects", usize_to_trace_count(mapped.len())),
+            peony_prof::TraceField::bytes("bytes", mapped_bytes),
+        ],
+    );
     // Stage 2: parallel parse from the stable arena mmaps.
     let parsed: Vec<InputObject> = {
         let _t = peony_prof::trace("parse-bare");
@@ -984,33 +1141,77 @@ fn load_and_resolve(inputs: &[ResolvedInput], forced_undefined: &[String]) -> Re
         // SAFETY: `arena` is only read here (mmap bytes); no thread mutates it.
         // The borrow is shared + the mmaps are stable for the arena's lifetime.
         let arena_ref = &r.arena;
+        let collect_parse_stats = peony_prof::is_enabled();
         let parse_one =
-            |&(file_id, ref label): &(u32, String)| -> Result<(InputObject, Vec<Vec<u8>>)> {
+            |&(file_id, ref label): &(u32, String)| -> Result<(InputObject, Vec<Vec<u8>>, Option<ParseStats>)> {
                 let bytes = arena_ref.mmap_bytes(file_id);
                 // owned_base = 0: handles are object-local, rebased at merge.
-                peony_object::parse_bare_parallel(file_id, 0, label.clone(), bytes)
-                    .with_context(|| format!("failed to parse `{label}`"))
+                let (obj, owned) =
+                    peony_object::parse_bare_parallel(file_id, 0, label.clone(), bytes)
+                        .with_context(|| format!("failed to parse `{label}`"))?;
+                let stats = collect_parse_stats.then(|| ParseStats::from_parsed(&obj, bytes.len(), &owned));
+                if peony_prof::trace_detail_enabled() {
+                    let stats = stats.unwrap_or_default();
+                    peony_prof::detail_event_fields(
+                        "parse:object",
+                        [
+                            peony_prof::TraceField::text("object", label.as_str()),
+                            peony_prof::TraceField::bytes("mapped", stats.input_bytes),
+                            peony_prof::TraceField::count("sections", stats.sections),
+                            peony_prof::TraceField::count("alloc_sections", stats.alloc_sections),
+                            peony_prof::TraceField::count("debug_sections", stats.debug_sections),
+                            peony_prof::TraceField::count("symbols", stats.symbols),
+                            peony_prof::TraceField::count("relocs", stats.relocs),
+                            peony_prof::TraceField::count("owned_buffers", stats.owned_buffers),
+                            peony_prof::TraceField::bytes("owned", stats.owned_bytes),
+                        ],
+                    );
+                }
+                Ok((obj, owned, stats))
             };
-        let results: Vec<(InputObject, Vec<Vec<u8>>)> = if mapped.len() >= PARALLEL_PARSE_THRESHOLD
-        {
-            mapped.par_iter().map(parse_one).collect::<Result<_>>()?
-        } else {
-            mapped.iter().map(parse_one).collect::<Result<_>>()?
+        let results: Vec<(InputObject, Vec<Vec<u8>>, Option<ParseStats>)> = {
+            let _t = peony_prof::trace("parse-bare:workers");
+            if mapped.len() >= PARALLEL_PARSE_THRESHOLD {
+                mapped.par_iter().map(parse_one).collect::<Result<_>>()?
+            } else {
+                mapped.iter().map(parse_one).collect::<Result<_>>()?
+            }
         };
+        if collect_parse_stats {
+            let mut parse_stats = ParseStats::default();
+            for (_, _, stats) in &results {
+                if let Some(stats) = stats {
+                    parse_stats.add(*stats);
+                }
+            }
+            peony_prof::event_fields("parse-bare:result", parse_stats.trace_fields(results.len()));
+        }
         // Stage 3: serial merge in object order (deterministic owned rebase).
         let mut parsed = Vec::with_capacity(results.len());
-        for (mut obj, local_owned) in results {
-            r.arena.merge_parsed_owned(&mut obj, local_owned);
-            parsed.push(obj);
+        {
+            let _t = peony_prof::trace("parse-bare:merge-owned");
+            for (mut obj, local_owned, _) in results {
+                r.arena.merge_parsed_owned(&mut obj, local_owned);
+                parsed.push(obj);
+            }
         }
         parsed
     };
     // Now that the objects are parsed we know roughly how many distinct symbols
     // the link will define; pre-size the resolution map to avoid repeated
     // grow+rehash as ~10k+ symbols are inserted on a large link.
-    let est_symbols: usize = parsed.iter().map(|o| o.symbols.len()).sum();
-    if est_symbols > r.symbols.len() {
-        r.symbols.reserve(est_symbols);
+    {
+        let est_symbols: usize = parsed.iter().map(|o| o.symbols.len()).sum();
+        let _t = peony_prof::trace_fields(
+            "resolve-bare:reserve-symbols",
+            [
+                peony_prof::TraceField::count("symbols", usize_to_trace_count(est_symbols)),
+                peony_prof::TraceField::count("existing", r.symbols.len() as u64),
+            ],
+        );
+        if est_symbols > r.symbols.len() {
+            r.symbols.reserve(est_symbols);
+        }
     }
     {
         let _t = peony_prof::trace("resolve-bare");
@@ -1409,18 +1610,33 @@ fn compute_live(
         return LiveFilter::Except(comdat_excluded.clone());
     }
     // --gc-sections: an allow-list of reachable sections, minus COMDAT dups.
-    let mut live = peony_layout::gc_sections_rooted(objects, symbols, entry, export_roots);
+    let gc_out = peony_layout::gc_sections_rooted_with_stats(objects, symbols, entry, export_roots);
+    let stats = gc_out.stats;
+    let mut live = gc_out.live;
     if let Some(script) = script {
         add_script_kept_sections(&mut live, objects, script);
     }
     for key in comdat_excluded {
-        live.remove(key);
+        live.remove(*key);
     }
+    peony_prof::event_fields(
+        "reloc-postproc:live-sections-result",
+        [
+            peony_prof::TraceField::count("roots", stats.roots),
+            peony_prof::TraceField::count("visited", stats.traversed_sections),
+            peony_prof::TraceField::count("relocs", stats.scanned_relocs),
+            peony_prof::TraceField::count("raw_live", stats.live_sections),
+            peony_prof::TraceField::count("final_live", live.len() as u64),
+            peony_prof::TraceField::count("target_symbols", stats.target_symbols),
+            peony_prof::TraceField::count("dense_maps", stats.dense_target_objects),
+            peony_prof::TraceField::count("sparse_maps", stats.sparse_target_objects),
+        ],
+    );
     LiveFilter::Only(live)
 }
 
 fn add_script_kept_sections(
-    live: &mut FxHashSet<(usize, usize)>,
+    live: &mut peony_layout::LiveSections,
     objects: &[InputObject],
     script: &ScriptLayout,
 ) {
@@ -1440,7 +1656,7 @@ fn add_script_kept_sections(
 /// [`peony_layout::SectionFilter`] when passed to the layout.
 enum LiveFilter {
     All,
-    Only(FxHashSet<(usize, usize)>),
+    Only(peony_layout::LiveSections),
     Except(FxHashSet<(usize, usize)>),
 }
 
@@ -1448,7 +1664,7 @@ impl LiveFilter {
     fn as_filter(&self) -> peony_layout::SectionFilter<'_> {
         match self {
             LiveFilter::All => peony_layout::SectionFilter::All,
-            LiveFilter::Only(s) => peony_layout::SectionFilter::Only(s),
+            LiveFilter::Only(s) => peony_layout::SectionFilter::OnlyLive(s),
             LiveFilter::Except(s) => peony_layout::SectionFilter::Except(s),
         }
     }

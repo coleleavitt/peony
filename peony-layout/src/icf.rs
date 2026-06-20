@@ -55,8 +55,7 @@ fn content_digest(bytes: &[u8]) -> u128 {
 /// objects). Returns `None` if the symbol can't be resolved — such a section is
 /// not folded (conservative).
 fn reloc_target_name(obj: &InputObject, sym: SymbolIndex) -> Option<&[u8]> {
-    let pos = *obj.symbol_map.get(&sym.0)?;
-    obj.symbols.get(pos).map(|s| s.name.as_bytes())
+    obj.symbol_by_index(sym.0).map(|s| s.name.as_bytes())
 }
 
 /// x86-64 relocation types that take a symbol's ADDRESS (as opposed to a direct
@@ -148,7 +147,7 @@ fn parse_addrsig(arena: &InputArena, t: &mut AddrTaint, obj: &InputObject, obj_i
         let Some(sym_idx) = read_uleb128(data, &mut pos) else {
             break;
         };
-        if let Some(&sym_pos) = obj.symbol_map.get(&(sym_idx as usize)) {
+        if let Some(sym_pos) = obj.symbol_pos(sym_idx as usize) {
             t.addrsig_syms.insert((obj_id, sym_pos));
         }
     }
@@ -164,7 +163,7 @@ fn taint_one_reloc(
     if !reloc_takes_address(r.r_type) {
         return;
     }
-    let Some(&pos) = obj.symbol_map.get(&r.symbol.0) else {
+    let Some(pos) = obj.symbol_pos(r.symbol.0) else {
         return;
     };
     let Some(sym) = obj.symbols.get(pos) else {
@@ -336,13 +335,13 @@ pub fn compute_fold_map(arena: &InputArena, objects: &[InputObject]) -> FoldMap 
 mod tests {
     use peony_object::{
         Binding,
+        IndexLookup,
         InputSection,
         InputSymbol,
         SectionIndex,
         SectionKind,
         SymbolIndex,
     };
-    use rustc_hash::FxHashMap;
 
     use super::*;
 
@@ -426,11 +425,11 @@ mod tests {
             let idx = sections.iter().map(|s| s.index.0).max().unwrap_or(0) + 1;
             sections.push(addrsig_section(arena, idx, sig));
         }
-        let mut section_map = FxHashMap::default();
+        let mut section_map = IndexLookup::default();
         for (pos, s) in sections.iter().enumerate() {
             section_map.insert(s.index.0, pos);
         }
-        let mut symbol_map = FxHashMap::default();
+        let mut symbol_map = IndexLookup::default();
         for (pos, s) in symbols.iter().enumerate() {
             symbol_map.insert(s.index.0, pos);
         }

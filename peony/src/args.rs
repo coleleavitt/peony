@@ -62,6 +62,7 @@ pub(crate) struct Args {
     pub(crate) stats: bool,
     pub(crate) trace: bool,
     pub(crate) trace_stack: bool,
+    pub(crate) trace_detail: bool,
     pub(crate) help: bool,
     pub(crate) defsym: Vec<String>,
     pub(crate) linker_scripts: Vec<PathBuf>,
@@ -71,6 +72,7 @@ pub(crate) struct Args {
     pub(crate) strip_debug: bool,
     pub(crate) emit_relocs: bool,
     pub(crate) pie: bool,
+    pub(crate) no_crt: bool,
     pub(crate) dynamic_linker: Option<String>,
     pub(crate) rpaths: Vec<String>,
     pub(crate) enable_new_dtags: bool,
@@ -118,6 +120,7 @@ impl Default for Args {
             stats: false,
             trace: false,
             trace_stack: false,
+            trace_detail: false,
             help: false,
             defsym: Vec::new(),
             linker_scripts: Vec::new(),
@@ -127,6 +130,7 @@ impl Default for Args {
             strip_debug: false,
             emit_relocs: false,
             pie: false,
+            no_crt: false,
             dynamic_linker: None,
             rpaths: Vec::new(),
             enable_new_dtags: true,
@@ -150,6 +154,12 @@ impl Default for Args {
 /// flags that take a separate value argument consume it so it isn't mistaken for
 /// an input file.
 pub(crate) fn parse_args() -> Result<Args> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = expand_response_args(argv)?;
+    parse_expanded_args(argv)
+}
+
+fn parse_expanded_args(argv: Vec<String>) -> Result<Args> {
     // ld flags whose value is a *separate* following argument that we ignore.
     const IGNORE_WITH_VALUE: &[&str] = &[
         "-m",
@@ -233,8 +243,6 @@ pub(crate) fn parse_args() -> Result<Args> {
     }
 
     let mut a = Args::default();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let argv = expand_response_args(argv)?;
     a.raw_args = argv.clone();
     let mut whole_archive = false;
     let mut as_needed = false;
@@ -280,6 +288,10 @@ pub(crate) fn parse_args() -> Result<Args> {
                 a.trace = true;
                 a.trace_stack = true;
             }
+            "--trace-detail" => {
+                a.trace = true;
+                a.trace_detail = true;
+            }
             "--help" => a.help = true,
             // Identical Code Folding. `=all`/`=safe` accepted; `=none` disables.
             "--icf=all" | "--icf=safe" | "--icf" => a.icf = true,
@@ -295,6 +307,7 @@ pub(crate) fn parse_args() -> Result<Args> {
             "--emit-relocs" | "-q" => a.emit_relocs = true,
             "-pie" | "--pie" => a.pie = true,
             "-no-pie" | "--no-pie" => a.pie = false,
+            "-nostartfiles" | "--no-crt" => a.no_crt = true,
             "-static" | "--static" => {
                 library_mode = LibraryMode::Static;
                 a.pie = false;
@@ -567,7 +580,9 @@ pub(crate) fn cache_key_args(raw_args: &[String]) -> Vec<String> {
             continue;
         }
         match arg.as_str() {
-            "--incremental" | "--stats" | "--trace" | "--trace-stack" => continue,
+            "--incremental" | "--stats" | "--trace" | "--trace-stack" | "--trace-detail" => {
+                continue;
+            }
             "--cache-report" | "--threads" => {
                 skip_value = true;
                 continue;
@@ -609,6 +624,7 @@ mod tests {
         let raw = strings(&[
             "--cache-report=target/peony-cache.json",
             "--trace",
+            "--trace-detail",
             "--threads=4",
             "-shared",
             "lib.o",
@@ -616,10 +632,19 @@ mod tests {
 
         assert_eq!(cache_key_args(&raw), strings(&["-shared", "lib.o"]));
     }
+
+    #[test]
+    fn parse_crt_suppression_flags() {
+        let no_crt = parse_expanded_args(strings(&["--no-crt", "main.o"])).unwrap();
+        assert!(no_crt.no_crt);
+
+        let no_startfiles = parse_expanded_args(strings(&["-nostartfiles", "main.o"])).unwrap();
+        assert!(no_startfiles.no_crt);
+    }
 }
 
 pub(crate) fn print_help() {
     println!(
-        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table and cache diagnostics\n  --trace             Print phase timing and call-flow trace\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Enable incremental cache\n  --cache-report FILE Write JSON cache reuse/fallback report\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  -shared             Produce a shared object\n  --help              Print this help"
+        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table and cache diagnostics\n  --trace             Print phase timing and call-flow trace\n  --trace-detail      Include capped byte/address detail records\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Enable incremental cache\n  --cache-report FILE Write JSON cache reuse/fallback report\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  --no-crt            Do not auto-inject C runtime startup objects\n  -shared             Produce a shared object\n  --help              Print this help"
     );
 }

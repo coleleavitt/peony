@@ -2,11 +2,11 @@ use std::path::Path;
 
 use peony_layout::{Layout, SecSource};
 use peony_object::{InputArena, InputObject, elf};
-use peony_reloc::ApplyCtx;
 use peony_symbols::SymbolTable;
 
 use crate::build_id::write_build_id;
-use crate::{EmitError, Result, SectionWriteFilter};
+use crate::input_sections::copy_input_sections;
+use crate::{Result, SectionWriteFilter};
 
 /// Write the shared-object TLS GOT static slots (`layout.tls_got_writes`): each
 /// `(got_va, value)` is the DTPOFF in a locally-defined General-Dynamic pair's
@@ -45,56 +45,6 @@ pub(crate) fn write_tls_got(buf: &mut [u8], layout: &Layout) {
     }
 }
 
-// ── Per-item processing helper (extracted to keep closures shallow) ───────────
-
-/// Process one work item: copy section bytes and apply its relocations.
-/// Called from worker threads; `buf_ptr` + `buf_len` describe the mmap'd output.
-fn process_item(
-    item: (usize, usize, u64, usize, usize),
-    arena: &InputArena,
-    objects: &[peony_object::InputObject],
-    buf_ptr: usize,
-    buf_len: usize,
-    ctx: &peony_reloc::ApplyCtx<'_>,
-    error_slot: &std::sync::Mutex<Option<peony_reloc::RelocError>>,
-) {
-    let (file_off, _, section_va, obj_id, sec_idx) = item;
-    let Some(obj) = objects.get(obj_id) else {
-        return;
-    };
-    let Some(&pos) = obj.section_map.get(&sec_idx) else {
-        return;
-    };
-    let Some(isec) = obj.sections.get(pos) else {
-        return;
-    };
-
-    let data_len = isec.data.len();
-    if data_len == 0 || file_off + data_len > buf_len {
-        return;
-    }
-
-    // SAFETY: each section has a unique, non-overlapping file range (QUAD Theorem 4.1).
-    let sec_buf: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut((buf_ptr + file_off) as *mut u8, data_len) };
-
-    // Zero-copy source: blit straight from the input mmap (via the arena) into
-    // the output buffer — no intermediate per-section Vec.
-    sec_buf.copy_from_slice(arena.bytes(isec.data));
-    peony_prof::count("sections_emitted", 1);
-    peony_prof::record_bytes("emit", data_len as u64);
-
-    if !isec.relocs.is_empty() {
-        for reloc in &isec.relocs {
-            if let Err(e) = peony_reloc::apply_reloc(ctx, obj, obj_id, reloc, section_va, sec_buf) {
-                *error_slot.lock().unwrap() = Some(e);
-                return;
-            }
-            peony_prof::count("relocs_applied", 1);
-        }
-    }
-}
-
 // ── Section data (parallel) ───────────────────────────────────────────────────
 
 /// Write all section data and apply relocations in parallel.
@@ -126,7 +76,7 @@ pub(crate) fn write_section_data_parallel(
         match sec.source {
             SecSource::Input => {
                 if filter.writes_input_section(&sec.name) {
-                    zero_section(buf, sec.sh_offset, sec.sh_size);
+                    zero_input_gaps(buf, sec.sh_offset, sec.sh_size, &sec.contributions);
                 }
             } // handled in phase 2
             SecSource::Bss => {} // NOBITS
@@ -219,148 +169,18 @@ pub(crate) fn write_section_data_parallel(
     }
     drop(synth);
 
-    // Phase 2: Parallel input section copy + relocation apply.
     let buf_ptr = buf.as_mut_ptr() as usize;
     let buf_len = buf.len();
-    // Integer-indexed symbol resolution for the per-relocation hot path: built
-    // once here (≈49k name hashes) to replace ≈216k per-reloc name hashes with
-    // array indexing. Borrows objects + symbols, which outlive this scope.
-    let sym_index = {
-        let _t = peony_prof::trace("emit:sym-index-build");
-        peony_reloc::SymIndex::build(objects, symbols)
-    };
-    let ctx = ApplyCtx {
-        symbols,
-        layout,
-        shared: layout.shared,
-        sym_index: Some(&sym_index),
-    };
-    let work_items = collect_input_work_items(layout, filter);
-    peony_prof::record_items("emit", work_items.len() as u64);
-    let _t = peony_prof::trace("emit:section-copy-dispatch");
-    dispatch_parallel(
-        work_items,
+    copy_input_sections(
         arena,
         objects,
+        symbols,
+        layout,
+        filter,
+        output_path,
         buf_ptr,
         buf_len,
-        ctx,
-        output_path,
     )
-}
-
-/// Collect (file_offset, _, section_va, object_id, section_index) for all input sections.
-type WorkItem = (usize, usize, u64, usize, usize);
-
-fn collect_input_work_items(layout: &Layout, filter: SectionWriteFilter<'_>) -> Vec<WorkItem> {
-    layout
-        .output_sections
-        .iter()
-        .filter(|sec| sec.source == SecSource::Input && filter.writes_input_section(&sec.name))
-        .flat_map(|sec| {
-            sec.contributions.iter().map(move |c| {
-                (
-                    (sec.sh_offset + c.offset) as usize,
-                    0usize,
-                    sec.sh_addr + c.offset,
-                    c.object_id,
-                    c.section_index,
-                )
-            })
-        })
-        .collect()
-}
-
-/// Dispatch work items across Chase-Lev workers with quiescence-based termination.
-///
-/// Uses the proper Chase-Lev drain protocol: an atomic idle counter prevents any
-/// thread from exiting while a sibling still has stealable work. A thread only
-/// exits when `idle_count == num_threads` (all threads simultaneously idle).
-fn dispatch_parallel(
-    work_items: Vec<WorkItem>,
-    arena: &InputArena,
-    objects: &[InputObject],
-    buf_ptr: usize,
-    buf_len: usize,
-    ctx: ApplyCtx<'_>,
-    output_path: &Path,
-) -> Result<()> {
-    if work_items.is_empty() {
-        return Ok(());
-    }
-
-    // Small links (the common `cc`/incremental case) finish faster serially:
-    // the work is a handful of section copies, and spinning up a worker scope
-    // costs far more in `futex`/`sched_yield`/mutex churn than the copies save.
-    // Profiling a hello-world link showed ~74% of syscall time in futex+yield
-    // from the parallel scaffolding alone. Stay serial below this threshold.
-    // Section-copy work items: only fan out across ws-deque workers when there
-    // are enough that the concurrent copy outweighs spawning the worker scope
-    // (which otherwise idle-spins on futex/sched_yield — 85% of a small link's
-    // syscall time). Tiny links copy a handful of sections faster serially.
-    const PARALLEL_THRESHOLD: usize = 2048;
-    if work_items.len() < PARALLEL_THRESHOLD {
-        peony_prof::event(
-            "emit-dispatch",
-            format!("serial: {} work items", work_items.len()),
-        );
-        let error_slot = std::sync::Mutex::new(None);
-        let ctx_ref = &ctx;
-        for item in work_items {
-            process_item(item, arena, objects, buf_ptr, buf_len, ctx_ref, &error_slot);
-            if let Some(e) = error_slot.lock().unwrap().take() {
-                tracing::error!(output = %output_path.display(), %e, "relocation error");
-                return Err(EmitError::Reloc(e));
-            }
-        }
-        return Ok(());
-    }
-
-    // Use the link's CONFIGURED worker count (rayon's global pool, which honours
-    // `--threads` and the small-link cap), not `available_parallelism()`. emit
-    // formerly always spawned up to all cores, so a link configured for fewer
-    // workers still spun 24 ws-deque threads here — measured as the bulk of the
-    // futex/sched_yield churn on ripgrep (1040 sched_yield at the 8-thread cap).
-    // Capping to the pool size keeps emit consistent with the rest of the link.
-    let num_threads = rayon::current_num_threads().max(1).min(work_items.len());
-    peony_prof::event(
-        "emit-dispatch",
-        format!(
-            "parallel: {} work items, {num_threads} workers",
-            work_items.len()
-        ),
-    );
-
-    let error_slot: std::sync::Mutex<Option<peony_reloc::RelocError>> = std::sync::Mutex::new(None);
-
-    const BATCH_SIZE: usize = 256;
-    let batch_count = work_items.len().div_ceil(BATCH_SIZE);
-    peony_prof::event(
-        "emit-dispatch",
-        format!(
-            "batched: {} work items, {batch_count} batches, {BATCH_SIZE}/batch",
-            work_items.len()
-        ),
-    );
-    let batches: Vec<Vec<WorkItem>> = work_items
-        .chunks(BATCH_SIZE)
-        .map(<[WorkItem]>::to_vec)
-        .collect();
-
-    ws_deque::scheduler::run(num_threads, batches, |batch, _spawner| {
-        // Errors are rare (a malformed reloc); record the first and let the rest
-        // drain. We do not early-abort the schedule — the surviving sections are
-        // still written to disjoint regions, and the error is returned below.
-        for item in batch {
-            process_item(item, arena, objects, buf_ptr, buf_len, &ctx, &error_slot);
-        }
-    });
-
-    if let Some(e) = error_slot.into_inner().ok().flatten() {
-        tracing::error!(output = %output_path.display(), %e, "relocation error");
-        return Err(EmitError::Reloc(e));
-    }
-    Ok(())
 }
 
 fn write_symtab(buf: &mut [u8], symbols: &SymbolTable, layout: &Layout, base_off: u64) {
@@ -420,5 +240,25 @@ fn zero_section(buf: &mut [u8], off: u64, size: u64) {
     let size = size as usize;
     if off.checked_add(size).is_some_and(|end| end <= buf.len()) {
         buf[off..off + size].fill(0);
+    }
+}
+
+fn zero_input_gaps(
+    buf: &mut [u8],
+    section_offset: u64,
+    section_size: u64,
+    contributions: &[peony_layout::SectionContribution],
+) {
+    let section_end = section_offset.saturating_add(section_size);
+    let mut cursor = section_offset;
+    for contribution in contributions {
+        let start = section_offset.saturating_add(contribution.offset);
+        if start > cursor {
+            zero_section(buf, cursor, start - cursor);
+        }
+        cursor = cursor.max(start.saturating_add(contribution.size));
+    }
+    if section_end > cursor {
+        zero_section(buf, cursor, section_end - cursor);
     }
 }

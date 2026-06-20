@@ -29,10 +29,7 @@ pub fn count_dynamic_relocs(
                 if reloc.r_type != r_x86_64::R64 {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 if sym.binding == Binding::Local {
@@ -89,10 +86,7 @@ pub fn count_relative(objects: &[InputObject], symbols: &SymbolTable) -> usize {
                 if reloc.r_type != r_x86_64::R64 {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 let counts = if sym.binding == Binding::Local {
@@ -132,10 +126,7 @@ pub(crate) fn count_symbolic_data_relocs(objects: &[InputObject], symbols: &Symb
                 if reloc.r_type != r_x86_64::R64 {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 if sym.binding == Binding::Local {
@@ -174,10 +165,7 @@ pub fn collect_symbolic_data_relocs(
                 if reloc.r_type != r_x86_64::R64 {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 if sym.binding == Binding::Local {
@@ -242,10 +230,7 @@ pub fn collect_dynamic_data_relocs(
                 if reloc.r_type != r_x86_64::R64 {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 // Resolve the target VA exactly as the apply phase will, and note
@@ -311,4 +296,114 @@ pub fn collect_dynamic_data_relocs(
     out.sort_unstable();
     ifunc.sort_unstable();
     (out, ifunc)
+}
+
+/// Single-pass post-layout collection of every `R_X86_64_64` dynamic relocation,
+/// partitioned into the three lists the driver appends to `.rela.dyn`:
+/// base-relative (`R_X86_64_RELATIVE`), IFUNC (`R_X86_64_IRELATIVE`), and
+/// symbolic (`R_X86_64_64` against an imported DSO data symbol).
+///
+/// This is the union of [`collect_dynamic_data_relocs`] and
+/// [`collect_symbolic_data_relocs`]: each allocated R64 site falls into exactly
+/// one bucket — an in-image (or copy-reloc) target is RELATIVE/IRELATIVE, an
+/// imported non-copy target with a `.dynsym` slot is symbolic, and everything
+/// else is dropped — so a single walk doing one symbol lookup per site replaces
+/// two full passes over the relocation graph. Behaviourally identical to calling
+/// both functions; guarded by the byte-identical-output determinism tests.
+///
+/// Must run after layout (section VAs, `virtual_address`, and `dynsym_index` are
+/// final). Returns `(relative, irelative, symbolic)` where the first two are
+/// `(site_va, value_va)` pairs and the last is `(site_va, dynsym_index, addend)`.
+#[allow(clippy::type_complexity)]
+pub fn collect_data_and_symbolic_relocs(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u32, i64)>) {
+    let mut out = Vec::new();
+    let mut ifunc = Vec::new();
+    let mut symbolic = Vec::new();
+    for (obj_id, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            // Only allocated sections land in the loaded image.
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            // The site's section VA is constant across this section's relocs;
+            // resolve it once. A section with no placement (GC'd / dropped) has
+            // no R64 sites to emit, exactly as the per-reloc `address_of` skip in
+            // the two source functions.
+            let Some(site_va) = layout.address_of(obj_id, sec.index.0) else {
+                continue;
+            };
+            for reloc in &sec.relocs {
+                if reloc.r_type != r_x86_64::R64 {
+                    continue;
+                }
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
+                    continue;
+                };
+                let site = site_va + reloc.offset;
+                if sym.binding == Binding::Local {
+                    // Local defined in a kept, allocated section → RELATIVE (or
+                    // IRELATIVE for a local IFUNC). Absolute/dropped: no base bias.
+                    let Some(va) = sym.section.and_then(|si| layout.address_of(obj_id, si.0))
+                    else {
+                        continue;
+                    };
+                    let target = va + sym.value;
+                    if sym.is_ifunc {
+                        ifunc.push((site, target));
+                    } else {
+                        out.push((site, (target as i64).wrapping_add(reloc.addend) as u64));
+                    }
+                    continue;
+                }
+                let Some(res) = symbols.lookup(&sym.name) else {
+                    continue;
+                };
+                if res.is_defined() && (!res.import || res.copy_reloc) {
+                    // In-image (or copy-reloc) target → RELATIVE / IRELATIVE.
+                    if res.is_ifunc {
+                        ifunc.push((site, res.virtual_address));
+                    } else {
+                        out.push((
+                            site,
+                            (res.virtual_address as i64).wrapping_add(reloc.addend) as u64,
+                        ));
+                    }
+                } else if res.import && !res.copy_reloc && res.dynsym_index != 0 {
+                    // Imported DSO data with a `.dynsym` slot → symbolic R64.
+                    symbolic.push((site, res.dynsym_index, reloc.addend));
+                }
+            }
+        }
+    }
+
+    // GOT slots holding the address of a locally-defined (non-import) symbol also
+    // need a dynamic relocation in a PIE — identical to the tail of
+    // `collect_dynamic_data_relocs` (import GOT slots use GLOB_DAT, not here).
+    for (i, id) in layout.got_slots.iter().enumerate() {
+        let Some(name) = symbols.name_by_id(*id) else {
+            continue;
+        };
+        let Some(res) = symbols.lookup(name) else {
+            continue;
+        };
+        if (res.import && !res.copy_reloc) || !res.is_defined() {
+            continue;
+        }
+        let site = layout.got_base + (i as u64) * 8;
+        if res.is_ifunc {
+            ifunc.push((site, res.virtual_address));
+        } else {
+            out.push((site, res.virtual_address));
+        }
+    }
+
+    // Deterministic order (by site) for reproducible output + DT_RELACOUNT runs.
+    out.sort_unstable();
+    ifunc.sort_unstable();
+    symbolic.sort_unstable();
+    (out, ifunc, symbolic)
 }

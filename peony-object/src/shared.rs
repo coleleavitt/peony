@@ -3,13 +3,11 @@ use std::path::Path;
 use object::read::elf::{Dyn, ElfFile64};
 use object::{Endianness, Object, ObjectSymbol};
 
-use crate::{ObjectError, Result, elf};
+use crate::{MappedInput, ObjectError, Result, elf};
 
 #[derive(Debug, Clone)]
 pub struct SharedObject {
     pub soname: String,
-    pub exports: Vec<Vec<u8>>,
-    pub export_versions: Vec<Option<Vec<u8>>>,
     pub export_symbols: Vec<SharedExport>,
 }
 
@@ -22,25 +20,30 @@ pub struct SharedExport {
 }
 
 pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
-    let data = std::fs::read(path).map_err(|e| ObjectError::Io {
+    // mmap rather than `std::fs::read`: a `.so` parse only touches the dynsym,
+    // dynstr, and version sections, so copying the whole file onto the heap
+    // (libc alone is ~2MB) is pure waste — only the pages we actually read fault
+    // in from the map. `data` borrows `mapped`, which outlives every name copy.
+    let mapped = MappedInput::open(path).ok_or_else(|| ObjectError::Io {
+        path: path.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "could not memory-map shared object",
+        ),
+    })?;
+    let data = mapped.bytes();
+    let elf: ElfFile64<Endianness> = ElfFile64::parse(data).map_err(|e| ObjectError::Parse {
         path: path.display().to_string(),
         source: e,
     })?;
-    let elf: ElfFile64<Endianness> =
-        ElfFile64::parse(data.as_slice()).map_err(|e| ObjectError::Parse {
-            path: path.display().to_string(),
-            source: e,
-        })?;
 
     let endian = elf.endian();
     let versions = elf
         .elf_section_table()
-        .versions(endian, data.as_slice())
+        .versions(endian, data)
         .ok()
         .flatten();
 
-    let mut exports = Vec::new();
-    let mut export_versions = Vec::new();
     let mut export_symbols = Vec::new();
     for sym in elf.dynamic_symbols() {
         if sym.is_undefined() || sym.is_local() {
@@ -52,14 +55,15 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
         if name.is_empty() {
             continue;
         }
-        let ver = versions.as_ref().and_then(|vt| {
+        // Owned once into `export_symbols`; the previously-built parallel
+        // `exports`/`export_versions` Vecs were never read by the link pipeline.
+        let version = versions.as_ref().and_then(|vt| {
             let vidx = vt.version_index(endian, sym.index());
             match vt.version(vidx) {
                 Ok(Some(v)) => Some(v.name().to_vec()),
                 _ => None,
             }
         });
-        let name = name.to_vec();
         let st_type = match sym.kind() {
             object::SymbolKind::Text => elf::STT_FUNC,
             object::SymbolKind::Data => elf::STT_OBJECT,
@@ -69,16 +73,14 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
             _ => elf::STT_NOTYPE,
         };
         export_symbols.push(SharedExport {
-            name: name.clone(),
-            version: ver.clone(),
+            name: name.to_vec(),
+            version,
             size: sym.size(),
             st_type,
         });
-        exports.push(name);
-        export_versions.push(ver);
     }
 
-    let soname = elf_soname(&elf, data.as_slice()).unwrap_or_else(|| {
+    let soname = elf_soname(&elf, data).unwrap_or_else(|| {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string())
@@ -86,8 +88,6 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
 
     Ok(SharedObject {
         soname,
-        exports,
-        export_versions,
         export_symbols,
     })
 }
@@ -121,9 +121,9 @@ mod tests {
             let path = std::path::Path::new(p);
             if path.exists() {
                 let r = super::parse_shared_object(path).unwrap();
-                assert!(!r.exports.is_empty(), "libc should export symbols");
+                assert!(!r.export_symbols.is_empty(), "libc should export symbols");
                 assert!(
-                    r.exports.iter().any(|e| e == b"printf"),
+                    r.export_symbols.iter().any(|e| e.name == b"printf"),
                     "libc should export printf"
                 );
                 return;

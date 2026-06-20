@@ -523,10 +523,20 @@ fn resolve_library(name: &str, mode: LibraryMode, search: &[PathBuf]) -> Result<
 
 /// Inject C-runtime startup objects (`Scrt1.o crti.o crtbeginS.o … crtendS.o
 /// crtn.o`) around the user inputs, as the `cc` driver does, when none is already
-/// present. Only applied for executables (not `-shared`/`-r`). If the toolchain
-/// objects can't be located, the inputs are returned unchanged (a static link
-/// with its own `_start`, e.g. the test-suite's hand-written objects, still works).
-pub(crate) fn inject_crt_objects(inputs: Vec<ResolvedInput>, args: &Args) -> Vec<ResolvedInput> {
+/// present. Only applied for PIE executables. Freestanding PIE links can pass
+/// `--no-crt`/`-nostartfiles` to avoid startup-object injection without forcing
+/// Peony to scan every input object before parse.
+///
+/// Returns the augmented input list plus the paths of any CRT objects that were
+/// injected (empty when none were). A freestanding link that defines its own
+/// `_start` collides with `Scrt1.o`'s `_start`; rather than pre-scanning every
+/// input for `_start` (a per-object cost on large `cc` links), the driver lets
+/// resolution surface that duplicate and re-links without these injected objects
+/// (see `load_and_resolve_without_crt_on_start_conflict`).
+pub(crate) fn inject_crt_objects(
+    inputs: Vec<ResolvedInput>,
+    args: &Args,
+) -> (Vec<ResolvedInput>, Vec<PathBuf>) {
     let _t = peony_prof::trace("inject_crt_objects");
     // Heuristic: skip if a Scrt1/crt1 object is already on the command line.
     let already = inputs.iter().any(|p| {
@@ -536,14 +546,8 @@ pub(crate) fn inject_crt_objects(inputs: Vec<ResolvedInput>, args: &Args) -> Vec
             .is_some_and(|n| n == "Scrt1.o" || n == "crt1.o" || n == "rcrt1.o")
     });
     // Only auto-inject for a PIE (the case rustc/cc drive without crt objects).
-    if already || !args.pie {
-        return inputs;
-    }
-    // Skip if the inputs already provide `_start` (a freestanding PIE that does
-    // not need the C runtime). crt's Scrt1.o also defines `_start`, so injecting
-    // would cause a duplicate-symbol error.
-    if inputs.iter().any(|p| object_defines_start(&p.path)) {
-        return inputs;
+    if already || !args.pie || args.no_crt {
+        return (inputs, Vec::new());
     }
 
     // Locate the crt objects. First try the cached GCC library dirs (no
@@ -583,9 +587,12 @@ pub(crate) fn inject_crt_objects(inputs: Vec<ResolvedInput>, args: &Args) -> Vec
         find(end),
         find("crtn.o"),
     ) else {
-        return inputs; // toolchain crt unavailable — leave inputs as-is
+        return (inputs, Vec::new()); // toolchain crt unavailable — leave inputs as-is
     };
 
+    // The exact paths injected, so the driver can re-link without them if the
+    // user turns out to provide its own `_start` (freestanding link).
+    let injected = vec![c1.clone(), ci.clone(), cb.clone(), ce.clone(), cn.clone()];
     let mut out = Vec::with_capacity(inputs.len() + 5);
     out.push(ResolvedInput {
         path: c1,
@@ -618,20 +625,7 @@ pub(crate) fn inject_crt_objects(inputs: Vec<ResolvedInput>, args: &Args) -> Vec
         as_needed: false,
         start_lib_member: false,
     });
-    out
-}
-
-/// True if `path` is a relocatable object that defines a global `_start`.
-/// Used to decide whether the C-runtime startup objects are needed.
-fn object_defines_start(path: &Path) -> bool {
-    // Only a bare relocatable object can be the freestanding `_start` provider;
-    // archives/shared objects never suppress crt injection. One header read
-    // (classify_file) instead of the former is_archive + is_shared_object double
-    // open, then a symbol-table-only scan (no full parse) for the bare case.
-    if peony_object::classify_file(path) != peony_object::FileKind::Bare {
-        return false;
-    }
-    peony_object::object_defines_global_start(path)
+    (out, injected)
 }
 
 /// The full library search path: explicit `-L` dirs first (highest priority),

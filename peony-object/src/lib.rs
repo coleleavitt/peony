@@ -55,6 +55,7 @@ pub use input::{
 pub use model::{
     Binding,
     ComdatGroup,
+    IndexLookup,
     InputObject,
     InputReloc,
     InputSection,

@@ -5,11 +5,30 @@ mod fmt;
 mod phase;
 mod rss;
 mod trace;
+mod trace_detail;
+mod trace_fields;
+mod trace_render;
+#[cfg(test)]
+mod trace_tests;
 
 pub use counters::count;
 pub use phase::{Span, enable, is_enabled, phase, record_bytes, record_items};
 pub use rss::record_rss;
-pub use trace::{TraceFrame, event, trace, trace_enable, trace_stack_enable, trace_tree};
+pub use trace::{
+    TraceFrame,
+    detail_event_fields,
+    event,
+    event_fields,
+    trace,
+    trace_detail_enable,
+    trace_detail_enabled,
+    trace_enable,
+    trace_fields,
+    trace_stack_detail_enable,
+    trace_stack_enable,
+};
+pub use trace_fields::TraceField;
+pub use trace_render::trace_tree;
 
 pub fn report() {
     if !is_enabled() {

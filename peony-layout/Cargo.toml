@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 peony-object      = { path = "../peony-object" }
+peony-prof        = { path = "../peony-prof" }
 peony-symbols     = { path = "../peony-symbols" }
 ws-deque.workspace   = true
 rustc-hash.workspace = true

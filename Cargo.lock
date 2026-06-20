@@ -659,6 +659,7 @@ name = "peony-layout"
 version = "0.1.0"
 dependencies = [
  "peony-object",
+ "peony-prof",
  "peony-symbols",
  "rustc-hash",
  "thiserror",

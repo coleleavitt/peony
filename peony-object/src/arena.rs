@@ -37,7 +37,6 @@ impl InputArena {
             }
             self.owned.extend(local_owned);
         }
-        self.intern_object_names(obj);
     }
 
     pub fn intern_name(&mut self, bytes: &[u8]) -> Name {
@@ -120,6 +119,35 @@ mod tests {
         assert!(!first.ptr_eq(&third));
         assert_eq!(arena.interned_name_count(), 2);
         assert_eq!(arena.interned_name_bytes(), 13);
+    }
+
+    #[test]
+    fn merge_parsed_owned_skips_interning_when_there_is_no_owned_data() {
+        let mut arena = InputArena::new();
+        let name = Name::from_slice(b".text.fast");
+        let mut obj = InputObject {
+            path: "obj.o".to_string(),
+            sections: vec![crate::InputSection {
+                index: object::SectionIndex(1),
+                name: name.clone(),
+                kind: crate::SectionKind::Text,
+                sh_type: crate::elf::SHT_PROGBITS,
+                data: SectionData::EMPTY,
+                align: 1,
+                size: 1,
+                flags: crate::elf::SHF_ALLOC | crate::elf::SHF_EXECINSTR,
+                relocs: Vec::new(),
+            }],
+            symbols: Vec::new(),
+            section_map: crate::IndexLookup::default(),
+            symbol_map: crate::IndexLookup::default(),
+            comdat_groups: Vec::new(),
+        };
+
+        arena.merge_parsed_owned(&mut obj, Vec::new());
+
+        assert_eq!(arena.interned_name_count(), 0);
+        assert!(obj.sections[0].name.ptr_eq(&name));
     }
 }
 

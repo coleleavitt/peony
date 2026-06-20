@@ -1,18 +1,22 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Eq)]
 pub struct Name(Arc<[u8]>);
 
 impl Name {
     pub fn from_slice(bytes: &[u8]) -> Self {
+        if bytes.is_empty() {
+            return Self::empty();
+        }
         Self(Arc::from(bytes))
     }
 
     pub fn empty() -> Self {
-        Self::from_slice(&[])
+        static EMPTY: OnceLock<Name> = OnceLock::new();
+        EMPTY.get_or_init(|| Self(Arc::from([]))).clone()
     }
 
     #[inline]
@@ -28,6 +32,9 @@ impl Name {
 
 impl From<Vec<u8>> for Name {
     fn from(value: Vec<u8>) -> Self {
+        if value.is_empty() {
+            return Self::empty();
+        }
         Self(Arc::from(value.into_boxed_slice()))
     }
 }
@@ -87,5 +94,20 @@ impl std::fmt::Debug for Name {
         f.debug_tuple("Name")
             .field(&String::from_utf8_lossy(self.as_bytes()))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Name;
+
+    #[test]
+    fn empty_names_share_backing_storage() {
+        let first = Name::empty();
+        let second = Name::from_slice(b"");
+        let third = Name::from(Vec::new());
+
+        assert!(first.ptr_eq(&second));
+        assert!(second.ptr_eq(&third));
     }
 }

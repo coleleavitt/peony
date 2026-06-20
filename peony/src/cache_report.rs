@@ -105,7 +105,9 @@ impl FullEmitReason<'_> {
     fn message(self) -> String {
         match self {
             Self::IncrementalDisabled => "incremental cache disabled".to_string(),
-            Self::CacheStateUnavailable => "no usable prior cache state".to_string(),
+            Self::CacheStateUnavailable => {
+                "no usable prior cache state; the output may be missing, stale, or touched by a compiler driver before Peony started".to_string()
+            }
             Self::PlannerFallback(reason) => reason.message(),
             Self::PartialEmitDeclined => {
                 "partial emit declined because section preservation was unsafe".to_string()

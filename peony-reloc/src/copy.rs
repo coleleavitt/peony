@@ -25,10 +25,7 @@ pub fn copy_reloc_symbols(objects: &[InputObject], symbols: &SymbolTable) -> Vec
                 if !may_need_copy_reloc(reloc.r_type) {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 if sym.binding == Binding::Local {

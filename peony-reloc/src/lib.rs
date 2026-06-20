@@ -34,6 +34,7 @@ use apply::{RelocAddrs, patch_buf};
 pub use copy::copy_reloc_symbols;
 pub use dynamic::{
     DynamicRelocCounts,
+    collect_data_and_symbolic_relocs,
     collect_dynamic_data_relocs,
     collect_symbolic_data_relocs,
     count_dynamic_relocs,

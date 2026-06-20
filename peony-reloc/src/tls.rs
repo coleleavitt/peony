@@ -207,10 +207,7 @@ pub fn count_irelative(
                 if reloc.r_type != r_x86_64::R64 {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 let is_ifunc = if sym.binding == Binding::Local {

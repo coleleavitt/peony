@@ -51,6 +51,8 @@ strip = "none"
 debug = "full"
 split-debuginfo = "off"
 strip = "none"
+lto = "thin"
+codegen-units = 1
 
 [profile.unstripped]
 inherits = "release"

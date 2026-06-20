@@ -1,47 +1,67 @@
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
 use std::panic::Location;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::ThreadId;
 use std::time::Instant;
+
+use crate::trace_detail::DetailDecision;
+use crate::trace_fields::TraceField;
 
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static STACK_ENABLED: AtomicBool = AtomicBool::new(false);
+static DETAIL_ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+static TRACE_NODES: Mutex<Vec<TraceNode>> = Mutex::new(Vec::new());
 
 #[derive(Clone)]
-struct TraceNode {
-    label: &'static str,
-    loc: &'static Location<'static>,
-    depth: usize,
-    nanos: u128,
-    enter_seq: u64,
-    is_event: bool,
-    detail: String,
-    stack: String,
+pub(crate) struct TraceNode {
+    pub(crate) label: &'static str,
+    pub(crate) loc: &'static Location<'static>,
+    pub(crate) thread: ThreadId,
+    pub(crate) depth: usize,
+    pub(crate) nanos: u128,
+    pub(crate) enter_seq: u64,
+    pub(crate) is_event: bool,
+    pub(crate) detail: String,
+    pub(crate) fields: Vec<TraceField>,
+    pub(crate) stack: String,
 }
 
 thread_local! {
     static TRACE_DEPTH: RefCell<usize> = const { RefCell::new(0) };
-    static TRACE_NODES: RefCell<Vec<TraceNode>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn trace_enable() {
-    crate::enable();
-    TRACE_ENABLED.store(true, Ordering::Relaxed);
-    STACK_ENABLED.store(false, Ordering::Relaxed);
-    reset();
+    enable_trace(false, false);
 }
 
 pub fn trace_stack_enable() {
+    enable_trace(true, false);
+}
+
+pub fn trace_detail_enable() {
+    enable_trace(false, true);
+}
+
+pub fn trace_stack_detail_enable() {
+    enable_trace(true, true);
+}
+
+fn enable_trace(stack: bool, detail: bool) {
     crate::enable();
     TRACE_ENABLED.store(true, Ordering::Relaxed);
-    STACK_ENABLED.store(true, Ordering::Relaxed);
+    STACK_ENABLED.store(stack, Ordering::Relaxed);
+    DETAIL_ENABLED.store(detail, Ordering::Relaxed);
+    crate::trace_detail::set_limit_from_env();
     reset();
 }
 
 pub(crate) fn reset() {
     TRACE_SEQ.store(0, Ordering::Relaxed);
-    TRACE_NODES.with(|nodes| nodes.borrow_mut().clear());
+    with_nodes_mut(Vec::clear);
+    crate::trace_detail::reset_counts();
     TRACE_DEPTH.with(|depth| *depth.borrow_mut() = 0);
 }
 
@@ -51,6 +71,7 @@ pub struct TraceFrame {
     start: Option<Instant>,
     depth: usize,
     enter_seq: u64,
+    fields: Vec<TraceField>,
     stack: String,
     active: bool,
 }
@@ -65,6 +86,7 @@ pub fn trace(label: &'static str) -> TraceFrame {
             start: None,
             depth: 0,
             enter_seq: 0,
+            fields: Vec::new(),
             stack: String::new(),
             active: false,
         };
@@ -81,9 +103,23 @@ pub fn trace(label: &'static str) -> TraceFrame {
         start: Some(Instant::now()),
         depth,
         enter_seq: TRACE_SEQ.fetch_add(1, Ordering::Relaxed),
+        fields: Vec::new(),
         stack: capture_stack_if_enabled(),
         active: true,
     }
+}
+
+#[inline]
+#[track_caller]
+pub fn trace_fields(
+    label: &'static str,
+    fields: impl IntoIterator<Item = TraceField>,
+) -> TraceFrame {
+    let mut frame = trace(label);
+    if frame.active {
+        frame.fields.extend(fields);
+    }
+    frame
 }
 
 impl Drop for TraceFrame {
@@ -94,18 +130,19 @@ impl Drop for TraceFrame {
         let Some(start) = self.start else { return };
         let nanos = start.elapsed().as_nanos();
         TRACE_DEPTH.with(|depth| *depth.borrow_mut() = self.depth);
-        TRACE_NODES.with(|nodes| {
-            nodes.borrow_mut().push(TraceNode {
-                label: self.label,
-                loc: self.loc,
-                depth: self.depth,
-                nanos,
-                enter_seq: self.enter_seq,
-                is_event: false,
-                detail: String::new(),
-                stack: std::mem::take(&mut self.stack),
-            })
-        });
+        let node = TraceNode {
+            label: self.label,
+            loc: self.loc,
+            thread: std::thread::current().id(),
+            depth: self.depth,
+            nanos,
+            enter_seq: self.enter_seq,
+            is_event: false,
+            detail: String::new(),
+            fields: std::mem::take(&mut self.fields),
+            stack: std::mem::take(&mut self.stack),
+        };
+        with_nodes_mut(|nodes| nodes.push(node));
     }
 }
 
@@ -115,66 +152,50 @@ pub fn event(label: &'static str, detail: impl Into<String>) {
     if !TRACE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let depth = TRACE_DEPTH.with(|value| *value.borrow());
-    let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let loc = Location::caller();
-    TRACE_NODES.with(|nodes| {
-        nodes.borrow_mut().push(TraceNode {
-            label,
-            loc,
-            depth,
-            nanos: 0,
-            enter_seq: seq,
-            is_event: true,
-            detail: detail.into(),
-            stack: capture_stack_if_enabled(),
-        })
-    });
+    push_event(label, detail.into(), Vec::new());
 }
 
-pub fn trace_tree() {
+#[inline]
+#[track_caller]
+pub fn event_fields(label: &'static str, fields: impl IntoIterator<Item = TraceField>) {
     if !TRACE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let mut nodes = TRACE_NODES.with(|nodes| nodes.borrow().clone());
-    if nodes.is_empty() {
+    push_event(label, String::new(), fields.into_iter().collect());
+}
+
+#[inline]
+#[track_caller]
+pub fn detail_event_fields(label: &'static str, fields: impl IntoIterator<Item = TraceField>) {
+    if !detail_event_allowed(label) {
         return;
     }
-    nodes.sort_by_key(|node| node.enter_seq);
-    eprintln!("\n── peony --trace (call flow) ──────────────────────────────");
-    for node in &nodes {
-        let indent = "  ".repeat(node.depth);
-        let file = node
-            .loc
-            .file()
-            .rsplit('/')
-            .next()
-            .unwrap_or_else(|| node.loc.file());
-        if node.is_event {
-            let detail = if node.detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", node.detail)
-            };
-            eprintln!(
-                "{indent}• {}{}  ({}:{})",
-                node.label,
-                detail,
-                file,
-                node.loc.line()
-            );
-        } else {
-            eprintln!(
-                "{indent}{} {:>9}  ({}:{})",
-                node.label,
-                crate::fmt::fmt_ns(node.nanos),
-                file,
-                node.loc.line()
-            );
-        }
-        print_stack(&indent, &node.stack);
-    }
-    eprintln!("───────────────────────────────────────────────────────────");
+    push_event(label, String::new(), fields.into_iter().collect());
+}
+
+#[inline]
+pub fn trace_detail_enabled() -> bool {
+    TRACE_ENABLED.load(Ordering::Relaxed) && DETAIL_ENABLED.load(Ordering::Relaxed)
+}
+
+#[track_caller]
+fn push_event(label: &'static str, detail: String, fields: Vec<TraceField>) {
+    let depth = TRACE_DEPTH.with(|value| *value.borrow());
+    let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let loc = Location::caller();
+    let node = TraceNode {
+        label,
+        loc,
+        thread: std::thread::current().id(),
+        depth,
+        nanos: 0,
+        enter_seq: seq,
+        is_event: true,
+        detail,
+        fields,
+        stack: capture_stack_if_enabled(),
+    };
+    with_nodes_mut(|nodes| nodes.push(node));
 }
 
 fn capture_stack_if_enabled() -> String {
@@ -185,88 +206,49 @@ fn capture_stack_if_enabled() -> String {
     }
 }
 
-fn print_stack(indent: &str, stack: &str) {
-    if stack.is_empty() {
-        return;
+fn detail_event_allowed(label: &'static str) -> bool {
+    match crate::trace_detail::decision(label, trace_detail_enabled()) {
+        DetailDecision::Allow => true,
+        DetailDecision::Deny => false,
+        DetailDecision::LimitReached { limit, seen } => {
+            event_fields(
+                "trace-detail-limit",
+                [
+                    TraceField::text("label", label),
+                    TraceField::count("limit", limit),
+                    TraceField::count("seen", seen),
+                ],
+            );
+            false
+        }
     }
-    for line in stack.lines().take(32) {
-        eprintln!("{indent}    ↳ {line}");
+}
+
+fn with_nodes_mut(f: impl FnOnce(&mut Vec<TraceNode>)) {
+    match TRACE_NODES.lock() {
+        Ok(mut nodes) => f(&mut nodes),
+        Err(poisoned) => {
+            let mut nodes = poisoned.into_inner();
+            f(&mut nodes);
+        }
+    }
+}
+
+pub(crate) fn snapshot_nodes() -> Vec<TraceNode> {
+    match TRACE_NODES.lock() {
+        Ok(nodes) => nodes.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::Ordering;
+pub(crate) fn disable_for_tests() {
+    TRACE_ENABLED.store(false, Ordering::Relaxed);
+    STACK_ENABLED.store(false, Ordering::Relaxed);
+    DETAIL_ENABLED.store(false, Ordering::Relaxed);
+}
 
-    #[test]
-    fn trace_builds_nested_caller_callee_tree() {
-        let _guard = crate::TEST_LOCK.lock().expect("test mutex poisoned");
-        super::trace_enable();
-        {
-            let _outer = super::trace("outer");
-            {
-                let _inner = super::trace("inner");
-                let _leaf = super::trace("leaf");
-            }
-        }
-        let nodes = super::TRACE_NODES.with(|nodes| nodes.borrow().clone());
-        let by_label = |label: &str| nodes.iter().find(|node| node.label == label).unwrap();
-        assert_eq!(by_label("outer").depth, 0);
-        assert_eq!(by_label("inner").depth, 1);
-        assert_eq!(by_label("leaf").depth, 2);
-        assert!(by_label("outer").enter_seq < by_label("inner").enter_seq);
-        assert!(by_label("inner").enter_seq < by_label("leaf").enter_seq);
-        assert!(by_label("outer").loc.line() > 0);
-        assert!(by_label("outer").stack.is_empty());
-        super::TRACE_ENABLED.store(false, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn trace_disabled_is_noop() {
-        let _guard = crate::TEST_LOCK.lock().expect("test mutex poisoned");
-        super::TRACE_ENABLED.store(false, Ordering::Relaxed);
-        super::reset();
-        {
-            let _frame = super::trace("x");
-            super::event("e", "d");
-        }
-        assert!(super::TRACE_NODES.with(|nodes| nodes.borrow().is_empty()));
-    }
-
-    #[test]
-    fn events_logged_at_frame_depth_with_detail() {
-        let _guard = crate::TEST_LOCK.lock().expect("test mutex poisoned");
-        super::trace_enable();
-        {
-            let _frame = super::trace("phase");
-            super::event("conflict", "sym_foo");
-            super::event("excluded", String::from("comdat_bar"));
-        }
-        let nodes = super::TRACE_NODES.with(|nodes| nodes.borrow().clone());
-        let events: Vec<_> = nodes.iter().filter(|node| node.is_event).collect();
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|node| node.depth == 1));
-        assert!(
-            events
-                .iter()
-                .any(|node| node.label == "conflict" && node.detail == "sym_foo")
-        );
-        assert!(events.iter().any(|node| node.detail == "comdat_bar"));
-        assert!(events.iter().all(|node| node.nanos == 0));
-        super::TRACE_ENABLED.store(false, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn trace_stack_mode_captures_backtraces() {
-        let _guard = crate::TEST_LOCK.lock().expect("test mutex poisoned");
-        super::trace_stack_enable();
-        {
-            let _frame = super::trace("with-stack");
-            super::event("stack-event", "detail");
-        }
-        let nodes = super::TRACE_NODES.with(|nodes| nodes.borrow().clone());
-        assert!(nodes.iter().any(|node| !node.stack.is_empty()));
-        super::TRACE_ENABLED.store(false, Ordering::Relaxed);
-        super::STACK_ENABLED.store(false, Ordering::Relaxed);
-    }
+#[cfg(test)]
+pub(crate) fn set_detail_limit_for_tests(limit: u64) {
+    crate::trace_detail::set_limit_for_tests(limit);
 }

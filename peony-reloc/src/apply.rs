@@ -37,6 +37,9 @@ impl<'a> SymIndex<'a> {
     /// object symbol's name once (≈49k total) — replacing the ≈216k per-reloc
     /// name hashes with array indexing.
     pub fn build(objects: &[InputObject], symbols: &'a SymbolTable) -> Self {
+        // NOTE: a par_iter build was measured SLOWER here (+0.2ms on ripgrep) —
+        // the rayon pool is parked by emit time, so wakeup overhead exceeds the
+        // speedup on this ~0.8ms memory-bandwidth-bound pass. Kept serial.
         let by_object = objects
             .iter()
             .map(|obj| {
@@ -98,7 +101,9 @@ pub fn apply_reloc(
     if reloc.r_type == r_x86_64::NONE {
         return Ok(());
     }
-    let sym_pos = *obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX);
+    let Some(sym_pos) = obj.symbol_pos(reloc.symbol.0) else {
+        return Ok(());
+    };
     let Some(sym) = obj.symbols.get(sym_pos) else {
         return Ok(());
     };
@@ -208,26 +213,25 @@ pub fn apply_reloc(
     // TLS GOT addresses for this reference, keyed by `TlsRef` exactly as the
     // scan allocated them. IE (GOTTPOFF) slots exist in BOTH exe and shared
     // outputs; GD/LDM pairs only in a shared object.
-    let (tls_gd, tls_ie, tls_desc) = {
-        let sym_pos = obj.symbol_map.get(&reloc.symbol.0).copied();
-        let tref = match sym_pos {
-            Some(pos) if sym.binding == Binding::Local => Some(TlsRef::Local(obj_id, pos)),
-            Some(pos) => match res {
-                Some(r) => Some(TlsRef::Global(r.id)),
-                None => Some(TlsRef::Local(obj_id, pos)),
-            },
-            None => None,
+    // Only TLS relocations consume these GOT-pair addresses (verified: every
+    // patch_buf branch that reads `tls_gd`/`tls_ie`/`tls_desc` is a TLS reloc
+    // type, all of which `is_tls` matches). For the ~97% of ordinary relocs we
+    // skip building the `TlsRef` and the three (mostly-missing) hashmap probes.
+    let (tls_gd, tls_ie, tls_desc) = if is_tls(reloc.r_type) {
+        let tref = if sym.binding == Binding::Local {
+            TlsRef::Local(obj_id, sym_pos)
+        } else {
+            match res {
+                Some(r) => TlsRef::Global(r.id),
+                None => TlsRef::Local(obj_id, sym_pos),
+            }
         };
-        let gd = tref
-            .and_then(|t| ctx.layout.tls_gd_addr.get(&t).copied())
-            .unwrap_or(0);
-        let ie = tref
-            .and_then(|t| ctx.layout.tls_ie_addr.get(&t).copied())
-            .unwrap_or(0);
-        let desc = tref
-            .and_then(|t| ctx.layout.tls_desc_addr.get(&t).copied())
-            .unwrap_or(0);
+        let gd = ctx.layout.tls_gd_addr.get(&tref).copied().unwrap_or(0);
+        let ie = ctx.layout.tls_ie_addr.get(&tref).copied().unwrap_or(0);
+        let desc = ctx.layout.tls_desc_addr.get(&tref).copied().unwrap_or(0);
         (gd, ie, desc)
+    } else {
+        (0, 0, 0)
     };
 
     let addrs = RelocAddrs {

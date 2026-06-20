@@ -11,10 +11,7 @@ pub fn assign_weak_got_ids(objects: &[InputObject], symbols: &mut SymbolTable) {
                 if !needs_got(reloc.r_type) {
                     continue;
                 }
-                let Some(sym) = obj
-                    .symbols
-                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
-                else {
+                let Some(sym) = obj.symbol_by_index(reloc.symbol.0) else {
                     continue;
                 };
                 if sym.binding != Binding::Weak {
@@ -78,7 +75,7 @@ fn scan_object(
     let mut slots = Vec::new();
     for sec in &obj.sections {
         for reloc in &sec.relocs {
-            let Some(sym_pos) = obj.symbol_map.get(&reloc.symbol.0).copied() else {
+            let Some(sym_pos) = obj.symbol_pos(reloc.symbol.0) else {
                 continue;
             };
             let Some(sym) = obj.symbols.get(sym_pos) else {
@@ -143,7 +140,14 @@ fn scan_object(
                 // (the GD/LD call is kept), so it DOES need a PLT slot; in an
                 // executable the GD/LD calls are relaxed away, so it does not.
                 let tls_helper = sym.name == b"__tls_get_addr";
-                if res.import && (shared || !tls_helper) {
+                let import_plt = res.import && (shared || !tls_helper);
+                // A direct call to a DEFINED IFUNC must ALSO go through a PLT
+                // stub whose `.got.plt` slot is filled by an R_X86_64_IRELATIVE
+                // (the loader runs the resolver and the call lands on the chosen
+                // implementation). Resolving the PLT32 straight to the symbol
+                // would call the *resolver* itself — returning garbage.
+                let ifunc_plt = res.is_ifunc && res.is_defined() && !res.import;
+                if import_plt || ifunc_plt {
                     slots.push(SyntheticSlot::Plt(res.id));
                 }
             }
