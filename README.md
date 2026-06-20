@@ -166,6 +166,11 @@ otherwise reusable link:
 RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no -C link-arg=--incremental -C link-arg=--cache-report=target/peony-cache-report.json" cargo build
 ```
 
+Keep that `RUSTFLAGS` value stable between retries. Cargo fingerprints the full
+`RUSTFLAGS` string before Peony starts, so changing only the report filename can
+still make Cargo/rustc rebuild or relink even though Peony ignores that filename
+inside its own incremental cache key.
+
 Use `--stats` when invoking Peony directly if you also want a human-readable
 stderr line such as `reused unchanged output`, `partial relink used`, or
 `full emit fallback: section ... size changed`. The JSON report has stable

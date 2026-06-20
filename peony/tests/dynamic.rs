@@ -163,6 +163,42 @@ fn dynamic_function_import() {
 }
 
 #[test]
+fn dynamic_executable_is_accepted_by_bfd_tools() {
+    let dir = workdir("dyn_bfd");
+    let Some(exe) = link_c(&dir, "bfd", "int main(void){ return 42; }\n") else {
+        eprintln!("skipping: toolchain crt/libc unavailable");
+        return;
+    };
+
+    let sections = readelf(&exe, &["-SW"]);
+    let versym = sections
+        .lines()
+        .find(|line| line.contains(".gnu.version"))
+        .unwrap_or_else(|| panic!("missing .gnu.version section:\n{sections}"));
+    let fields = versym.split_whitespace().collect::<Vec<_>>();
+    let versym_type = fields
+        .iter()
+        .position(|field| *field == "VERSYM")
+        .unwrap_or_else(|| panic!("malformed .gnu.version section header:\n{sections}"));
+    assert!(
+        fields.get(versym_type + 4) == Some(&"02"),
+        ".gnu.version must advertise 2-byte entries for BFD/GDB:\n{sections}"
+    );
+
+    let objdump = Command::new("objdump")
+        .arg("-f")
+        .arg(&exe)
+        .output()
+        .expect("run objdump");
+    assert!(
+        objdump.status.success(),
+        "objdump rejected peony output:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&objdump.stdout),
+        String::from_utf8_lossy(&objdump.stderr)
+    );
+}
+
+#[test]
 fn hash_style_sysv_omits_gnu_hash() {
     let dir = workdir("hash_sysv");
     compile_shared(&dir, "hashsysv", "int get_answer(void){ return 42; }\n");

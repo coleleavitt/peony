@@ -3029,6 +3029,7 @@ fn place(
                 elf::SHT_RELA => elf::RELA_SIZE,
                 elf::SHT_DYNAMIC => 16,
                 elf::SHT_HASH => 4,
+                elf::SHT_GNU_VERSYM => 2,
                 _ => 0,
             },
             sh_name: 0,
