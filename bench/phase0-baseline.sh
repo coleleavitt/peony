@@ -8,7 +8,7 @@
 #   2. a determinism check        — link twice, the two sha256s must be equal
 #                                    (catches races introduced by parallelism).
 #   3. peony --stats per-phase     — self-time table at --threads 1 and
-#      self-time at 1 vs N threads   --threads 0 (all cores), so we can compute
+#      self-time at 1 vs auto threads --threads 0 (Peony auto default), so we can compute
 #                                    the per-phase scaling factor and re-rank
 #                                    the remaining phases by measured cost
 #                                    (Amdahl: biggest serial fraction wins).
@@ -99,7 +99,7 @@ run_corpus() {
     echo '```'
     grep -A40 -iE 'phase|====|total' "$outdir/$cname.stats.t1.txt" 2>/dev/null | head -40 || echo "(no stats)"
     echo '```'
-    echo "### --stats @ threads=$ncpu (0=all)"
+    echo "### --stats @ threads=auto (0=auto, host cores=$ncpu)"
     echo '```'
     grep -A40 -iE 'phase|====|total' "$outdir/$cname.stats.tN.txt" 2>/dev/null | head -40 || echo "(no stats)"
     echo '```'

@@ -4,18 +4,22 @@
 //!
 //! ### Epoch-gated fast path (QUAD Definition 6.2, Theorem 6.2)
 //!
-//! A *build epoch* is a period during which no input changes. The epoch key is
-//! `SHA-256(sorted file mtimes ∥ args_hash)`. If the current epoch key matches
-//! the cached one, the output is byte-identical to the previous link and we skip
-//! all work.
+//! A *build epoch* is a period during which no input changes. The epoch key is a
+//! deterministic FNV-1a fold of input mtimes/paths plus `args_hash`. If the
+//! current epoch key and cheap file fingerprints match the cached manifest, the
+//! output is byte-identical to the previous link and we skip all work.
 //!
 //! ### Red-green section coloring (QUAD Definition 6.1, Theorem 6.1)
 //!
-//! When inputs *do* change, we diff at the section level:
+//! When inputs *do* change, the cache exposes section-level diff machinery:
 //! - **Green** sections: byte-identical to the previous link → skip re-emit.
 //! - **Red** sections: changed or have moved relocation targets → must re-emit.
 //!
-//! This reduces incremental work to O(|δ|) instead of O(|S|) (QUAD §11).
+//! The driver records the metadata for this path and asks this crate for a
+//! patch plan on changed-input relinks. The plan is intentionally conservative:
+//! if file offsets, VM addresses, sizes, output fingerprints, input order, or
+//! command-line flags do not match the previous manifest, Peony falls back to a
+//! normal full emit rather than risking stale bytes.
 //!
 //! ### Relocation reverse index (QUAD §10.3, SPEC §7.3)
 //!
@@ -25,7 +29,7 @@
 //!
 //! Built lock-free with atomic compare-exchange from parallel threads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
@@ -50,7 +54,7 @@ pub enum CacheError {
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 /// Bump when the manifest format changes incompatibly.
-pub const CACHE_VERSION: u32 = 4;
+pub const CACHE_VERSION: u32 = 5;
 
 /// Sentinel for "no next entry" in the relocation reverse index.
 pub const NO_ENTRY: u32 = u32::MAX;
@@ -151,6 +155,18 @@ pub struct SectionRecord {
     pub virtual_address: u64,
 }
 
+/// Current-layout metadata for one patchable output section.
+#[derive(Debug, Clone)]
+pub struct PatchSectionRecord {
+    pub name: String,
+    pub file_offset: u64,
+    pub size: u64,
+    pub virtual_address: u64,
+    /// True when any input contribution to this output section came from an
+    /// input file whose cheap fingerprint changed since the last manifest.
+    pub input_changed: bool,
+}
+
 // ── Symbol record for persistent symbol cache (SPEC §7.2) ────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +174,129 @@ pub struct CachedSymbolEntry {
     pub name: Vec<u8>,
     pub virtual_address: u64,
     pub got_address: u64,
+}
+
+/// Previously recorded state that is safe to consult for a changed-input relink.
+#[derive(Debug, Clone)]
+pub struct CachedLinkState {
+    pub changed_inputs: Vec<String>,
+    pub sections: Vec<SectionRecord>,
+    pub symbols: Vec<CachedSymbolEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialRelinkFallback {
+    MissingSectionMetadata,
+    MissingPreviousSection {
+        section: String,
+    },
+    SectionFileOffsetChanged {
+        section: String,
+        previous: u64,
+        current: u64,
+    },
+    SectionVirtualAddressChanged {
+        section: String,
+        previous: u64,
+        current: u64,
+    },
+    SectionCapacityExceeded {
+        section: String,
+        capacity: u64,
+        size: u64,
+    },
+    SectionSizeChanged {
+        section: String,
+        previous: u64,
+        current: u64,
+    },
+}
+
+impl PartialRelinkFallback {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::MissingSectionMetadata => "missing_section_metadata",
+            Self::MissingPreviousSection { .. } => "missing_previous_section",
+            Self::SectionFileOffsetChanged { .. } => "section_file_offset_changed",
+            Self::SectionVirtualAddressChanged { .. } => "section_virtual_address_changed",
+            Self::SectionCapacityExceeded { .. } => "section_capacity_exceeded",
+            Self::SectionSizeChanged { .. } => "section_size_changed",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::MissingSectionMetadata => {
+                "section metadata missing from the previous or current link".to_string()
+            }
+            Self::MissingPreviousSection { section } => {
+                format!("section `{section}` was not present in the previous link")
+            }
+            Self::SectionFileOffsetChanged {
+                section,
+                previous,
+                current,
+            } => format!(
+                "section `{section}` file offset changed from {previous:#x} to {current:#x}"
+            ),
+            Self::SectionVirtualAddressChanged {
+                section,
+                previous,
+                current,
+            } => format!(
+                "section `{section}` virtual address changed from {previous:#x} to {current:#x}"
+            ),
+            Self::SectionCapacityExceeded {
+                section,
+                capacity,
+                size,
+            } => format!(
+                "section `{section}` grew to {size:#x} bytes beyond cached capacity {capacity:#x}"
+            ),
+            Self::SectionSizeChanged {
+                section,
+                previous,
+                current,
+            } => format!("section `{section}` size changed from {previous:#x} to {current:#x}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PartialRelinkPlan {
+    colors: HashMap<String, SectionColor>,
+    red_sections: HashSet<String>,
+    green_sections: HashSet<String>,
+}
+
+impl PartialRelinkPlan {
+    pub fn color(&self, section: &str) -> Option<SectionColor> {
+        self.colors.get(section).copied()
+    }
+
+    pub fn is_red(&self, section: &str) -> bool {
+        self.red_sections.contains(section)
+    }
+
+    pub fn is_green(&self, section: &str) -> bool {
+        self.green_sections.contains(section)
+    }
+
+    pub fn red_sections(&self) -> &HashSet<String> {
+        &self.red_sections
+    }
+
+    pub fn green_sections(&self) -> &HashSet<String> {
+        &self.green_sections
+    }
+
+    pub fn red_count(&self) -> usize {
+        self.red_sections.len()
+    }
+
+    pub fn green_count(&self) -> usize {
+        self.green_sections.len()
+    }
 }
 
 // ── Relocation reverse index (QUAD §10.3, SPEC §7.3) ────────────────────────
@@ -304,6 +443,9 @@ pub fn hash_args(args: &[String]) -> u64 {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
+    /// Output-affecting command-line hash used to distinguish flag-only relinks
+    /// from changed-input relinks.
+    pub args_hash: u64,
     /// Epoch key at time of last link (QUAD Definition 6.2).
     pub epoch_key: u64,
     /// (input path, content fingerprint) in input order. The content hash is
@@ -360,6 +502,9 @@ pub fn try_reuse(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<bo
     if manifest.version != CACHE_VERSION {
         return Ok(false);
     }
+    if manifest.args_hash != args_hash {
+        return Ok(false);
+    }
 
     // Output-affecting flags must match: the epoch key folds the args hash, so a
     // relink with different flags (same inputs) has a different epoch key and
@@ -389,6 +534,50 @@ pub fn try_reuse(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<bo
         Ok(fp) if fp == manifest.fast_output => Ok(true),
         _ => Ok(false),
     }
+}
+
+pub fn load_changed_state(
+    output: &Path,
+    inputs: &[PathBuf],
+    args_hash: u64,
+) -> Result<Option<CachedLinkState>> {
+    let path = manifest_path(output);
+    if !path.exists() || !output.exists() {
+        return Ok(None);
+    }
+    let Some(manifest) = read_manifest(&path)? else {
+        return Ok(None);
+    };
+    if manifest.version != CACHE_VERSION || manifest.args_hash != args_hash {
+        return Ok(None);
+    }
+    if manifest.fast_inputs.len() != inputs.len() {
+        return Ok(None);
+    }
+
+    let mut changed_inputs = Vec::new();
+    for ((rec_path, rec_fp), cur) in manifest.fast_inputs.iter().zip(inputs) {
+        let cur_path = cur.display().to_string();
+        if rec_path != &cur_path {
+            return Ok(None);
+        }
+        match FastFingerprint::of_file(cur) {
+            Ok(fp) if fp == *rec_fp => {}
+            Ok(_) => changed_inputs.push(cur_path),
+            Err(_) => return Ok(None),
+        }
+    }
+
+    match FastFingerprint::of_file(output) {
+        Ok(fp) if fp == manifest.fast_output => {}
+        _ => return Ok(None),
+    }
+
+    Ok(Some(CachedLinkState {
+        changed_inputs,
+        sections: manifest.sections,
+        symbols: manifest.symbols,
+    }))
 }
 
 /// Record fingerprints after a successful full link. `args_hash` is the hash of
@@ -442,6 +631,7 @@ pub fn record_link_with_sections(
     let epoch_key = compute_epoch_key(inputs, args_hash);
     let manifest = Manifest {
         version: CACHE_VERSION,
+        args_hash,
         epoch_key,
         inputs: input_fps,
         fast_inputs,
@@ -454,6 +644,95 @@ pub fn record_link_with_sections(
     let bytes = bincode::serde::encode_to_vec(&manifest, bincode::config::standard())
         .map_err(|e| CacheError::Codec(e.to_string()))?;
     atomic_write(&manifest_path(output), &bytes)
+}
+
+pub fn plan_partial_relink(
+    cached: &CachedLinkState,
+    current_sections: &[PatchSectionRecord],
+    moved_symbol_ids: &[u32],
+    rev_index: &RelocReverseIndex,
+    reloc_sections: &[&str],
+) -> std::result::Result<PartialRelinkPlan, PartialRelinkFallback> {
+    if current_sections.is_empty() || cached.sections.is_empty() {
+        return Err(PartialRelinkFallback::MissingSectionMetadata);
+    }
+    let previous: HashMap<&str, &SectionRecord> = cached
+        .sections
+        .iter()
+        .map(|sec| (sec.name.as_str(), sec))
+        .collect();
+    let moved_sections = moved_reloc_sections(moved_symbol_ids, rev_index, reloc_sections);
+
+    let mut colors = HashMap::with_capacity(current_sections.len());
+    let mut red_sections = HashSet::new();
+    let mut green_sections = HashSet::new();
+    for current in current_sections {
+        let previous = previous.get(current.name.as_str()).ok_or_else(|| {
+            PartialRelinkFallback::MissingPreviousSection {
+                section: current.name.clone(),
+            }
+        })?;
+        if previous.file_offset != current.file_offset {
+            return Err(PartialRelinkFallback::SectionFileOffsetChanged {
+                section: current.name.clone(),
+                previous: previous.file_offset,
+                current: current.file_offset,
+            });
+        }
+        if previous.virtual_address != current.virtual_address {
+            return Err(PartialRelinkFallback::SectionVirtualAddressChanged {
+                section: current.name.clone(),
+                previous: previous.virtual_address,
+                current: current.virtual_address,
+            });
+        }
+        if current.size > previous.capacity {
+            return Err(PartialRelinkFallback::SectionCapacityExceeded {
+                section: current.name.clone(),
+                capacity: previous.capacity,
+                size: current.size,
+            });
+        }
+        if current.size != previous.size {
+            return Err(PartialRelinkFallback::SectionSizeChanged {
+                section: current.name.clone(),
+                previous: previous.size,
+                current: current.size,
+            });
+        }
+        let color = if current.input_changed || moved_sections.contains(current.name.as_str()) {
+            SectionColor::Red
+        } else {
+            SectionColor::Green
+        };
+        colors.insert(current.name.clone(), color);
+        match color {
+            SectionColor::Red => {
+                red_sections.insert(current.name.clone());
+            }
+            SectionColor::Green => {
+                green_sections.insert(current.name.clone());
+            }
+        }
+    }
+
+    Ok(PartialRelinkPlan {
+        colors,
+        red_sections,
+        green_sections,
+    })
+}
+
+fn read_manifest(path: &Path) -> Result<Option<Manifest>> {
+    let bytes = std::fs::read(path).map_err(|e| CacheError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let manifest = match bincode::serde::decode_from_slice(&bytes, bincode::config::standard()) {
+        Ok((manifest, _)) => manifest,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(manifest))
 }
 
 /// Compute the red-green coloring for each output section.
@@ -563,6 +842,22 @@ fn section_references_moved_checked(
     false
 }
 
+fn moved_reloc_sections<'a>(
+    moved_ids: &[u32],
+    rev_index: &RelocReverseIndex,
+    reloc_sections: &'a [&'a str],
+) -> HashSet<&'a str> {
+    let mut sections = HashSet::new();
+    for &sym_id in moved_ids {
+        for reloc_id in rev_index.iter_relocs(sym_id) {
+            if let Some(&section) = reloc_sections.get(reloc_id as usize) {
+                sections.insert(section);
+            }
+        }
+    }
+    sections
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
@@ -656,6 +951,84 @@ mod tests {
         let k1 = hash_args(&["peony".to_string(), "-o".to_string(), "a.out".to_string()]);
         let k2 = hash_args(&["peony".to_string(), "-o".to_string(), "b.out".to_string()]);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn partial_relink_reports_section_size_fallback() {
+        let cached = CachedLinkState {
+            changed_inputs: vec!["in.o".to_string()],
+            sections: vec![SectionRecord {
+                name: ".text".to_string(),
+                fingerprint: Fingerprint::of_bytes(b"old"),
+                file_offset: 0x1000,
+                size: 0x20,
+                capacity: 0x20,
+                virtual_address: 0x401000,
+            }],
+            symbols: Vec::new(),
+        };
+        let current = vec![PatchSectionRecord {
+            name: ".text".to_string(),
+            file_offset: 0x1000,
+            size: 0x28,
+            virtual_address: 0x401000,
+            input_changed: true,
+        }];
+        let reason =
+            plan_partial_relink(&cached, &current, &[], &RelocReverseIndex::new(0, 0), &[])
+                .unwrap_err();
+
+        assert_eq!(reason.code(), "section_capacity_exceeded");
+        assert!(reason.message().contains(".text"));
+    }
+
+    #[test]
+    fn partial_relink_reports_red_and_green_sections() {
+        let cached = CachedLinkState {
+            changed_inputs: vec!["in.o".to_string()],
+            sections: vec![
+                SectionRecord {
+                    name: ".text".to_string(),
+                    fingerprint: Fingerprint::of_bytes(b"text"),
+                    file_offset: 0x1000,
+                    size: 0x20,
+                    capacity: 0x20,
+                    virtual_address: 0x401000,
+                },
+                SectionRecord {
+                    name: ".rodata".to_string(),
+                    fingerprint: Fingerprint::of_bytes(b"rodata"),
+                    file_offset: 0x2000,
+                    size: 0x10,
+                    capacity: 0x10,
+                    virtual_address: 0x402000,
+                },
+            ],
+            symbols: Vec::new(),
+        };
+        let current = vec![
+            PatchSectionRecord {
+                name: ".text".to_string(),
+                file_offset: 0x1000,
+                size: 0x20,
+                virtual_address: 0x401000,
+                input_changed: true,
+            },
+            PatchSectionRecord {
+                name: ".rodata".to_string(),
+                file_offset: 0x2000,
+                size: 0x10,
+                virtual_address: 0x402000,
+                input_changed: false,
+            },
+        ];
+        let plan = plan_partial_relink(&cached, &current, &[], &RelocReverseIndex::new(0, 0), &[])
+            .unwrap();
+
+        assert_eq!(plan.red_count(), 1);
+        assert_eq!(plan.green_count(), 1);
+        assert!(plan.is_red(".text"));
+        assert!(plan.is_green(".rodata"));
     }
 
     #[test]

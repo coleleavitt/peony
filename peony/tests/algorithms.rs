@@ -11,8 +11,14 @@
 mod common;
 
 use std::fs;
+use std::path::Path;
 
-use common::{assemble, link, run, workdir};
+use common::{assemble, link, link_raw, run, workdir};
+
+fn read_cache_report(path: &Path) -> serde_json::Value {
+    let bytes = fs::read(path).expect("read cache report");
+    serde_json::from_slice(&bytes).expect("parse cache report")
+}
 
 // ── S3-GC correctness ─────────────────────────────────────────────────────────
 
@@ -450,14 +456,29 @@ _start:
     );
 
     let out = dir.join("incr.out");
+    let report = dir.join("cache-report.json");
+    let report_arg = format!("--cache-report={}", report.display());
 
     // First link: no cache.
-    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    link(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
+    let first_report = read_cache_report(&report);
+    assert_eq!(first_report["action"], "full_emit");
+    assert_eq!(first_report["reason"]["code"], "cache_state_unavailable");
     let bytes1 = fs::read(&out).unwrap();
     assert_eq!(run(&out), 55);
 
     // Second link: cache hit → output unchanged.
-    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    link(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
+    let reused_report = read_cache_report(&report);
+    assert_eq!(reused_report["action"], "reused_unchanged_output");
     let bytes2 = fs::read(&out).unwrap();
     assert_eq!(bytes1, bytes2, "cached link must produce identical binary");
     assert_eq!(
@@ -467,14 +488,15 @@ _start:
     );
 }
 
-/// Incremental cache invalidation: when an input changes, the `--incremental`
-/// relink must NOT reuse the stale output — it must fall back to a full link and
-/// produce the new (correct) binary. This is the conservative-correctness
-/// guarantee: a cache that ever serves stale bytes is worse than no cache.
+/// Incremental changed-input relink: when an input changes, the `--incremental`
+/// relink must NOT reuse the stale output. If section layout is still stable it
+/// should take the red/green patch path and produce the new correct binary.
 #[test]
 fn incremental_cache_invalidates_on_input_change() {
     let dir = workdir("incr_inval");
     let out = dir.join("incr.out");
+    let report = dir.join("cache-report.json");
+    let report_arg = format!("--cache-report={}", report.display());
 
     let exit_55 = "\
         .text\n.globl _start\n_start:\n    mov $60, %rax\n    mov $55, %rdi\n    syscall\n";
@@ -483,7 +505,11 @@ fn incremental_cache_invalidates_on_input_change() {
 
     // First link with the 55 variant, priming the cache.
     let obj = assemble(&dir, "incr", exit_55);
-    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    link(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
     assert_eq!(run(&out), 55);
 
     // Overwrite the SAME object path with a different program. A correct
@@ -492,20 +518,100 @@ fn incremental_cache_invalidates_on_input_change() {
     std::thread::sleep(std::time::Duration::from_millis(10));
     let obj2 = assemble(&dir, "incr", exit_42);
     assert_eq!(obj, obj2, "assemble must reuse the same object path");
-    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    let changed = link_raw(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
+    assert!(
+        changed.status.success(),
+        "changed-input incremental relink failed: {}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let changed_log = String::from_utf8_lossy(&changed.stderr);
+    assert!(
+        changed_log.contains("incremental red/green patch emitted"),
+        "changed-input stable-layout relink should use the red/green patch path; stderr was:\n{changed_log}"
+    );
     assert_eq!(
         run(&out),
         42,
         "incremental relink must reflect the changed input, not serve stale bytes"
     );
+    let partial_report = read_cache_report(&report);
+    assert_eq!(partial_report["action"], "partial_relink");
+    assert_eq!(partial_report["cache"]["enabled"], true);
+    assert!(
+        partial_report["sections"]["red"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|section| section == ".text"),
+        "partial report should name the patched .text section: {partial_report:#?}"
+    );
 
     // And a third link with no further change is a clean cache hit again.
     let b_after = fs::read(&out).unwrap();
-    link(&out, std::slice::from_ref(&obj), &["--incremental"]);
+    link(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
     assert_eq!(
         fs::read(&out).unwrap(),
         b_after,
         "no-change relink after invalidation must be byte-identical"
+    );
+}
+
+#[test]
+fn incremental_cache_full_emits_when_changed_input_grows() {
+    let dir = workdir("incr_fallback");
+    let out = dir.join("incr.out");
+    let report = dir.join("cache-report.json");
+    let report_arg = format!("--cache-report={}", report.display());
+
+    let small = "\
+        .text\n.globl _start\n_start:\n    mov $60, %rax\n    mov $11, %rdi\n    syscall\n";
+    let large = "\
+        .text\n.globl _start\n_start:\n    nop\n    nop\n    mov $60, %rax\n    mov $12, %rdi\n    syscall\n";
+
+    let obj = assemble(&dir, "incr", small);
+    link(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
+    assert_eq!(run(&out), 11);
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let obj2 = assemble(&dir, "incr", large);
+    assert_eq!(obj, obj2, "assemble must reuse the same object path");
+    let changed = link_raw(
+        &out,
+        std::slice::from_ref(&obj),
+        &["--incremental", report_arg.as_str()],
+    );
+    assert!(
+        changed.status.success(),
+        "changed-input incremental relink failed: {}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let changed_log = String::from_utf8_lossy(&changed.stderr);
+    assert!(
+        changed_log.contains("incremental red/green patch unavailable; using full emit"),
+        "layout/size-changing relink should conservatively full-emit; stderr was:\n{changed_log}"
+    );
+    assert!(
+        !changed_log.contains("incremental red/green patch emitted"),
+        "fallback relink must not report partial patch emission; stderr was:\n{changed_log}"
+    );
+    assert_eq!(run(&out), 12);
+    let fallback_report = read_cache_report(&report);
+    assert_eq!(fallback_report["action"], "full_emit");
+    assert_eq!(
+        fallback_report["reason"]["code"],
+        "section_capacity_exceeded"
     );
 }
 

@@ -604,6 +604,7 @@ dependencies = [
  "peony-symbols",
  "rayon",
  "rustc-hash",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -613,7 +614,12 @@ name = "peony-bench"
 version = "0.1.0"
 dependencies = [
  "codspeed-criterion-compat",
+ "peony-cache",
+ "peony-layout",
+ "peony-object",
+ "peony-reloc",
  "peony-symbols",
+ "rustc-hash",
 ]
 
 [[package]]

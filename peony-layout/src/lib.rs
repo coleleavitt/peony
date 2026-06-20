@@ -29,6 +29,9 @@ use thiserror::Error;
 use ws_deque::{Steal, Worker};
 
 pub mod icf;
+mod script;
+
+pub use script::{ScriptLayout, ScriptOutputSection};
 
 /// Which input sections the layout should emit. Replaces an
 /// `Option<&FxHashSet<(usize,usize)>>` allow-list so the common
@@ -82,6 +85,8 @@ pub enum LayoutError {
         "internal error: program-header count mismatch (predicted {predicted}, emitted {actual})"
     )]
     PhdrCountMismatch { predicted: u64, actual: u64 },
+    #[error("unsupported layout feature: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, LayoutError>;
@@ -143,6 +148,14 @@ pub enum SecSource {
     RelaEmit(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashStyle {
+    Sysv,
+    Gnu,
+    #[default]
+    Both,
+}
+
 /// Inputs needed to lay out a dynamic executable.
 #[derive(Debug, Clone, Default)]
 pub struct DynamicInfo {
@@ -157,6 +170,15 @@ pub struct DynamicInfo {
     pub import_sonames: Vec<Option<String>>,
     /// `DT_NEEDED` shared-library names.
     pub needed: Vec<String>,
+    /// Optional `PT_INTERP` payload for dynamic executables. Shared objects omit
+    /// the interpreter regardless of this value.
+    pub interp: Option<Vec<u8>>,
+    /// Colon-joined runtime library search path from `-rpath`.
+    pub rpath: Option<String>,
+    /// Use `DT_RUNPATH` when true (`--enable-new-dtags`), otherwise `DT_RPATH`.
+    pub enable_new_dtags: bool,
+    /// Dynamic hash-table policy requested by `--hash-style`.
+    pub hash_style: HashStyle,
     /// True when producing a position-independent executable (ET_DYN). PIE
     /// requires `R_X86_64_RELATIVE` dynamic relocations for every absolute
     /// pointer the loader must bias.
@@ -671,35 +693,6 @@ impl Default for LayoutConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ScriptLayout {
-    pub output_sections: Vec<ScriptOutputSection>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScriptOutputSection {
-    pub name: String,
-    pub patterns: Vec<String>,
-}
-
-impl ScriptLayout {
-    pub fn output_for_input(&self, input_name: &[u8]) -> Option<&str> {
-        let name = std::str::from_utf8(input_name).ok()?;
-        self.output_sections
-            .iter()
-            .find(|out| {
-                out.patterns
-                    .iter()
-                    .any(|pat| script_pattern_matches(pat, name))
-            })
-            .map(|out| out.name.as_str())
-    }
-
-    pub fn order_of(&self, name: &str) -> Option<usize> {
-        self.output_sections.iter().position(|out| out.name == name)
-    }
-}
-
 /// Size of a `.note.gnu.build-id` note: namesz+descsz+type (12) + "GNU\0" (4)
 /// + a 16-byte hash.
 pub const BUILD_ID_NOTE_SIZE: u64 = 12 + 4 + 16;
@@ -796,6 +789,7 @@ pub fn compute_layout_icf(
     let mut copy_patch: Vec<(SymbolId, usize)> = Vec::new();
     // `DT_SONAME` string offset in `.dynstr` (shared only).
     let mut soname_dt_off: Option<u32> = None;
+    let mut rpath_dt_off: Option<u32> = None;
     if let Some(dynj) = dynamic {
         let copy_imports: FxHashSet<Vec<u8>> = dynj
             .copy_relocs
@@ -863,6 +857,11 @@ pub fn compute_layout_icf(
         if let Some(name) = &dynj.soname {
             soname_dt_off = Some(dynstr.len() as u32);
             dynstr.extend_from_slice(name.as_bytes());
+            dynstr.push(0);
+        }
+        if let Some(path) = &dynj.rpath {
+            rpath_dt_off = Some(dynstr.len() as u32);
+            dynstr.extend_from_slice(path.as_bytes());
             dynstr.push(0);
         }
 
@@ -1025,6 +1024,16 @@ pub fn compute_layout_icf(
             gnu_hash.extend_from_slice(&0u64.to_le_bytes()); // bloom[0] = 0 (matches nothing)
             gnu_hash.extend_from_slice(&0u32.to_le_bytes()); // bucket[0] = 0 (empty)
         }
+        if dynj.hash_style == HashStyle::Gnu && gnu_hash.is_empty() && n_hashed > 0 {
+            return Err(LayoutError::Unsupported(
+                "--hash-style=gnu for exported or copy-relocated symbols".to_string(),
+            ));
+        }
+        match dynj.hash_style {
+            HashStyle::Sysv => gnu_hash.clear(),
+            HashStyle::Gnu => hash.clear(),
+            HashStyle::Both => {}
+        }
 
         dyn_blobs.dynstr = dynstr;
         dyn_blobs.dynsym = dynsym;
@@ -1032,7 +1041,13 @@ pub fn compute_layout_icf(
         dyn_blobs.gnu_hash = gnu_hash;
         // A shared object has no program interpreter, so no `.interp`/PT_INTERP.
         if !config.shared {
-            dyn_blobs.interp = elf::DEFAULT_INTERP.to_vec();
+            dyn_blobs.interp = dynj
+                .interp
+                .clone()
+                .unwrap_or_else(|| elf::DEFAULT_INTERP.to_vec());
+            if !dyn_blobs.interp.ends_with(&[0]) {
+                dyn_blobs.interp.push(0);
+            }
         }
         // Only attach versym/verneed when there is something to version.
         if verneed_num > 0 {
@@ -1419,15 +1434,19 @@ pub fn compute_layout_icf(
             0
         };
         let has_ver = dyn_blobs.verneed_num > 0;
+        let has_sysv_hash = !dyn_blobs.hash.is_empty();
         let has_gnu_hash = !dyn_blobs.gnu_hash.is_empty();
         let has_soname = soname_dt_off.is_some();
+        let has_rpath = rpath_dt_off.is_some();
         // DT_INIT / DT_FINI when the corresponding (executable) sections exist.
         let n_init = rx.iter().filter(|b| b.name == ".init").count();
         let n_fini = rx.iter().filter(|b| b.name == ".fini").count();
         dyn_entries = dynj.needed.len()
-            + 5                                  // HASH,STRTAB,SYMTAB,STRSZ,SYMENT
+            + 4                                  // STRTAB,SYMTAB,STRSZ,SYMENT
+            + usize::from(has_sysv_hash)         // DT_HASH
             + usize::from(has_gnu_hash)          // DT_GNU_HASH (omitted when it would hash nothing)
             + usize::from(has_soname)            // DT_SONAME (shared object)
+            + usize::from(has_rpath)             // DT_RUNPATH/DT_RPATH
             + if has_rela { 3 } else { 0 }       // DT_RELA, DT_RELASZ, DT_RELAENT
             + if dynj.n_relative > dynj.n_irelative { 1 } else { 0 } // DT_RELACOUNT (plain RELATIVE only)
             + if n_plt > 0 { 4 } else { 0 }      // PLTGOT,PLTRELSZ,PLTREL,JMPREL
@@ -2239,7 +2258,17 @@ pub fn compute_layout_icf(
         if let Some(off) = soname_dt_off {
             push_dyn(elf::DT_SONAME, off as u64);
         }
-        push_dyn(elf::DT_HASH, va_of(SecSource::Hash));
+        if let Some(off) = rpath_dt_off {
+            let tag = if dynj.enable_new_dtags {
+                elf::DT_RUNPATH
+            } else {
+                elf::DT_RPATH
+            };
+            push_dyn(tag, off as u64);
+        }
+        if !dyn_blobs.hash.is_empty() {
+            push_dyn(elf::DT_HASH, va_of(SecSource::Hash));
+        }
         // DT_GNU_HASH only when `.gnu.hash` actually indexes symbols (see the
         // export gating above) — otherwise glibc would prefer it and find nothing.
         if !dyn_blobs.gnu_hash.is_empty() {
@@ -2751,7 +2780,7 @@ pub fn gc_sections_rooted(
     }
     for (obj_id, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
-            // GC roots: init/fini arrays, SHF_LINK_ORDER sections, and
+            // GC roots: init/fini arrays, SHF_GNU_RETAIN sections, and
             // exception-handling metadata. `.eh_frame` and `.gcc_except_table`
             // are NOT referenced *by* code — they reference *into* code (FDEs
             // point at functions, LSDA tables are referenced by FDE aug data).
@@ -2765,7 +2794,7 @@ pub fn gc_sections_rooted(
                 || sec.name.starts_with(b".preinit_array")
                 || sec.name.starts_with(b".eh_frame")
                 || sec.name.starts_with(b".gcc_except_table")
-                || (sec.flags & 0x0020_0000) != 0; // SHF_LINK_ORDER
+                || (sec.flags & peony_object::elf::SHF_GNU_RETAIN) != 0;
             if keep && sec.flags & peony_object::elf::SHF_ALLOC != 0 {
                 let key = (obj_id, sec.index.0);
                 if live.insert(key) {
@@ -3521,45 +3550,6 @@ fn output_section_name(name: &[u8]) -> String {
     }
 }
 
-fn script_pattern_matches(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let mut rest = name;
-    let mut parts = pattern.split('*').peekable();
-    let anchored_start = !pattern.starts_with('*');
-    let anchored_end = !pattern.ends_with('*');
-
-    if let Some(first) = parts.next() {
-        if !first.is_empty() {
-            if anchored_start {
-                let Some(stripped) = rest.strip_prefix(first) else {
-                    return false;
-                };
-                rest = stripped;
-            } else if let Some(pos) = rest.find(first) {
-                rest = &rest[pos + first.len()..];
-            } else {
-                return false;
-            }
-        }
-    }
-
-    let mut last_non_empty = "";
-    for part in parts {
-        if part.is_empty() {
-            continue;
-        }
-        last_non_empty = part;
-        let Some(pos) = rest.find(part) else {
-            return false;
-        };
-        rest = &rest[pos + part.len()..];
-    }
-
-    !anchored_end || pattern.ends_with(last_non_empty) && rest.is_empty()
-}
-
 fn copy_reloc_align(size: u64) -> u64 {
     size.next_power_of_two().clamp(1, 16)
 }
@@ -3613,22 +3603,5 @@ mod tests {
             .collect();
         // null + [1→0, 0x10000→0x10000, 0x10007→0x10007]
         assert_eq!(words, vec![0, 0, 0x1_0000, 0x1_0007]);
-    }
-
-    #[test]
-    fn script_patterns_match_common_linker_wildcards() {
-        assert!(script_pattern_matches(".text*", ".text.startup"));
-        assert!(script_pattern_matches("*.init_array", ".rela.init_array"));
-        assert!(script_pattern_matches(".rodata", ".rodata"));
-        assert!(!script_pattern_matches(".data", ".data.rel.ro"));
-
-        let script = ScriptLayout {
-            output_sections: vec![ScriptOutputSection {
-                name: ".fast".to_string(),
-                patterns: vec![".text.hot*".to_string(), ".init".to_string()],
-            }],
-        };
-        assert_eq!(script.output_for_input(b".text.hot.foo"), Some(".fast"));
-        assert_eq!(script.output_for_input(b".text.cold.foo"), None);
     }
 }

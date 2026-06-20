@@ -12,15 +12,25 @@
 //! The layout maintains `file_offset == vaddr - base`, so writing each section
 //! at its `sh_offset` simultaneously places it at the correct in-memory address.
 
-use std::fs::OpenOptions;
+use std::collections::HashSet;
 use std::path::Path;
 
-use memmap2::MmapMut;
-use peony_layout::{Layout, SecSource};
-use peony_object::{InputArena, InputObject, elf};
-use peony_reloc::ApplyCtx;
+use peony_layout::Layout;
+use peony_object::{InputArena, InputObject};
 use peony_symbols::SymbolTable;
 use thiserror::Error;
+
+mod build_id;
+mod eh_frame;
+mod file;
+mod headers;
+mod sections;
+
+use build_id::finalize_build_id;
+use eh_frame::write_eh_frame_hdr;
+use file::{chmod_executable, open_output_map};
+use headers::{write_headers, write_section_headers};
+use sections::{write_section_data_parallel, write_tls_got};
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +49,21 @@ pub enum EmitError {
 }
 
 pub type Result<T> = std::result::Result<T, EmitError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectionWriteFilter<'a> {
+    All,
+    RedOnly(&'a HashSet<String>),
+}
+
+impl SectionWriteFilter<'_> {
+    pub(crate) fn writes_input_section(self, name: &str) -> bool {
+        match self {
+            SectionWriteFilter::All => true,
+            SectionWriteFilter::RedOnly(red) => red.contains(name),
+        }
+    }
+}
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -64,47 +89,58 @@ pub struct EmitConfig {
 ///
 /// All input sections write to disjoint file ranges (by Theorem 4.1), so they
 /// can be copied and relocated in parallel with zero synchronization.
-/// Open the output file and `mmap` it RW, sized to `file_size`. When
-/// `can_overwrite` (an existing file of the exact size), the file is opened
-/// without truncation and the map is reused as-is (TLB-friendly, avoids
-/// remap shootdowns); otherwise the file is created/truncated and the fresh map
-/// is zeroed. Returned as a raw `io::Error` so the caller attaches the path.
-fn open_output_map(
-    output_path: &Path,
-    file_size: u64,
-    can_overwrite: bool,
-) -> std::io::Result<MmapMut> {
-    let file = if can_overwrite {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(output_path)?
-    } else {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(output_path)?;
-        f.set_len(file_size)?;
-        f
-    };
-    // SAFETY: we hold the file open exclusively for the duration of the map.
-    let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
-    if !can_overwrite {
-        mmap.iter_mut().for_each(|b| *b = 0);
-    }
-    Ok(mmap)
-}
-
 pub fn emit_full(
     output_path: &Path,
     arena: &InputArena,
     objects: &[InputObject],
     symbols: &SymbolTable,
     layout: &Layout,
-    _config: &EmitConfig,
+    config: &EmitConfig,
 ) -> Result<()> {
+    emit_with_filter(
+        output_path,
+        arena,
+        objects,
+        symbols,
+        layout,
+        config,
+        SectionWriteFilter::All,
+        false,
+    )?;
+    Ok(())
+}
+
+pub fn emit_partial(
+    output_path: &Path,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    config: &EmitConfig,
+    red_sections: &HashSet<String>,
+) -> Result<bool> {
+    emit_with_filter(
+        output_path,
+        arena,
+        objects,
+        symbols,
+        layout,
+        config,
+        SectionWriteFilter::RedOnly(red_sections),
+        true,
+    )
+}
+
+fn emit_with_filter(
+    output_path: &Path,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    _config: &EmitConfig,
+    filter: SectionWriteFilter<'_>,
+    require_existing_size: bool,
+) -> Result<bool> {
     let io = |e: std::io::Error| EmitError::Io {
         path: output_path.display().to_string(),
         source: e,
@@ -121,6 +157,9 @@ pub fn emit_full(
     // TLB-aware: check if we can overwrite in-place (avoids truncate+remap shootdowns).
     let existing_size = std::fs::metadata(output_path).ok().map(|m| m.len());
     let can_overwrite = existing_size == Some(file_size);
+    if require_existing_size && !can_overwrite {
+        return Ok(false);
+    }
 
     // SAFETY: we hold the file open exclusively for the duration of the map.
     let mut mmap = {
@@ -139,7 +178,15 @@ pub fn emit_full(
     // Uses ws-deque's Chase-Lev work-stealing deque for load-balanced dispatch.
     {
         let _t = peony_prof::trace("emit:section-data");
-        write_section_data_parallel(&mut mmap, arena, objects, symbols, layout, output_path)?;
+        write_section_data_parallel(
+            &mut mmap,
+            arena,
+            objects,
+            symbols,
+            layout,
+            output_path,
+            filter,
+        )?;
     }
 
     // Shared-object TLS GOT static slots (DTPOFF in GD/LDM pair slot1) — written
@@ -177,661 +224,17 @@ pub fn emit_full(
         mmap.flush().map_err(io)?;
     }
 
-    // Make the output executable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(output_path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(0o755);
-            if let Err(e) = std::fs::set_permissions(output_path, perm) {
-                tracing::warn!("could not chmod output: {e}");
-            }
-        }
-    }
+    chmod_executable(output_path);
 
     tracing::info!(
         output = %output_path.display(),
         size = file_size,
         entry = format_args!("{:#x}", layout.entry),
         overwrite_in_place = can_overwrite,
+        partial = require_existing_size,
         "emitted ELF executable"
     );
-    Ok(())
+    Ok(true)
 }
 
 // ── .eh_frame_hdr (built from the relocated .eh_frame) ───────────────────────
-
-/// Write the shared-object TLS GOT static slots (`layout.tls_got_writes`): each
-/// `(got_va, value)` is the DTPOFF in a locally-defined General-Dynamic pair's
-/// slot1 (or the Local-Dynamic pair's slot1 = 0), known at link time. Maps the
-/// VA to a file offset via the `.got` section, since these slots live in the TLS
-/// GOT region appended to `.got`.
-fn write_tls_got(buf: &mut [u8], layout: &Layout) {
-    if layout.tls_got_writes.is_empty() {
-        return;
-    }
-    let Some(got) = layout
-        .output_sections
-        .iter()
-        .find(|s| s.source == SecSource::Got)
-    else {
-        return;
-    };
-    let (lo, hi) = (got.sh_addr, got.sh_addr + got.sh_size);
-    for &(va, value) in &layout.tls_got_writes {
-        if va < lo || va + 8 > hi {
-            tracing::warn!(
-                va = format_args!("{va:#x}"),
-                "TLS GOT static write outside .got — skipping"
-            );
-            continue;
-        }
-        let file_off = (got.sh_offset + (va - got.sh_addr)) as usize;
-        if file_off + 8 <= buf.len() {
-            buf[file_off..file_off + 8].copy_from_slice(&value.to_le_bytes());
-            tracing::trace!(
-                va = format_args!("{va:#x}"),
-                value,
-                "TLS GOT static write (DTPOFF)"
-            );
-        }
-    }
-}
-
-/// Build `.eh_frame_hdr` from the already-relocated `.eh_frame` bytes in `buf`.
-///
-/// The FDE `PC begin` fields are set by `R_X86_64_PC32` relocations applied
-/// during section emission, so we read them back from the output buffer (not the
-/// input objects). Produces the version-1 header + a PC-sorted binary-search
-/// table of `(initial_location, fde_address)` as 4-byte `datarel|sdata4` offsets.
-fn write_eh_frame_hdr(buf: &mut [u8], layout: &Layout) {
-    let Some(hdr) = layout
-        .output_sections
-        .iter()
-        .find(|s| s.source == SecSource::EhFrameHdr)
-    else {
-        return;
-    };
-    let Some(eh) = layout
-        .output_sections
-        .iter()
-        .find(|s| s.name == ".eh_frame")
-    else {
-        return;
-    };
-    let hdr_va = hdr.sh_addr;
-    let hdr_off = hdr.sh_offset as usize;
-    let hdr_cap = hdr.sh_size as usize;
-    let eh_va = eh.sh_addr;
-    let eh_off = eh.sh_offset as usize;
-    let eh_size = eh.sh_size as usize;
-    if eh_off + eh_size > buf.len() {
-        return;
-    }
-
-    // Parse FDEs from the relocated .eh_frame bytes.
-    let eh_bytes = &buf[eh_off..eh_off + eh_size];
-    let (cies, fdes_scanned, terms, leftover) = peony_object::scan_eh_frame(eh_bytes);
-    tracing::debug!(
-        eh_off,
-        eh_size,
-        cies,
-        fdes_scanned,
-        terms,
-        leftover,
-        hdr_cap,
-        hdr_capacity_entries = (hdr_cap.saturating_sub(12)) / 8,
-        "write_eh_frame_hdr: scanning merged .eh_frame"
-    );
-    let mut entries: Vec<(i64, i64)> = Vec::new(); // (func_pc, fde_va)
-    for (fde_off, pcbegin_off, rel) in peony_object::iter_fdes(eh_bytes) {
-        // PC begin is pcrel|sdata4: relative to its own field's virtual address.
-        let pcbegin_va = eh_va + pcbegin_off as u64;
-        let func_pc = (pcbegin_va as i64).wrapping_add(rel);
-        let fde_va = (eh_va + fde_off as u64) as i64;
-        entries.push((func_pc, fde_va));
-    }
-    entries.sort_by_key(|&(pc, _)| pc);
-
-    // If the FDE count exceeds the reserved section capacity the table would be
-    // truncated and the unwinder's binary search could land on a bogus entry.
-    let cap_entries = (hdr_cap.saturating_sub(12)) / 8;
-    if entries.len() > cap_entries {
-        tracing::warn!(
-            fde_count = entries.len(),
-            cap_entries,
-            "eh_frame_hdr: more FDEs than reserved capacity — table will be truncated!"
-        );
-    }
-
-    tracing::debug!(
-        eh_frame_va = format_args!("{eh_va:#x}"),
-        eh_frame_size = eh_size,
-        hdr_va = format_args!("{hdr_va:#x}"),
-        fde_count = entries.len(),
-        first_pc = format_args!("{:#x}", entries.first().map(|e| e.0).unwrap_or(0)),
-        last_pc = format_args!("{:#x}", entries.last().map(|e| e.0).unwrap_or(0)),
-        "building .eh_frame_hdr"
-    );
-
-    let mut out = Vec::with_capacity(12 + entries.len() * 8);
-    out.push(1u8); // version
-    out.push(0x1b); // eh_frame_ptr_enc = pcrel|sdata4
-    out.push(0x03); // fde_count_enc = udata4
-    out.push(0x3b); // table_enc = datarel|sdata4
-    let efp_field_va = hdr_va + 4;
-    out.extend_from_slice(&((eh_va as i64 - efp_field_va as i64) as i32).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (func_pc, fde_va) in &entries {
-        out.extend_from_slice(&((func_pc - hdr_va as i64) as i32).to_le_bytes());
-        out.extend_from_slice(&((fde_va - hdr_va as i64) as i32).to_le_bytes());
-    }
-    let n = out.len().min(hdr_cap);
-    if hdr_off + n <= buf.len() {
-        buf[hdr_off..hdr_off + n].copy_from_slice(&out[..n]);
-    }
-}
-
-// ── ELF header + program headers ─────────────────────────────────────────────
-
-fn write_headers(buf: &mut [u8], layout: &Layout) {
-    // Elf64_Ehdr (64 bytes at offset 0).
-    let e = &mut buf[0..64];
-    e[0..4].copy_from_slice(&elf::ELFMAG);
-    e[4] = elf::ELFCLASS64;
-    e[5] = elf::ELFDATA2LSB;
-    e[6] = elf::EV_CURRENT;
-    e[7] = elf::ELFOSABI_SYSV;
-    // e[8..16] ABI version + pad = 0 (already zeroed).
-    e[16..18].copy_from_slice(&layout.e_type.to_le_bytes());
-    e[18..20].copy_from_slice(&elf::EM_X86_64.to_le_bytes());
-    e[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
-    e[24..32].copy_from_slice(&layout.entry.to_le_bytes());
-    e[32..40].copy_from_slice(&layout.phoff.to_le_bytes());
-    e[40..48].copy_from_slice(&layout.shoff.to_le_bytes());
-    e[48..52].copy_from_slice(&0u32.to_le_bytes()); // e_flags
-    e[52..54].copy_from_slice(&(elf::EHDR_SIZE as u16).to_le_bytes());
-    e[54..56].copy_from_slice(&(elf::PHDR_SIZE as u16).to_le_bytes());
-    e[56..58].copy_from_slice(&(layout.phnum as u16).to_le_bytes());
-    e[58..60].copy_from_slice(&(elf::SHDR_SIZE as u16).to_le_bytes());
-    let e_shnum = if layout.shnum >= elf::SHN_LORESERVE as u64 {
-        0
-    } else {
-        layout.shnum as u16
-    };
-    let e_shstrndx = if layout.shstrndx >= elf::SHN_LORESERVE as u64 {
-        elf::SHN_XINDEX
-    } else {
-        layout.shstrndx as u16
-    };
-    e[60..62].copy_from_slice(&e_shnum.to_le_bytes());
-    e[62..64].copy_from_slice(&e_shstrndx.to_le_bytes());
-
-    // Program headers.
-    let phoff = layout.phoff as usize;
-    for (i, ph) in layout.segments.iter().enumerate() {
-        let o = phoff + i * elf::PHDR_SIZE as usize;
-        let p = &mut buf[o..o + 56];
-        p[0..4].copy_from_slice(&ph.p_type.to_le_bytes());
-        p[4..8].copy_from_slice(&ph.p_flags.to_le_bytes());
-        p[8..16].copy_from_slice(&ph.p_offset.to_le_bytes());
-        p[16..24].copy_from_slice(&ph.p_vaddr.to_le_bytes());
-        p[24..32].copy_from_slice(&ph.p_paddr.to_le_bytes());
-        p[32..40].copy_from_slice(&ph.p_filesz.to_le_bytes());
-        p[40..48].copy_from_slice(&ph.p_memsz.to_le_bytes());
-        p[48..56].copy_from_slice(&ph.p_align.to_le_bytes());
-    }
-}
-
-// ── Per-item processing helper (extracted to keep closures shallow) ───────────
-
-/// Process one work item: copy section bytes and apply its relocations.
-/// Called from worker threads; `buf_ptr` + `buf_len` describe the mmap'd output.
-fn process_item(
-    item: (usize, usize, u64, usize, usize),
-    arena: &InputArena,
-    objects: &[peony_object::InputObject],
-    buf_ptr: usize,
-    buf_len: usize,
-    ctx: &peony_reloc::ApplyCtx<'_>,
-    error_slot: &std::sync::Mutex<Option<peony_reloc::RelocError>>,
-) {
-    let (file_off, _, section_va, obj_id, sec_idx) = item;
-    let Some(obj) = objects.get(obj_id) else {
-        return;
-    };
-    let Some(&pos) = obj.section_map.get(&sec_idx) else {
-        return;
-    };
-    let Some(isec) = obj.sections.get(pos) else {
-        return;
-    };
-
-    let data_len = isec.data.len();
-    if data_len == 0 || file_off + data_len > buf_len {
-        return;
-    }
-
-    // SAFETY: each section has a unique, non-overlapping file range (QUAD Theorem 4.1).
-    let sec_buf: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut((buf_ptr + file_off) as *mut u8, data_len) };
-
-    // Zero-copy source: blit straight from the input mmap (via the arena) into
-    // the output buffer — no intermediate per-section Vec.
-    sec_buf.copy_from_slice(arena.bytes(isec.data));
-    peony_prof::count("sections_emitted", 1);
-    peony_prof::record_bytes("emit", data_len as u64);
-
-    if !isec.relocs.is_empty() {
-        for reloc in &isec.relocs {
-            if let Err(e) = peony_reloc::apply_reloc(ctx, obj, obj_id, reloc, section_va, sec_buf) {
-                *error_slot.lock().unwrap() = Some(e);
-                return;
-            }
-            peony_prof::count("relocs_applied", 1);
-        }
-    }
-}
-
-// ── Section data (parallel) ───────────────────────────────────────────────────
-
-/// Write all section data and apply relocations in parallel.
-///
-/// By QUAD Theorem 5.1, each output section writes to a disjoint file range,
-/// so we can split the mutable buffer into non-overlapping slices and hand each
-/// to a worker thread without any synchronization.
-fn write_section_data_parallel(
-    buf: &mut [u8],
-    arena: &InputArena,
-    objects: &[InputObject],
-    symbols: &SymbolTable,
-    layout: &Layout,
-    output_path: &Path,
-) -> Result<()> {
-    // Build a list of (file_offset, size, SecSource) tuples for each section.
-    // We need to split the buf into disjoint mutable slices; we do this by
-    // collecting (offset, len) pairs sorted by offset, then using split_at_mut.
-    //
-    // For correctness: synthetic sections (GOT, symtab, etc.) are written
-    // serially because they reference shared `layout` data. Input sections
-    // (the bulk of the data) are written in parallel.
-
-    // Phase 1: Write all synthetic sections serially (fast — small data,
-    // except build-id which hashes all input bytes; framed separately).
-    let synth = peony_prof::trace("emit:synthetic-sections");
-    for sec in &layout.output_sections {
-        match sec.source {
-            SecSource::Input => {} // handled in phase 2
-            SecSource::Bss => {}   // NOBITS
-            SecSource::Got => {
-                for (i, &sym_id) in layout.got_slots.iter().enumerate() {
-                    let va = symbols
-                        .name_by_id(sym_id)
-                        .and_then(|n| symbols.lookup(n))
-                        .map(|r| r.virtual_address)
-                        .unwrap_or(0);
-                    let off = (sec.sh_offset + (i as u64) * 8) as usize;
-                    if off + 8 <= buf.len() {
-                        buf[off..off + 8].copy_from_slice(&va.to_le_bytes());
-                    }
-                }
-            }
-            SecSource::SymTab => write_symtab(buf, symbols, layout, sec.sh_offset),
-            SecSource::SymTabShndx => write_bytes(buf, sec.sh_offset, &layout.symtab_shndx),
-            SecSource::StrTab => write_bytes(buf, sec.sh_offset, &layout.strtab),
-            SecSource::ShStrTab => write_bytes(buf, sec.sh_offset, &layout.shstrtab),
-            // Header only; the descriptor is hashed from the final image by
-            // finalize_build_id after all bytes are written.
-            SecSource::NoteBuildId => write_build_id(buf, sec.sh_offset),
-            SecSource::NoteGnuProperty => {
-                write_bytes(buf, sec.sh_offset, &layout.gnu_property_note)
-            }
-            SecSource::Interp => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.interp),
-            SecSource::Hash => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.hash),
-            SecSource::DynSym => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.dynsym),
-            SecSource::DynStr => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.dynstr),
-            SecSource::RelaDyn => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.rela_dyn),
-            SecSource::GnuVersion => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.gnu_version),
-            SecSource::GnuVersionR => {
-                write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.gnu_version_r)
-            }
-            // `.eh_frame_hdr` is filled by `write_eh_frame_hdr` after relocations.
-            SecSource::EhFrameHdr => {}
-            SecSource::GnuHash => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.gnu_hash),
-            SecSource::Dynamic => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.dynamic),
-            SecSource::Plt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.plt),
-            SecSource::GotPlt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.got_plt),
-            SecSource::RelaPlt => write_bytes(buf, sec.sh_offset, &layout.dyn_blobs.rela_plt),
-            SecSource::RelaEmit(idx) => {
-                if let Some(bytes) = layout.emit_relocs.get(idx) {
-                    write_bytes(buf, sec.sh_offset, bytes);
-                }
-            }
-        }
-    }
-    drop(synth);
-
-    // Phase 2: Parallel input section copy + relocation apply.
-    let buf_ptr = buf.as_mut_ptr() as usize;
-    let buf_len = buf.len();
-    // Integer-indexed symbol resolution for the per-relocation hot path: built
-    // once here (≈49k name hashes) to replace ≈216k per-reloc name hashes with
-    // array indexing. Borrows objects + symbols, which outlive this scope.
-    let sym_index = {
-        let _t = peony_prof::trace("emit:sym-index-build");
-        peony_reloc::SymIndex::build(objects, symbols)
-    };
-    let ctx = ApplyCtx {
-        symbols,
-        layout,
-        shared: layout.shared,
-        sym_index: Some(&sym_index),
-    };
-    let work_items = collect_input_work_items(layout);
-    peony_prof::record_items("emit", work_items.len() as u64);
-    let _t = peony_prof::trace("emit:section-copy-dispatch");
-    dispatch_parallel(
-        work_items,
-        arena,
-        objects,
-        buf_ptr,
-        buf_len,
-        ctx,
-        output_path,
-    )
-}
-
-/// Collect (file_offset, _, section_va, object_id, section_index) for all input sections.
-type WorkItem = (usize, usize, u64, usize, usize);
-
-fn collect_input_work_items(layout: &Layout) -> Vec<WorkItem> {
-    layout
-        .output_sections
-        .iter()
-        .filter(|sec| sec.source == SecSource::Input)
-        .flat_map(|sec| {
-            sec.contributions.iter().map(move |c| {
-                (
-                    (sec.sh_offset + c.offset) as usize,
-                    0usize,
-                    sec.sh_addr + c.offset,
-                    c.object_id,
-                    c.section_index,
-                )
-            })
-        })
-        .collect()
-}
-
-/// Dispatch work items across Chase-Lev workers with quiescence-based termination.
-///
-/// Uses the proper Chase-Lev drain protocol: an atomic idle counter prevents any
-/// thread from exiting while a sibling still has stealable work. A thread only
-/// exits when `idle_count == num_threads` (all threads simultaneously idle).
-fn dispatch_parallel(
-    work_items: Vec<WorkItem>,
-    arena: &InputArena,
-    objects: &[InputObject],
-    buf_ptr: usize,
-    buf_len: usize,
-    ctx: ApplyCtx<'_>,
-    output_path: &Path,
-) -> Result<()> {
-    if work_items.is_empty() {
-        return Ok(());
-    }
-
-    // Small links (the common `cc`/incremental case) finish faster serially:
-    // the work is a handful of section copies, and spinning up a worker scope
-    // costs far more in `futex`/`sched_yield`/mutex churn than the copies save.
-    // Profiling a hello-world link showed ~74% of syscall time in futex+yield
-    // from the parallel scaffolding alone. Stay serial below this threshold.
-    // Section-copy work items: only fan out across ws-deque workers when there
-    // are enough that the concurrent copy outweighs spawning the worker scope
-    // (which otherwise idle-spins on futex/sched_yield — 85% of a small link's
-    // syscall time). Tiny links copy a handful of sections faster serially.
-    const PARALLEL_THRESHOLD: usize = 2048;
-    if work_items.len() < PARALLEL_THRESHOLD {
-        peony_prof::event(
-            "emit-dispatch",
-            format!("serial: {} work items", work_items.len()),
-        );
-        let error_slot = std::sync::Mutex::new(None);
-        let ctx_ref = &ctx;
-        for item in work_items {
-            process_item(item, arena, objects, buf_ptr, buf_len, ctx_ref, &error_slot);
-            if let Some(e) = error_slot.lock().unwrap().take() {
-                tracing::error!(output = %output_path.display(), %e, "relocation error");
-                return Err(EmitError::Reloc(e));
-            }
-        }
-        return Ok(());
-    }
-
-    // Use the link's CONFIGURED worker count (rayon's global pool, which honours
-    // `--threads` and the small-link cap), not `available_parallelism()`. emit
-    // formerly always spawned up to all cores, so a link configured for fewer
-    // workers still spun 24 ws-deque threads here — measured as the bulk of the
-    // futex/sched_yield churn on ripgrep (1040 sched_yield at the 8-thread cap).
-    // Capping to the pool size keeps emit consistent with the rest of the link.
-    let num_threads = rayon::current_num_threads().max(1).min(work_items.len());
-    peony_prof::event(
-        "emit-dispatch",
-        format!(
-            "parallel: {} work items, {num_threads} workers",
-            work_items.len()
-        ),
-    );
-
-    let error_slot: std::sync::Mutex<Option<peony_reloc::RelocError>> = std::sync::Mutex::new(None);
-
-    const BATCH_SIZE: usize = 256;
-    let batch_count = work_items.len().div_ceil(BATCH_SIZE);
-    peony_prof::event(
-        "emit-dispatch",
-        format!(
-            "batched: {} work items, {batch_count} batches, {BATCH_SIZE}/batch",
-            work_items.len()
-        ),
-    );
-    let batches: Vec<Vec<WorkItem>> = work_items
-        .chunks(BATCH_SIZE)
-        .map(<[WorkItem]>::to_vec)
-        .collect();
-
-    ws_deque::scheduler::run(num_threads, batches, |batch, _spawner| {
-        // Errors are rare (a malformed reloc); record the first and let the rest
-        // drain. We do not early-abort the schedule — the surviving sections are
-        // still written to disjoint regions, and the error is returned below.
-        for item in batch {
-            process_item(item, arena, objects, buf_ptr, buf_len, &ctx, &error_slot);
-        }
-    });
-
-    if let Some(e) = error_slot.into_inner().ok().flatten() {
-        tracing::error!(output = %output_path.display(), %e, "relocation error");
-        return Err(EmitError::Reloc(e));
-    }
-    Ok(())
-}
-
-/// Write the `.note.gnu.build-id` note HEADER only, leaving the 16-byte
-/// descriptor zeroed. The descriptor is filled by [`finalize_build_id`] after
-/// the whole output image is written — it hashes the emitted bytes (≈4MB), not
-/// the much larger scattered input set (≈18.5MB incl. discarded/debug sections),
-/// which is what `ld`/lld/mold do and is ~4× less data hashed.
-fn write_build_id(buf: &mut [u8], off: u64) {
-    let off = off as usize;
-    if off + 32 > buf.len() {
-        return;
-    }
-    buf[off..off + 4].copy_from_slice(&4u32.to_le_bytes()); // namesz = len("GNU\0")
-    buf[off + 4..off + 8].copy_from_slice(&16u32.to_le_bytes()); // descsz = hash len
-    buf[off + 8..off + 12].copy_from_slice(&elf::NT_GNU_BUILD_ID.to_le_bytes());
-    buf[off + 12..off + 16].copy_from_slice(b"GNU\0");
-    // Descriptor zeroed; filled in by finalize_build_id once the image is final.
-    buf[off + 16..off + 32].copy_from_slice(&[0u8; 16]);
-}
-
-/// Fixed hash block (256 KiB). Block boundaries depend only on `buf.len()`, so
-/// the per-block hashes can be computed in parallel and folded in index order
-/// for a build-id that is identical regardless of `--threads`.
-const BUILD_ID_BLOCK: usize = 256 * 1024;
-
-/// Fill the `.note.gnu.build-id` descriptor with a content hash of the FINAL
-/// output image. Must run after every byte (section data, relocations, headers)
-/// is written and while the descriptor is still zero. Hashes the contiguous
-/// buffer in parallel fixed-size blocks, then folds the block digests in index
-/// order — so the result is deterministic across thread counts.
-fn finalize_build_id(buf: &mut [u8], layout: &Layout) {
-    let Some(off) = build_id_descriptor_offset(layout) else {
-        return;
-    };
-    if off + 16 > buf.len() {
-        return;
-    }
-    let digest = build_id_hash(buf);
-    buf[off..off + 16].copy_from_slice(&digest);
-}
-
-/// File offset of the build-id note's 16-byte descriptor, or `None` if the
-/// output has no build-id section.
-fn build_id_descriptor_offset(layout: &Layout) -> Option<usize> {
-    layout
-        .output_sections
-        .iter()
-        .find(|s| s.source == SecSource::NoteBuildId)
-        .map(|s| s.sh_offset as usize + 16)
-}
-
-/// A deterministic 128-bit hash over the contiguous output buffer, computed in
-/// parallel fixed-size blocks and folded in block order. The descriptor region
-/// is zero at hash time (filled afterwards), so the hash is stable.
-fn build_id_hash(buf: &[u8]) -> [u8; 16] {
-    use rayon::prelude::*;
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    // Per-block double-FNV; blocks are independent so this parallelizes. Each
-    // block's (h1,h2) is seeded with its index so identical blocks at different
-    // positions do not cancel.
-    let block_hash = |(idx, chunk): (usize, &[u8])| -> (u64, u64) {
-        let mut h1 = OFFSET ^ (idx as u64).wrapping_mul(PRIME);
-        let mut h2 = 0x9e37_79b9_7f4a_7c15u64 ^ (idx as u64);
-        for &b in chunk {
-            h1 = (h1 ^ b as u64).wrapping_mul(PRIME);
-            h2 = (h2.wrapping_add(b as u64)).wrapping_mul(PRIME) ^ (h2 >> 29);
-        }
-        (h1, h2)
-    };
-
-    // Small outputs: hash serially (avoids touching the pool for a handful of
-    // blocks). Large outputs: hash blocks in parallel. Either way the fold is in
-    // index order, so the digest is identical regardless of thread count.
-    let blocks: Vec<(u64, u64)> = if buf.len() >= 4 * BUILD_ID_BLOCK {
-        buf.par_chunks(BUILD_ID_BLOCK)
-            .enumerate()
-            .map(block_hash)
-            .collect()
-    } else {
-        buf.chunks(BUILD_ID_BLOCK)
-            .enumerate()
-            .map(block_hash)
-            .collect()
-    };
-
-    let mut h1 = OFFSET;
-    let mut h2 = 0x9e37_79b9_7f4a_7c15u64;
-    for (b1, b2) in blocks {
-        h1 = (h1 ^ b1).wrapping_mul(PRIME);
-        h2 = (h2.wrapping_add(b2)).wrapping_mul(PRIME) ^ (h2 >> 29);
-    }
-    let mut out = [0u8; 16];
-    out[0..8].copy_from_slice(&h1.to_le_bytes());
-    out[8..16].copy_from_slice(&h2.to_le_bytes());
-    out
-}
-
-fn write_symtab(buf: &mut [u8], symbols: &SymbolTable, layout: &Layout, base_off: u64) {
-    // Index 0 is the null symbol (already zeroed). Entries start at index 1.
-    for (i, ent) in layout.symtab.iter().enumerate() {
-        let off = (base_off + ((i + 1) as u64) * elf::SYM_SIZE) as usize;
-        if off + 24 > buf.len() {
-            break;
-        }
-        let (value, size) = match ent.local {
-            Some((v, sz)) => (v, sz), // local: precomputed at layout time
-            None => {
-                let res = symbols.lookup(&ent.name);
-                (
-                    res.map(|r| r.virtual_address).unwrap_or(0),
-                    res.map(|r| r.size).unwrap_or(0),
-                )
-            }
-        };
-        let s = &mut buf[off..off + 24];
-        s[0..4].copy_from_slice(&ent.name_off.to_le_bytes());
-        s[4] = ent.info;
-        s[5] = elf::STV_DEFAULT;
-        // `st_shndx` is a 16-bit field. Any value that fits — including the
-        // reserved pseudo-indices SHN_ABS (0xfff1), SHN_COMMON (0xfff2) — is
-        // written verbatim. SHN_XINDEX (with the true index in `.symtab_shndx`)
-        // is used ONLY for a genuine real-section index that does not fit in 16
-        // bits (≥ 0x10000 sections). Rewriting an SHN_ABS symbol to SHN_XINDEX
-        // forces a bogus extended-index table that BFD/gdb reject ("not in
-        // executable format") — the cause of the C++ exe load failure.
-        let shndx = if ent.shndx >= 0x1_0000 {
-            elf::SHN_XINDEX
-        } else {
-            ent.shndx as u16
-        };
-        s[6..8].copy_from_slice(&shndx.to_le_bytes());
-        s[8..16].copy_from_slice(&value.to_le_bytes());
-        s[16..24].copy_from_slice(&size.to_le_bytes());
-    }
-}
-
-fn write_bytes(buf: &mut [u8], off: u64, data: &[u8]) {
-    let off = off as usize;
-    let end = off + data.len();
-    if end <= buf.len() {
-        buf[off..end].copy_from_slice(data);
-    }
-}
-
-// ── Section header table ─────────────────────────────────────────────────────
-
-fn write_section_headers(buf: &mut [u8], layout: &Layout) {
-    let shoff = layout.shoff as usize;
-    // Index 0: the null section header. For oversized section tables, ELF stores
-    // the true section count in sh_size and the true shstrndx in sh_link.
-    if shoff + 64 <= buf.len() {
-        let null = &mut buf[shoff..shoff + 64];
-        if layout.shnum >= elf::SHN_LORESERVE as u64 {
-            null[32..40].copy_from_slice(&layout.shnum.to_le_bytes());
-        }
-        if layout.shstrndx >= elf::SHN_LORESERVE as u64 {
-            null[40..44].copy_from_slice(&(layout.shstrndx as u32).to_le_bytes());
-        }
-    }
-    for sec in &layout.output_sections {
-        let o = shoff + (sec.shndx as usize) * elf::SHDR_SIZE as usize;
-        if o + 64 > buf.len() {
-            break;
-        }
-        let h = &mut buf[o..o + 64];
-        h[0..4].copy_from_slice(&sec.sh_name.to_le_bytes());
-        h[4..8].copy_from_slice(&sec.sh_type.to_le_bytes());
-        h[8..16].copy_from_slice(&sec.sh_flags.to_le_bytes());
-        h[16..24].copy_from_slice(&sec.sh_addr.to_le_bytes());
-        h[24..32].copy_from_slice(&sec.sh_offset.to_le_bytes());
-        h[32..40].copy_from_slice(&sec.sh_size.to_le_bytes());
-        h[40..44].copy_from_slice(&sec.sh_link.to_le_bytes());
-        h[44..48].copy_from_slice(&sec.sh_info.to_le_bytes());
-        h[48..56].copy_from_slice(&sec.sh_addralign.to_le_bytes());
-        h[56..64].copy_from_slice(&sec.sh_entsize.to_le_bytes());
-    }
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────

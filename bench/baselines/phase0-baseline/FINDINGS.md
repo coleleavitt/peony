@@ -216,9 +216,10 @@ Zero-copy did **NOT** reduce peak RSS at ripgrep scale. Why: the section bytes
 were copied *out of* the mmap before, but the mmap source pages are faulted in
 during parse regardless, and a smaps snapshot shows the resident bulk is
 **anonymous** (~105MB) — the symbol table + 419 `InputObject`s' section/symbol/
-reloc `Vec`s + layout structures — which zero-copy does not touch. (`--threads 0`
-peaks ~216MB; the extra ~60MB is the rayon pool's transient emit buffers + 24
-thread stacks w/ huge pages.) The real zero-copy win is **speed** (−30% link,
+reloc `Vec`s + layout structures — which zero-copy does not touch. In this
+historical run, `--threads 0` meant the auto setting selected a 24-thread emit
+pool and peaked ~216MB; current `--threads 0` remains auto-tuned and may choose
+fewer threads on small links. The real zero-copy win is **speed** (−30% link,
 re-measured many times), not memory. mold's 8MB RSS comes from retaining far
 less metadata — a separate, larger effort. The honest RSS gap vs mold remains
 ~20× and is dominated by per-object metadata, not section bytes.

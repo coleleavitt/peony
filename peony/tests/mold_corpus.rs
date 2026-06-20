@@ -3,10 +3,13 @@
 //! Every one of mold's tests is represented here as a `#[test]`. Tests whose
 //! *concept* is within peony's static x86-64 domain are exercised by the
 //! `link_and_run` / `relocations` / `symbols` / `features` suites; the mold
-//! originals are `#[ignore]`d here with the subsystem they additionally need
-//! (mostly libc + dynamic linking). Run `cargo test -- --ignored --list` to
-//! see the full corpus. This file documents coverage honestly — ignored tests
-//! are NOT claimed to pass.
+//! originals are `#[ignore]`d here with the broad reason the original shell
+//! script is not runnable verbatim (often libc, dynamic linking, target support,
+//! or a linker option Peony intentionally rejects). Those labels are a backlog
+//! taxonomy, not a claim that every concept in that subsystem is unsupported:
+//! supported dynamic/TLS/shared-library behavior is ported into focused tests.
+//! Run `cargo test -- --ignored --list` to see the full corpus. This file
+//! documents coverage honestly — ignored tests are NOT claimed to pass.
 
 #[test]
 #[ignore = "needs dynamic linking"]

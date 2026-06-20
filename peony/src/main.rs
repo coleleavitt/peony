@@ -6,7 +6,7 @@
 //! peony [OPTIONS] <inputs>...
 //!   -o <file>          Output file (default: a.out)
 //!   --incremental      Enable the incremental cache
-//!   --threads <N>      rayon worker threads (0 = all cores)
+//!   --threads <N>      rayon worker threads (0 = auto)
 //!   --base-address <A> First-segment base VA (default 0x400000)
 //!   -e, --entry <SYM>  Entry symbol (default _start)
 //! ```
@@ -33,20 +33,15 @@ use std::path::{Path, PathBuf};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
-use peony_emit::{EmitConfig, emit_full};
-use peony_layout::{
-    LayoutConfig,
-    ScriptLayout,
-    ScriptOutputSection,
-    check_undefined,
-    finalize_symbols,
-};
+use peony_emit::{EmitConfig, emit_full, emit_partial};
+use peony_layout::{LayoutConfig, ScriptLayout, check_undefined, finalize_symbols};
 use peony_object::{
     Binding,
     InputObject,
     Name,
     iter_archive_members,
     iter_archive_members_matching,
+    parse_object,
     parse_owned_member,
 };
 use peony_reloc::scan_relocations;
@@ -55,245 +50,42 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing_subscriber::EnvFilter;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
+mod args;
+mod cache_report;
+mod handoff;
+mod inputs;
+mod provided_symbols;
 
-/// Linker options. Parsed by a permissive, `ld`-compatible hand-rolled parser
-/// (see [`parse_args`]) so peony can be invoked directly by `cc`/`gcc` as the
-/// linker — it accepts the standard `ld` flags and ignores the ones it doesn't
-/// act on, rather than erroring.
-#[derive(Debug)]
-struct Args {
-    raw_args: Vec<String>,
-    inputs: Vec<PathBuf>,
-    library_paths: Vec<PathBuf>,
-    libraries: Vec<String>,
-    output: PathBuf,
-    incremental: bool,
-    threads: usize,
-    base_address: String,
-    base_address_explicit: bool,
-    entry: String,
-    entry_explicit: bool,
-    gc_sections: bool,
-    icf: bool,
-    stats: bool,
-    trace: bool,
-    trace_stack: bool,
-    help: bool,
-    defsym: Vec<String>,
-    linker_scripts: Vec<PathBuf>,
-    plugin: Option<PathBuf>,
-    build_id: bool,
-    strip_all: bool,
-    strip_debug: bool,
-    emit_relocs: bool,
-    pie: bool,
-    /// Produce a shared object (`-shared`): ET_DYN with exported `.dynsym`, no
-    /// crt startup objects, no `PT_INTERP`, no mandatory entry point.
-    shared: bool,
-    /// `DT_SONAME` value (`-soname`/`-h`). Defaults to the output file name when
-    /// producing a shared object.
-    soname: Option<String>,
-    /// `--version-script` path. rustc emits one for a cdylib listing exactly the
-    /// symbols to export (`global:`) and hiding the rest (`local: *`).
-    version_script: Option<PathBuf>,
-}
+use args::{ResolvedInput, cache_key_args, parse_args, print_help};
+use cache_report::{CacheOutcome, CacheReportSink, FullEmitReason};
+use handoff::{maybe_handoff_lto_plugin, maybe_handoff_relocatable, reject_unsupported_flags};
+use inputs::{
+    expand_inputs,
+    inject_crt_objects,
+    library_search_paths,
+    parse_linker_script_controls,
+    resolve_inputs,
+    resolved_input_paths,
+    strip_block_comments,
+};
+use provided_symbols::{predefine_linker_symbols, set_linker_addresses};
 
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            raw_args: Vec::new(),
-            inputs: Vec::new(),
-            library_paths: Vec::new(),
-            libraries: Vec::new(),
-            output: PathBuf::from("a.out"),
-            incremental: false,
-            threads: 0,
-            base_address: "0x400000".to_string(),
-            base_address_explicit: false,
-            entry: "_start".to_string(),
-            entry_explicit: false,
-            gc_sections: false,
-            icf: false,
-            stats: false,
-            trace: false,
-            trace_stack: false,
-            help: false,
-            defsym: Vec::new(),
-            linker_scripts: Vec::new(),
-            plugin: None,
-            build_id: false,
-            strip_all: false,
-            strip_debug: false,
-            emit_relocs: false,
-            pie: false,
-            shared: false,
-            soname: None,
-            version_script: None,
-        }
+// ── Compatibility handoffs ──────────────────────────────────────────────────
+
+fn check_required_defined(symbols: &SymbolTable, required: &[String]) -> Result<()> {
+    let missing: Vec<&str> = required
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            symbols
+                .lookup(name.as_bytes())
+                .is_none_or(|r| !r.is_defined())
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
     }
-}
-
-/// Parse a (permissive, `ld`-compatible) command line. Unknown flags are ignored;
-/// flags that take a separate value argument consume it so it isn't mistaken for
-/// an input file.
-fn parse_args() -> Result<Args> {
-    // ld flags whose value is a *separate* following argument that we ignore.
-    const IGNORE_WITH_VALUE: &[&str] = &[
-        "-z",
-        "-m",
-        "-plugin",
-        "-plugin-opt",
-        "-rpath",
-        "-rpath-link",
-        "-y",
-        "-Y",
-        "-R",
-        "-a",
-        "-A",
-        "--hash-style",
-        "--sysroot",
-        "-dynamic-linker",
-        "--dynamic-linker",
-        "--exclude-libs",
-    ];
-    fn take(argv: &[String], i: &mut usize, flag: &str) -> Result<String> {
-        *i += 1;
-        argv.get(*i)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing value for `{flag}`"))
-    }
-    let mut a = Args::default();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    a.raw_args = argv.clone();
-    let mut i = 0;
-    while i < argv.len() {
-        let arg = argv[i].clone();
-        let arg = arg.as_str();
-        match arg {
-            "-o" | "--output" => a.output = PathBuf::from(take(&argv, &mut i, arg)?),
-            "-e" | "--entry" => {
-                a.entry = take(&argv, &mut i, arg)?;
-                a.entry_explicit = true;
-            }
-            "-L" | "--library-path" => a
-                .library_paths
-                .push(PathBuf::from(take(&argv, &mut i, arg)?)),
-            "-T" | "--script" => a
-                .linker_scripts
-                .push(PathBuf::from(take(&argv, &mut i, arg)?)),
-            "-l" | "--library" => a.libraries.push(take(&argv, &mut i, arg)?),
-            "--defsym" => a.defsym.push(take(&argv, &mut i, arg)?),
-            "-plugin" | "--plugin" => a.plugin = Some(PathBuf::from(take(&argv, &mut i, arg)?)),
-            "--threads" => a.threads = take(&argv, &mut i, arg)?.parse().unwrap_or(0),
-            "--base-address" => {
-                a.base_address = take(&argv, &mut i, arg)?;
-                a.base_address_explicit = true;
-            }
-            "--gc-sections" => a.gc_sections = true,
-            "--no-gc-sections" => a.gc_sections = false,
-            "--stats" => a.stats = true,
-            "--trace" => a.trace = true,
-            "--trace-stack" => {
-                a.trace = true;
-                a.trace_stack = true;
-            }
-            "--help" => a.help = true,
-            // Identical Code Folding. `=all`/`=safe` accepted; `=none` disables.
-            "--icf=all" | "--icf=safe" | "--icf" => a.icf = true,
-            "--icf=none" | "--no-icf" => a.icf = false,
-            "--build-id" => a.build_id = true,
-            "--incremental" => a.incremental = true,
-            "-s" | "--strip-all" => {
-                a.strip_all = true;
-                a.strip_debug = true;
-            }
-            "-S" | "--strip-debug" => a.strip_debug = true,
-            "--emit-relocs" | "-q" => a.emit_relocs = true,
-            "-pie" | "--pie" => a.pie = true,
-            "-no-pie" | "--no-pie" => a.pie = false,
-            "-shared" | "--shared" | "-Bshareable" => a.shared = true,
-            "-soname" | "-h" | "--soname" => a.soname = Some(take(&argv, &mut i, arg)?),
-            "--version-script" => a.version_script = Some(PathBuf::from(take(&argv, &mut i, arg)?)),
-            _ if IGNORE_WITH_VALUE.contains(&arg) => {
-                // A recognised-but-ignored flag that carries a value (e.g.
-                // `--hash-style gnu`): skip its value argument. A missing value
-                // at end-of-argv is harmless here — there is simply nothing to
-                // skip — so we advance the index directly rather than erroring.
-                i += 1;
-            }
-            _ if arg.starts_with("--entry=") => {
-                a.entry = arg[8..].to_string();
-                a.entry_explicit = true;
-            }
-            _ if arg.starts_with("--defsym=") => a.defsym.push(arg[9..].to_string()),
-            _ if arg.starts_with("--plugin=") => {
-                a.plugin = Some(PathBuf::from(&arg["--plugin=".len()..]))
-            }
-            _ if arg.starts_with("--threads=") => a.threads = arg[10..].parse().unwrap_or(0),
-            _ if arg.starts_with("--base-address=") => {
-                a.base_address = arg[15..].to_string();
-                a.base_address_explicit = true;
-            }
-            _ if arg.starts_with("--script=") => a
-                .linker_scripts
-                .push(PathBuf::from(&arg["--script=".len()..])),
-            _ if arg.starts_with("--build-id") => a.build_id = true, // --build-id=<style>
-            _ if arg.starts_with("--version-script=") => {
-                a.version_script = Some(PathBuf::from(&arg["--version-script=".len()..]))
-            }
-            _ if arg.starts_with("-soname=") => a.soname = Some(arg[8..].to_string()),
-            _ if arg.starts_with("-h") && arg.len() > 2 => a.soname = Some(arg[2..].to_string()),
-            _ if arg.starts_with("-o") => a.output = PathBuf::from(&arg[2..]),
-            _ if arg.starts_with("-L") => a.library_paths.push(PathBuf::from(&arg[2..])),
-            _ if arg.starts_with("-T") && arg.len() > 2 => {
-                a.linker_scripts.push(PathBuf::from(&arg[2..]))
-            }
-            _ if arg.starts_with("-plugin=") => a.plugin = Some(PathBuf::from(&arg[8..])),
-            _ if arg.starts_with("-l") => a.libraries.push(arg[2..].to_string()),
-            _ if arg.starts_with("-e") => {
-                a.entry = arg[2..].to_string();
-                a.entry_explicit = true;
-            }
-            _ if arg.starts_with('-') => {} // unknown ld flag → ignore
-            _ => a.inputs.push(PathBuf::from(arg)), // positional input file
-        }
-        i += 1;
-    }
-    Ok(a)
-}
-
-fn print_help() {
-    println!(
-        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table\n  --trace             Print phase timing and call-flow trace\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Enable incremental cache\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  -shared             Produce a shared object\n  --help              Print this help"
-    );
-}
-
-/// `cc`/`g++`/`rustc` always pass `-plugin .../liblto_plugin.so` even for a
-/// plain (non-LTO) link, so handing the whole link off to `ld.bfd` whenever a
-/// plugin is present meant peony was silently never doing the link. Instead we
-/// strip the plugin args (already kept out of `inputs` by the parser) and link
-/// the objects ourselves — they are real ELF `.o` files, not LTO IR. Any actual
-/// LTO IR object simply fails `parse_object` and is skipped as non-ELF.
-///
-/// Kept as a no-op returning `Ok(false)` so the call site and `args.plugin`
-/// (used for logging/LTO detection) are preserved.
-fn maybe_handoff_lto_plugin(args: &Args) -> Result<bool> {
-    if let Some(plugin) = &args.plugin {
-        tracing::info!(
-            plugin = %plugin.display(),
-            "ignoring LTO plugin; linking objects directly (no bfd handoff)"
-        );
-    }
-    Ok(false)
-}
-
-#[allow(dead_code)] // retained for diagnostics; no longer used for LTO handoff
-fn system_gnu_linker() -> Option<PathBuf> {
-    ["/usr/bin/ld.bfd", "/usr/bin/ld"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    anyhow::bail!("required symbol(s) not defined: {}", missing.join(", "))
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -313,6 +105,7 @@ fn main() -> Result<()> {
         print_help();
         return Ok(());
     }
+    let cache_report = CacheReportSink::new(args.cache_report.clone(), args.stats);
     // `--stats`: turn on the in-linker phase profiler so the breakdown table is
     // printed at the end. `--trace` additionally records the call-flow tree
     // (caller→callee by file:line) for following a bug through the pipeline.
@@ -325,6 +118,10 @@ fn main() -> Result<()> {
         peony_prof::enable();
     }
     peony_prof::record_rss("start");
+    reject_unsupported_flags(&args)?;
+    if maybe_handoff_relocatable(&args)? {
+        return Ok(());
+    }
     if maybe_handoff_lto_plugin(&args)? {
         return Ok(());
     }
@@ -370,6 +167,7 @@ fn main() -> Result<()> {
     } else {
         inject_crt_objects(inputs, &args)
     };
+    let input_paths = resolved_input_paths(&inputs);
 
     // Incremental fast-path: if every input and the previous output are
     // unchanged since the last link, the existing output is already correct.
@@ -377,18 +175,21 @@ fn main() -> Result<()> {
     // handful of stat()s, not a full link (the whole point of beating mold on
     // the edit–rebuild loop). The thread pool is only initialised once we know a
     // real link is needed.
-    // Hash of the full argv: any change to output-affecting flags (-pie,
-    // -shared, -soname, …) must invalidate the cached output. Hashing the whole
-    // argv is conservative — a benign flag difference just forces a full relink.
-    let args_hash = peony_cache::hash_args(&args.raw_args);
+    // Hash only output-affecting arguments: changes to diagnostics such as
+    // `--stats` or `--cache-report` must not make an otherwise reusable output
+    // look dirty, while real linker-mode changes still invalidate the cache.
+    let cache_args = cache_key_args(&args.raw_args);
+    let args_hash = peony_cache::hash_args(&cache_args);
     if args.incremental
-        && peony_cache::try_reuse(&args.output, &inputs, args_hash).context("incremental cache")?
+        && peony_cache::try_reuse(&args.output, &input_paths, args_hash)
+            .context("incremental cache")?
     {
         tracing::info!(output = %args.output.display(), "incremental: inputs unchanged, reused cached output");
+        cache_report.record(&args.output, CacheOutcome::ReusedUnchanged)?;
         return Ok(());
     }
 
-    init_thread_pool(args.threads, inputs.len())?;
+    init_thread_pool(args.threads, input_paths.len())?;
 
     let Resolved {
         arena,
@@ -398,7 +199,7 @@ fn main() -> Result<()> {
         needed,
     } = {
         let _p = peony_prof::phase("parse+resolve");
-        load_and_resolve(&inputs)?
+        load_and_resolve(&inputs, &args.undefined)?
     };
     peony_prof::record_items("parse+resolve", objects.len() as u64);
     peony_prof::count("objects_parsed", objects.len() as u64);
@@ -497,7 +298,8 @@ fn main() -> Result<()> {
         &symbols,
         &args.entry,
         &comdat_excluded,
-        args.shared, // shared-object exports are GC roots
+        args.shared || args.export_dynamic || !args.export_dynamic_patterns.is_empty(),
+        Some(&script_controls.layout),
     );
     match &live {
         LiveFilter::Only(l) => {
@@ -566,12 +368,22 @@ fn main() -> Result<()> {
         Some(p) => Some(parse_version_script(p)?),
         None => None,
     };
-    let exports: Vec<peony_layout::ExportSym> = if args.shared {
+    let export_requested =
+        args.shared || args.export_dynamic || !args.export_dynamic_patterns.is_empty();
+    let exports: Vec<peony_layout::ExportSym> = if export_requested {
         let _t = peony_prof::trace("reloc-postproc:exports");
         let mut e: Vec<peony_layout::ExportSym> = symbols
             .iter()
             .filter(|(_, r)| r.is_export())
-            .filter(|(name, _)| version_script.as_ref().is_none_or(|vs| vs.exports(name)))
+            .filter(|(_, r)| !excluded_by_exclude_libs(&args.exclude_libs, r, &symbols))
+            .filter(|(name, _)| {
+                if args.shared {
+                    version_script.as_ref().is_none_or(|vs| vs.exports(name))
+                } else {
+                    args.export_dynamic
+                        || export_pattern_matches(&args.export_dynamic_patterns, name)
+                }
+            })
             .map(|(name, r)| {
                 let bind = match r.binding {
                     peony_object::Binding::Weak => peony_object::elf::STB_WEAK,
@@ -609,12 +421,31 @@ fn main() -> Result<()> {
     // symbol (gcc's `.data.rel.local.DW.ref.*` EH slots). Sized here, collected
     // post-layout. Meaningful for any ET_DYN (PIE or shared).
     let n_symbolic_data = dynamic_counts.symbolic_data;
-    // Dynamic sections are needed for any import, any PIE, or a shared object.
-    let dynamic = (!imports.is_empty() || et_dyn).then(|| peony_layout::DynamicInfo {
+    let rpath = (!args.rpaths.is_empty()).then(|| args.rpaths.join(":"));
+    let interp = args.dynamic_linker.as_ref().map(|s| {
+        let mut bytes = s.as_bytes().to_vec();
+        if !bytes.ends_with(&[0]) {
+            bytes.push(0);
+        }
+        bytes
+    });
+    // Dynamic sections are needed for any import/needed DSO, any PIE/shared
+    // object, or executable dynsym exports.
+    let dynamic_needed = !imports.is_empty()
+        || !needed.is_empty()
+        || et_dyn
+        || export_requested
+        || rpath.is_some()
+        || interp.is_some();
+    let dynamic = dynamic_needed.then(|| peony_layout::DynamicInfo {
         imports,
         import_versions,
         import_sonames,
         needed: needed.clone(),
+        interp,
+        rpath,
+        enable_new_dtags: args.enable_new_dtags,
+        hash_style: args.hash_style,
         pie: args.pie,
         n_relative,
         n_irelative,
@@ -703,9 +534,10 @@ fn main() -> Result<()> {
     // A shared object may legitimately reference symbols it does not define;
     // they are resolved at load time against the process image. Only enforce
     // full resolution for executables.
-    if !args.shared {
+    if !args.shared || args.no_undefined {
         check_undefined(&symbols).context("unresolved symbols")?;
     }
+    check_required_defined(&symbols, &args.require_defined)?;
 
     // Assemble `.rela.dyn` now that symbol VAs are final: the R_X86_64_RELATIVE
     // entries (ET_DYN only) come first, then the GLOB_DATs. For a non-PIE dynamic
@@ -763,21 +595,83 @@ fn main() -> Result<()> {
     peony_prof::record_rss("after-finalize");
 
     let _emit_span = peony_prof::phase("emit");
-    emit_full(
-        &args.output,
-        &arena,
-        &objects,
-        &symbols,
-        &layout,
-        &EmitConfig::default(),
-    )
-    .context("binary emission failed")?;
+    let emit_config = EmitConfig::default();
+    let incremental_plan = if args.incremental {
+        incremental_emit_plan(
+            &args.output,
+            &input_paths,
+            args_hash,
+            &objects,
+            &symbols,
+            &layout,
+        )
+        .context("incremental patch planning")?
+    } else {
+        IncrementalEmitPlan::Disabled
+    };
+    let mut emitted = false;
+    if let IncrementalEmitPlan::Patch(plan) = &incremental_plan {
+        tracing::info!(
+            red = plan.red_count(),
+            green = plan.green_count(),
+            "incremental red/green patch plan accepted"
+        );
+        emitted = emit_partial(
+            &args.output,
+            &arena,
+            &objects,
+            &symbols,
+            &layout,
+            &emit_config,
+            plan.red_sections(),
+        )
+        .context("incremental patch emission failed")?;
+        if emitted {
+            tracing::info!("incremental red/green patch emitted");
+            cache_report.record(&args.output, CacheOutcome::PartialRelink { plan })?;
+        }
+    }
+    if !emitted {
+        let full_emit_reason = match &incremental_plan {
+            IncrementalEmitPlan::Disabled => FullEmitReason::IncrementalDisabled,
+            IncrementalEmitPlan::CacheUnavailable => FullEmitReason::CacheStateUnavailable,
+            IncrementalEmitPlan::Fallback(reason) => FullEmitReason::PlannerFallback(reason),
+            IncrementalEmitPlan::Patch(_) => FullEmitReason::PartialEmitDeclined,
+        };
+        if args.incremental {
+            tracing::info!(
+                reason = full_emit_reason.code(),
+                "incremental red/green patch unavailable; using full emit"
+            );
+        }
+        emit_full(
+            &args.output,
+            &arena,
+            &objects,
+            &symbols,
+            &layout,
+            &emit_config,
+        )
+        .context("binary emission failed")?;
+        cache_report.record(
+            &args.output,
+            CacheOutcome::FullEmit {
+                reason: full_emit_reason,
+            },
+        )?;
+    }
 
     if args.incremental {
         let sections = section_records(&args.output, &layout).unwrap_or_default();
-        let args_hash = peony_cache::hash_args(&args.raw_args);
-        peony_cache::record_link_with_sections(&args.output, &inputs, args_hash, &sections, &[])
-            .context("incremental cache record")?;
+        let cached_symbols = symbol_records(&symbols);
+        peony_cache::record_link_with_sections(
+            &args.output,
+            &input_paths,
+            args_hash,
+            &sections,
+            &cached_symbols,
+        )
+        .context("incremental cache record")?;
     }
 
     drop(_emit_span);
@@ -824,6 +718,156 @@ fn section_records(
     Some(records)
 }
 
+enum IncrementalEmitPlan {
+    Disabled,
+    CacheUnavailable,
+    Fallback(peony_cache::PartialRelinkFallback),
+    Patch(peony_cache::PartialRelinkPlan),
+}
+
+fn incremental_emit_plan(
+    output: &Path,
+    input_paths: &[PathBuf],
+    args_hash: u64,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &peony_layout::Layout,
+) -> Result<IncrementalEmitPlan> {
+    let Some(cached) = peony_cache::load_changed_state(output, input_paths, args_hash)? else {
+        return Ok(IncrementalEmitPlan::CacheUnavailable);
+    };
+    let patch_sections = patch_section_records(layout, objects, &cached.changed_inputs);
+    let moved_symbols = moved_symbol_ids(&cached.symbols, symbols);
+    let (rev_index, reloc_sections) = relocation_reverse_index(objects, symbols, layout);
+    let reloc_section_refs: Vec<&str> = reloc_sections.iter().map(String::as_str).collect();
+    Ok(
+        match peony_cache::plan_partial_relink(
+            &cached,
+            &patch_sections,
+            &moved_symbols,
+            &rev_index,
+            &reloc_section_refs,
+        ) {
+            Ok(plan) => IncrementalEmitPlan::Patch(plan),
+            Err(reason) => IncrementalEmitPlan::Fallback(reason),
+        },
+    )
+}
+
+fn patch_section_records(
+    layout: &peony_layout::Layout,
+    objects: &[InputObject],
+    changed_inputs: &[String],
+) -> Vec<peony_cache::PatchSectionRecord> {
+    let changed_inputs: HashSet<&str> = changed_inputs.iter().map(String::as_str).collect();
+    let mut records = Vec::new();
+    for sec in &layout.output_sections {
+        if sec.sh_type == peony_object::elf::SHT_NOBITS
+            || sec.sh_flags & peony_object::elf::SHF_ALLOC == 0
+        {
+            continue;
+        }
+        let input_changed = match sec.source {
+            peony_layout::SecSource::Input => sec.contributions.iter().any(|c| {
+                objects
+                    .get(c.object_id)
+                    .is_some_and(|obj| object_from_changed_input(&obj.path, &changed_inputs))
+            }),
+            _ => true,
+        };
+        records.push(peony_cache::PatchSectionRecord {
+            name: sec.name.clone(),
+            file_offset: sec.sh_offset,
+            size: sec.sh_size,
+            virtual_address: sec.sh_addr,
+            input_changed,
+        });
+    }
+    records
+}
+
+fn object_from_changed_input(path: &str, changed_inputs: &HashSet<&str>) -> bool {
+    changed_inputs.iter().any(|input| {
+        path == *input
+            || path
+                .strip_prefix(input)
+                .is_some_and(|rest| rest.starts_with('('))
+    })
+}
+
+fn moved_symbol_ids(cached: &[peony_cache::CachedSymbolEntry], symbols: &SymbolTable) -> Vec<u32> {
+    cached
+        .iter()
+        .filter_map(|entry| {
+            let current = symbols.lookup(&entry.name)?;
+            (current.virtual_address != entry.virtual_address
+                || current.got_address != entry.got_address)
+                .then_some(current.id.0)
+        })
+        .collect()
+}
+
+fn relocation_reverse_index(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &peony_layout::Layout,
+) -> (peony_cache::RelocReverseIndex, Vec<String>) {
+    let reloc_count: usize = layout
+        .output_sections
+        .iter()
+        .filter(|sec| sec.source == peony_layout::SecSource::Input)
+        .flat_map(|sec| &sec.contributions)
+        .filter_map(|c| {
+            objects
+                .get(c.object_id)
+                .and_then(|obj| obj.sections.get(c.section_index))
+        })
+        .map(|sec| sec.relocs.len())
+        .sum();
+    let index = peony_cache::RelocReverseIndex::new(symbols.len(), reloc_count);
+    let mut reloc_sections = Vec::with_capacity(reloc_count);
+    for sec in &layout.output_sections {
+        if sec.source != peony_layout::SecSource::Input {
+            continue;
+        }
+        for c in &sec.contributions {
+            let Some(obj) = objects.get(c.object_id) else {
+                continue;
+            };
+            let Some(input_sec) = obj.sections.get(c.section_index) else {
+                continue;
+            };
+            for reloc in &input_sec.relocs {
+                let reloc_id = reloc_sections.len() as u32;
+                reloc_sections.push(sec.name.clone());
+                if let Some(sym) = obj
+                    .symbols
+                    .get(*obj.symbol_map.get(&reloc.symbol.0).unwrap_or(&usize::MAX))
+                {
+                    if sym.binding != Binding::Local {
+                        if let Some(res) = symbols.lookup(&sym.name) {
+                            index.insert(res.id.0, reloc_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (index, reloc_sections)
+}
+
+fn symbol_records(symbols: &SymbolTable) -> Vec<peony_cache::CachedSymbolEntry> {
+    symbols
+        .iter()
+        .filter(|(_, res)| res.id.0 != u32::MAX)
+        .map(|(name, res)| peony_cache::CachedSymbolEntry {
+            name: name.to_vec(),
+            virtual_address: res.virtual_address,
+            got_address: res.got_address,
+        })
+        .collect()
+}
+
 // ── Loading + resolution ───────────────────────────────────────────────────────
 
 /// Parse all bare objects (in parallel) and pull in archive members lazily,
@@ -831,7 +875,7 @@ fn section_records(
 ///
 /// Object indices in the returned `Vec` match the [`peony_symbols::ObjectId`]s
 /// assigned during resolution (lock-step `add_object` + `push`).
-fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
+fn load_and_resolve(inputs: &[ResolvedInput], forced_undefined: &[String]) -> Result<Resolved> {
     let _t = peony_prof::trace("load_and_resolve");
     let mut r = Resolver::default();
 
@@ -847,23 +891,25 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     // need member iteration / whole-file reads). cc/rustc repeat archives like
     // `-lgcc` 4×, so the map is keyed by distinct path.
     let mut mmap_cache: FxHashMap<&Path, Option<MappedInput>> = FxHashMap::default();
-    for p in inputs {
-        mmap_cache
-            .entry(p.as_path())
-            .or_insert_with(|| MappedInput::open(p));
+    for input in inputs {
+        let p = input.path.as_path();
+        mmap_cache.entry(p).or_insert_with(|| MappedInput::open(p));
     }
     let kinds: Vec<Kind> = {
         let _t = peony_prof::trace("classify-inputs");
         let kinds: Vec<Kind> = inputs
             .iter()
-            .map(
-                |p| match mmap_cache.get(p.as_path()).and_then(|m| m.as_ref()) {
+            .map(|input| {
+                match mmap_cache
+                    .get(input.path.as_path())
+                    .and_then(|m| m.as_ref())
+                {
                     // Classify from the already-mapped bytes — zero extra syscalls.
                     Some(m) => peony_object::classify_bytes(m.bytes()),
                     // Unmappable (e.g. empty file): fall back to a header read.
-                    None => peony_object::classify_file(p),
-                },
-            )
+                    None => peony_object::classify_file(&input.path),
+                }
+            })
             .collect();
         peony_prof::event(
             "classified",
@@ -876,8 +922,8 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
     let bare: Vec<&PathBuf> = inputs
         .iter()
         .zip(&kinds)
-        .filter(|(_, k)| **k == Kind::Bare)
-        .map(|(p, _)| p)
+        .filter(|(input, k)| **k == Kind::Bare && !input.start_lib_member)
+        .map(|(input, _)| &input.path)
         .collect();
     tracing::info!(objects = bare.len(), "parsing input objects");
     // Small links (the common `cc`/incremental case) parse faster serially:
@@ -973,12 +1019,38 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
         }
     }
 
+    for name in forced_undefined {
+        r.symbols.force_undefined(name.as_bytes());
+    }
+
+    // ── Whole archives: include every object member unconditionally ──────────
+    let whole_archives: Vec<&PathBuf> = inputs
+        .iter()
+        .zip(&kinds)
+        .filter(|(input, k)| **k == Kind::Archive && input.whole_archive)
+        .map(|(input, _)| &input.path)
+        .collect();
+    if !whole_archives.is_empty() {
+        include_whole_archive_members(&whole_archives, &mut r)?;
+    }
+
+    // ── --start-lib: object files with archive-like lazy semantics ───────────
+    let start_lib_objects: Vec<&PathBuf> = inputs
+        .iter()
+        .zip(&kinds)
+        .filter(|(input, k)| **k == Kind::Bare && input.start_lib_member)
+        .map(|(input, _)| &input.path)
+        .collect();
+    if !start_lib_objects.is_empty() {
+        include_start_lib_members(&start_lib_objects, &mut r)?;
+    }
+
     // ── Archives: lazily include members that satisfy undefined references ────
     let archives: Vec<&PathBuf> = inputs
         .iter()
         .zip(&kinds)
-        .filter(|(_, k)| **k == Kind::Archive)
-        .map(|(p, _)| p)
+        .filter(|(input, k)| **k == Kind::Archive && !input.whole_archive)
+        .map(|(input, _)| &input.path)
         .collect();
     if !archives.is_empty() {
         include_archive_members(&archives, &mut r)?;
@@ -986,18 +1058,17 @@ fn load_and_resolve(inputs: &[PathBuf]) -> Result<Resolved> {
 
     // ── Shared objects: their exports satisfy remaining undefined refs ────────
     let mut needed = Vec::new();
-    for so in inputs
+    for (input, _) in inputs
         .iter()
         .zip(&kinds)
         .filter(|(_, k)| **k == Kind::Shared)
-        .map(|(p, _)| p)
     {
-        let lib = peony_object::parse_shared_object(so)
-            .with_context(|| format!("reading shared object `{}`", so.display()))?;
-        if r.symbols
-            .register_shared_export_symbols(&lib.export_symbols, &lib.soname)
-            > 0
-        {
+        let lib = peony_object::parse_shared_object(&input.path)
+            .with_context(|| format!("reading shared object `{}`", input.path.display()))?;
+        let satisfied = r
+            .symbols
+            .register_shared_export_symbols(&lib.export_symbols, &lib.soname);
+        if !input.as_needed || satisfied > 0 {
             needed.push(lib.soname);
         }
     }
@@ -1073,15 +1144,122 @@ struct Member {
     defines: HashSet<Name>,
 }
 
-fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()> {
-    let _t = peony_prof::trace("include_archive_members");
-    let mut members: Vec<Member> = Vec::new();
-    let mut undefined: HashSet<Name> = r
-        .symbols
+fn current_global_undefined(symbols: &SymbolTable) -> HashSet<Name> {
+    symbols
         .iter()
         .filter(|(_, res)| !res.is_defined() && res.binding == Binding::Global)
         .map(|(n, _)| Name::from_slice(n))
-        .collect();
+        .collect()
+}
+
+fn member_defines(obj: &InputObject) -> HashSet<Name> {
+    obj.symbols
+        .iter()
+        .filter(|s| !s.is_undefined && s.binding != Binding::Local && !s.name.is_empty())
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+fn pull_lazy_members(
+    members: &mut [Member],
+    r: &mut Resolver,
+    undefined: &mut HashSet<Name>,
+) -> Result<u32> {
+    let mut pulled = 0u32;
+    for m in members.iter_mut() {
+        if m.obj.is_none() {
+            continue;
+        }
+        // Only pull this member for symbols STILL undefined right now.
+        if m.defines.is_disjoint(undefined) {
+            continue;
+        }
+        let obj = m.obj.take().unwrap();
+        // Snapshot the names this member touches (its claimed defines plus
+        // its own undefined refs) BEFORE resolving, then reconcile each
+        // against the ACTUAL table state AFTER resolve. Reconciling against
+        // the table — rather than trusting `m.defines` — is what keeps the
+        // incremental set correct under COMDAT exclusion: a member can be
+        // pulled yet have a claimed define dropped (its COMDAT group already
+        // seen), in which case that name stays undefined and must remain in
+        // the set. Bounded by the member's own symbol count.
+        let touched: Vec<Name> = m
+            .defines
+            .iter()
+            .cloned()
+            .chain(
+                obj.symbols
+                    .iter()
+                    .filter(|s| s.is_undefined && !s.name.is_empty())
+                    .map(|s| s.name.clone()),
+            )
+            .collect();
+        r.resolve(obj)?;
+        for nm in touched {
+            match r.symbols.lookup(nm.as_bytes()) {
+                Some(res) if !res.is_defined() && res.binding == Binding::Global => {
+                    undefined.insert(nm);
+                }
+                _ => {
+                    undefined.remove(nm.as_bytes());
+                }
+            }
+        }
+        pulled += 1;
+    }
+    Ok(pulled)
+}
+
+fn include_whole_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()> {
+    let _t = peony_prof::trace("include_whole_archive_members");
+    for ar in archives {
+        let archive_members = iter_archive_members(ar)
+            .with_context(|| format!("reading archive `{}`", ar.display()))?;
+        peony_prof::count("whole_archive_members_seen", archive_members.len() as u64);
+        for m in archive_members {
+            let label = format!("{}({})", ar.display(), m.name);
+            let owned_id = r.arena.push_owned(m.data);
+            let data: &[u8] = {
+                let b = r.arena.owned_bytes(owned_id);
+                unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
+            };
+            let Ok(obj) = parse_owned_member(&mut r.arena, owned_id, label, data) else {
+                continue;
+            };
+            peony_prof::count("whole_archive_members_parsed", 1);
+            r.resolve(obj)?;
+        }
+    }
+    Ok(())
+}
+
+fn include_start_lib_members(paths: &[&PathBuf], r: &mut Resolver) -> Result<()> {
+    let _t = peony_prof::trace("include_start_lib_members");
+    let mut members = Vec::with_capacity(paths.len());
+    for path in paths {
+        let obj = parse_object(&mut r.arena, path)
+            .with_context(|| format!("failed to parse start-lib member `{}`", path.display()))?;
+        members.push(Member {
+            defines: member_defines(&obj),
+            obj: Some(obj),
+        });
+    }
+    let mut undefined = current_global_undefined(&r.symbols);
+    peony_prof::count("start_lib_strong_undefs", undefined.len() as u64);
+    while !undefined.is_empty() {
+        let pulled = pull_lazy_members(&mut members, r, &mut undefined)?;
+        peony_prof::count("start_lib_members_pulled", pulled as u64);
+        if pulled == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()> {
+    let _t = peony_prof::trace("include_archive_members");
+    let mut members: Vec<Member> = Vec::new();
+    let mut undefined: HashSet<Name> = current_global_undefined(&r.symbols);
     peony_prof::count("archive_strong_undefs", undefined.len() as u64);
     // Deduplicate archive paths, keeping first-seen order. `cc`/`rustc` pass the
     // same archive repeatedly (e.g. `-lgcc … -lgcc_s … -lgcc`, four `-lgcc`s) to
@@ -1166,64 +1344,15 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
                     continue;
                 };
                 peony_prof::count("archive_members_parsed", 1);
-                let defines = obj
-                    .symbols
-                    .iter()
-                    .filter(|s| {
-                        !s.is_undefined && s.binding != Binding::Local && !s.name.is_empty()
-                    })
-                    .map(|s| s.name.clone())
-                    .collect();
+                let defines = member_defines(&obj);
                 members.push(Member {
                     obj: Some(obj),
                     defines,
                 });
             }
         }
-        let mut included_any = false;
-        let mut pulled = 0u32;
-        for m in members.iter_mut() {
-            if m.obj.is_none() {
-                continue;
-            }
-            // Only pull this member for symbols STILL undefined right now.
-            if m.defines.is_disjoint(&undefined) {
-                continue;
-            }
-            let obj = m.obj.take().unwrap();
-            // Snapshot the names this member touches (its claimed defines plus
-            // its own undefined refs) BEFORE resolving, then reconcile each
-            // against the ACTUAL table state AFTER resolve. Reconciling against
-            // the table — rather than trusting `m.defines` — is what keeps the
-            // incremental set correct under COMDAT exclusion: a member can be
-            // pulled yet have a claimed define dropped (its COMDAT group already
-            // seen), in which case that name stays undefined and must remain in
-            // the set. Bounded by the member's own symbol count.
-            let touched: Vec<Name> = m
-                .defines
-                .iter()
-                .cloned()
-                .chain(
-                    obj.symbols
-                        .iter()
-                        .filter(|s| s.is_undefined && !s.name.is_empty())
-                        .map(|s| s.name.clone()),
-                )
-                .collect();
-            r.resolve(obj)?;
-            for nm in touched {
-                match r.symbols.lookup(nm.as_bytes()) {
-                    Some(res) if !res.is_defined() && res.binding == Binding::Global => {
-                        undefined.insert(nm);
-                    }
-                    _ => {
-                        undefined.remove(nm.as_bytes());
-                    }
-                }
-            }
-            included_any = true;
-            pulled += 1;
-        }
+        let pulled = pull_lazy_members(&mut members, r, &mut undefined)?;
+        let included_any = pulled > 0;
         peony_prof::event(
             "archive-round",
             format!(
@@ -1243,67 +1372,6 @@ fn include_archive_members(archives: &[&PathBuf], r: &mut Resolver) -> Result<()
         }
     }
     Ok(())
-}
-
-/// Standard linker-provided symbols (PROVIDE semantics: only define a name an
-/// input *referenced but left undefined*; never override a real definition).
-const LINKER_SYMS: &[&str] = &[
-    "_GLOBAL_OFFSET_TABLE_",
-    "__executable_start",
-    "__ehdr_start",
-    "__bss_start",
-    "_edata",
-    "edata",
-    "_end",
-    "end",
-    // `__dso_handle` identifies this DSO for `__cxa_atexit`/`__cxa_finalize`.
-    // The runtime only uses its ADDRESS as an opaque handle, so the image base
-    // is a valid, stable definition. crtbegin normally provides it, but when
-    // linking without crt (e.g. a cdylib) `libc_nonshared.a` references it
-    // undefined, so the linker must synthesise it.
-    "__dso_handle",
-];
-
-fn linker_symbol_addr(name: &str, layout: &peony_layout::Layout) -> u64 {
-    match name {
-        "_GLOBAL_OFFSET_TABLE_" => layout.got_base,
-        "__executable_start" | "__ehdr_start" | "__dso_handle" => layout.image_base,
-        "__bss_start" => layout.bss_start,
-        "_edata" | "edata" => layout.edata,
-        "_end" | "end" => layout.end,
-        _ => 0,
-    }
-}
-
-/// Pre-define well-known linker-synthesized symbols (e.g. `_end`, `_start`)
-/// as absolute symbols at address 0; their real addresses are patched by the
-/// layout pass. Returns the list of names registered.
-fn predefine_linker_symbols(symbols: &mut SymbolTable) -> Vec<&'static str> {
-    let mut provided = Vec::new();
-    for &name in LINKER_SYMS {
-        if let Some(r) = symbols.lookup(name.as_bytes()) {
-            if r.defined_in.is_none() {
-                symbols.define_absolute(name.as_bytes(), 0);
-                provided.push(name);
-            }
-        }
-    }
-    provided
-}
-
-/// Fill in the real addresses of the provided linker symbols after layout.
-fn set_linker_addresses(
-    symbols: &mut SymbolTable,
-    layout: &peony_layout::Layout,
-    provided: &[&'static str],
-) {
-    for &name in provided {
-        let addr = linker_symbol_addr(name, layout);
-        if let Some(r) = symbols.lookup_mut(name.as_bytes()) {
-            r.value = addr;
-            r.virtual_address = addr;
-        }
-    }
 }
 
 /// Apply `--defsym SYM=VALUE` definitions as absolute symbols.
@@ -1329,6 +1397,7 @@ fn compute_live(
     entry: &str,
     comdat_excluded: &FxHashSet<(usize, usize)>,
     export_roots: bool,
+    script: Option<&ScriptLayout>,
 ) -> LiveFilter {
     if !gc {
         // No GC: emit everything except the COMDAT-discarded dups. This is a
@@ -1341,10 +1410,30 @@ fn compute_live(
     }
     // --gc-sections: an allow-list of reachable sections, minus COMDAT dups.
     let mut live = peony_layout::gc_sections_rooted(objects, symbols, entry, export_roots);
+    if let Some(script) = script {
+        add_script_kept_sections(&mut live, objects, script);
+    }
     for key in comdat_excluded {
         live.remove(key);
     }
     LiveFilter::Only(live)
+}
+
+fn add_script_kept_sections(
+    live: &mut FxHashSet<(usize, usize)>,
+    objects: &[InputObject],
+    script: &ScriptLayout,
+) {
+    for (obj_id, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
+                continue;
+            }
+            if script.keeps_input(&sec.name) {
+                live.insert((obj_id, sec.index.0));
+            }
+        }
+    }
 }
 
 /// Owned section-emission filter produced by [`compute_live`]; borrowed as a
@@ -1427,560 +1516,107 @@ fn parse_version_script(path: &Path) -> Result<VersionScript> {
     Ok(vs)
 }
 
-/// Expand any GNU linker-script inputs (e.g. the system `libc.so`, which is a
-/// `GROUP(...)` script) into the real object/library files they reference,
-/// recursively.
-fn expand_inputs(inputs: Vec<PathBuf>, search: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    use std::collections::VecDeque;
-    let mut out = Vec::new();
-    let mut work: VecDeque<PathBuf> = inputs.into();
-    while let Some(p) = work.pop_front() {
-        if peony_object::classify_file(&p) == peony_object::FileKind::Archive {
-            out.push(p);
-            continue;
-        }
-        if !is_linker_script(&p) {
-            out.push(p);
-            continue;
-        }
-        let dir = p.parent().map(Path::to_path_buf);
-        for r in parse_linker_script(&p)? {
-            match resolve_script_ref(&r, dir.as_deref(), search) {
-                Some(rp) => work.push_back(rp),
-                None => tracing::warn!("linker script `{}`: cannot resolve `{r}`", p.display()),
+fn read_dynamic_symbol_patterns(path: &Path) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading dynamic symbol list `{}`", path.display()))?;
+    let text = strip_block_comments(&text);
+    let mut patterns = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        let line = line.split("//").next().unwrap_or("");
+        let cleaned: String = line
+            .chars()
+            .map(|c| if "{}();,:\t\r\n".contains(c) { ' ' } else { c })
+            .collect();
+        for tok in cleaned.split_whitespace() {
+            if matches!(
+                tok,
+                "global"
+                    | "local"
+                    | "extern"
+                    | "C"
+                    | "C++"
+                    | "VERSION"
+                    | "Base"
+                    | "global:"
+                    | "local:"
+            ) {
+                continue;
+            }
+            if tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && tok.ends_with("_VER") {
+                continue;
+            }
+            if !patterns.iter().any(|p| p == tok) {
+                patterns.push(tok.to_string());
             }
         }
     }
-    Ok(out)
+    Ok(patterns)
 }
 
-/// A text file referencing GROUP/INPUT (and not an ELF/archive) is a linker script.
-///
-/// Fast path: peek only the leading magic bytes and reject ELF objects /
-/// archives — the overwhelming majority of inputs — WITHOUT reading the whole
-/// file. The old code `read`-the-entire-file of every input just to magic-check
-/// it (on a 419-object link that re-read ~18MB the parser then mmaps anyway, and
-/// on a 1-object link it was ~50% of the link). Only a genuine non-ELF input
-/// (the rare linker script) is read in full.
-fn is_linker_script(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
+fn export_pattern_matches(patterns: &[String], name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
         return false;
     };
-    let mut magic = [0u8; 8];
-    let n = f.read(&mut magic).unwrap_or(0);
-    let head = &magic[..n];
-    if head.starts_with(&peony_object::elf::ELFMAG)
-        || head.starts_with(b"!<arch>\n")
-        || head.starts_with(b"!<thin>\n")
-    {
+    patterns.iter().any(|pat| wildcard_matches(pat, name))
+}
+
+fn excluded_by_exclude_libs(
+    exclude_libs: &[String],
+    res: &peony_symbols::SymbolResolution,
+    symbols: &SymbolTable,
+) -> bool {
+    if exclude_libs.is_empty() {
         return false;
     }
-    // Not ELF/archive: read the rest and scan for linker-script directives.
-    let mut data = magic[..n].to_vec();
-    if f.read_to_end(&mut data).is_err() {
+    let Some(obj_id) = res.defined_in else {
         return false;
-    }
-    let text = String::from_utf8_lossy(&data);
-    text.contains("GROUP")
-        || text.contains("INPUT")
-        || text.contains("AS_NEEDED")
-        || text.contains("SECTIONS")
-        || text.contains("ENTRY")
-}
-
-/// Extract the file/`-l` references from a linker script (GROUP/INPUT/AS_NEEDED).
-fn parse_linker_script(path: &Path) -> Result<Vec<String>> {
-    let data = std::fs::read(path)
-        .with_context(|| format!("reading linker script `{}`", path.display()))?;
-    let text = strip_block_comments(&String::from_utf8_lossy(&data));
-    Ok(extract_script_refs(&text))
-}
-
-#[derive(Default)]
-struct ScriptControls {
-    entry: Option<String>,
-    base_address: Option<String>,
-    layout: ScriptLayout,
-}
-
-fn parse_linker_script_controls(paths: &[PathBuf]) -> Result<ScriptControls> {
-    let mut merged = ScriptControls::default();
-    for path in paths {
-        let data = std::fs::read(path)
-            .with_context(|| format!("reading linker script `{}`", path.display()))?;
-        let text = strip_block_comments(&String::from_utf8_lossy(&data));
-        if let Some(entry) = directive_arg(&text, "ENTRY") {
-            merged.entry = Some(entry);
-        }
-        if let Some(base) = script_base_address(&text) {
-            merged.base_address = Some(base);
-        }
-        let layout = parse_sections_layout(&text);
-        merged.layout.output_sections.extend(layout.output_sections);
-    }
-    Ok(merged)
-}
-
-fn extract_script_refs(text: &str) -> Vec<String> {
-    let mut refs = Vec::new();
-    for keyword in ["GROUP", "INPUT", "AS_NEEDED"] {
-        let mut pos = 0;
-        while let Some((body, end)) = directive_body(text, keyword, pos) {
-            for r in parse_ref_tokens(body) {
-                if !refs.contains(&r) {
-                    refs.push(r);
-                }
-            }
-            pos = end;
-        }
-    }
-    refs
-}
-
-fn parse_ref_tokens(text: &str) -> Vec<String> {
-    let cleaned: String = text
-        .chars()
-        .map(|c| if "(),".contains(c) { ' ' } else { c })
-        .collect();
-    cleaned
-        .split_whitespace()
-        .map(|t| t.trim_matches('"').trim_matches('\''))
-        .filter(|t| {
-            *t != "GROUP"
-                && *t != "INPUT"
-                && *t != "AS_NEEDED"
-                && *t != "/DISCARD/"
-                && (t.starts_with("-l")
-                    || t.contains('/')
-                    || t.ends_with(".a")
-                    || t.contains(".so"))
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-fn parse_sections_layout(text: &str) -> ScriptLayout {
-    let Some((body, _)) = directive_body(text, "SECTIONS", 0) else {
-        return ScriptLayout::default();
     };
-    let mut layout = ScriptLayout::default();
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b';') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        if bytes[i] != b'.' && bytes[i] != b'/' {
-            i += 1;
-            continue;
-        }
-        let name_start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && !matches!(bytes[i], b':' | b'{' | b';')
-        {
-            i += 1;
-        }
-        let name = body[name_start..i].trim();
-        let j = skip_ws(body, i);
-        if name == "." && j < bytes.len() && bytes[j] == b'=' {
-            i = body[j..].find(';').map_or(bytes.len(), |off| j + off + 1);
-            continue;
-        }
-        let Some(colon) = find_byte_before(body, j, b':', b';') else {
-            i += 1;
-            continue;
-        };
-        let Some(open_rel) = body[colon + 1..].find('{') else {
-            i = colon + 1;
-            continue;
-        };
-        let open = colon + 1 + open_rel;
-        let Some(close) = matching_brace(body, open) else {
-            break;
-        };
-        if !name.is_empty() && name != "/DISCARD/" {
-            let mut patterns = section_patterns(&body[open + 1..close]);
-            if patterns.is_empty() {
-                patterns.push(name.to_string());
-            }
-            layout.output_sections.push(ScriptOutputSection {
-                name: name.to_string(),
-                patterns,
-            });
-        }
-        i = close + 1;
-    }
-    layout
-}
-
-fn section_patterns(body: &str) -> Vec<String> {
-    let cleaned: String = body
-        .chars()
-        .map(|c| if "(){};,\":".contains(c) { ' ' } else { c })
-        .collect();
-    let mut out = Vec::new();
-    for tok in cleaned.split_whitespace() {
-        if tok.starts_with('.') && !out.iter().any(|p| p == tok) {
-            out.push(tok.to_string());
-        }
-    }
-    out
-}
-
-fn script_base_address(text: &str) -> Option<String> {
-    let (body, _) = directive_body(text, "SECTIONS", 0)?;
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'.' {
-            let j = skip_ws(body, i + 1);
-            if j < bytes.len() && bytes[j] == b'=' {
-                let expr_start = skip_ws(body, j + 1);
-                let expr_end = body[expr_start..]
-                    .find(';')
-                    .map_or(bytes.len(), |off| expr_start + off);
-                let expr = body[expr_start..expr_end].trim();
-                if let Some(num) = first_number_token(expr) {
-                    return Some(num.to_string());
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn first_number_token(expr: &str) -> Option<&str> {
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let is_start = bytes[i].is_ascii_digit();
-        if is_start {
-            let start = i;
-            i += 1;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_hexdigit() || matches!(bytes[i], b'x' | b'X'))
-            {
-                i += 1;
-            }
-            return Some(&expr[start..i]);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn directive_arg(text: &str, keyword: &str) -> Option<String> {
-    directive_body(text, keyword, 0).map(|(body, _)| body.trim().to_string())
-}
-
-fn directive_body<'a>(text: &'a str, keyword: &str, start: usize) -> Option<(&'a str, usize)> {
-    let mut search = start;
-    while let Some(pos) = text[search..].find(keyword) {
-        let kw = search + pos;
-        let before_ok = kw == 0
-            || !text.as_bytes()[kw - 1].is_ascii_alphanumeric() && text.as_bytes()[kw - 1] != b'_';
-        let after = kw + keyword.len();
-        let after_ok = after >= text.len()
-            || !text.as_bytes()[after].is_ascii_alphanumeric() && text.as_bytes()[after] != b'_';
-        if before_ok && after_ok {
-            let open = skip_ws(text, after);
-            if open < text.len() && text.as_bytes()[open] == b'(' {
-                if let Some(close) = matching_paren(text, open) {
-                    return Some((&text[open + 1..close], close + 1));
-                }
-            } else if open < text.len() && text.as_bytes()[open] == b'{' {
-                if let Some(close) = matching_brace(text, open) {
-                    return Some((&text[open + 1..close], close + 1));
-                }
-            }
-        }
-        search = after;
-    }
-    None
-}
-
-fn find_byte_before(text: &str, start: usize, needle: u8, stop: u8) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut i = start;
-    while i < bytes.len() {
-        if bytes[i] == needle {
-            return Some(i);
-        }
-        if bytes[i] == stop {
-            return None;
-        }
-        i += 1;
-    }
-    None
-}
-
-fn matching_paren(text: &str, open: usize) -> Option<usize> {
-    matching_delim(text, open, b'(', b')')
-}
-
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
-    matching_delim(text, open, b'{', b'}')
-}
-
-fn matching_delim(text: &str, open: usize, left: u8, right: u8) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < bytes.len() {
-        if bytes[i] == left {
-            depth += 1;
-        } else if bytes[i] == right {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn skip_ws(text: &str, mut i: usize) -> usize {
-    let bytes = text.as_bytes();
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
-}
-
-fn strip_block_comments(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
-        } else {
-            out.push(b[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn resolve_script_ref(r: &str, script_dir: Option<&Path>, search: &[PathBuf]) -> Option<PathBuf> {
-    if let Some(name) = r.strip_prefix("-l") {
-        for d in search {
-            for ext in ["so", "a"] {
-                let p = d.join(format!("lib{name}.{ext}"));
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-        }
-        return None;
-    }
-    let p = Path::new(r);
-    if p.is_absolute() && p.exists() {
-        return Some(p.to_path_buf());
-    }
-    if let Some(dir) = script_dir {
-        let q = dir.join(r);
-        if q.exists() {
-            return Some(q);
-        }
-    }
-    search.iter().map(|d| d.join(r)).find(|p| p.exists())
-}
-
-/// Resolve positional inputs plus `-l<name>` libraries (searched as `lib<name>.a`
-/// on the `-L` paths) into the final ordered input list.
-///
-/// The search list is the explicit `-L` directories followed by the system
-/// library directories discovered from the host C toolchain (`gcc
-/// -print-search-dirs`) plus the standard multiarch locations. This lets
-/// `-lgcc_s`, `-lc`, etc. resolve without the caller passing every `-L`, exactly
-/// as GNU ld / lld do when driven by `cc`.
-fn resolve_inputs(args: &Args) -> Result<Vec<PathBuf>> {
-    let mut inputs = args.inputs.clone();
-    inputs.extend(args.linker_scripts.iter().cloned());
-    let search = library_search_paths(&args.library_paths);
-    for name in &args.libraries {
-        // Search each dir for the shared library first, then the archive.
-        let found = search
-            .iter()
-            .flat_map(|d| {
-                [
-                    d.join(format!("lib{name}.so")),
-                    d.join(format!("lib{name}.a")),
-                ]
-            })
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                anyhow::anyhow!("cannot find -l{name} (lib{name}.so/.a) on the library path")
-            })?;
-        inputs.push(found);
-    }
-    if inputs.is_empty() {
-        anyhow::bail!("no input files");
-    }
-    Ok(inputs)
-}
-
-/// Inject C-runtime startup objects (`Scrt1.o crti.o crtbeginS.o … crtendS.o
-/// crtn.o`) around the user inputs, as the `cc` driver does, when none is already
-/// present. Only applied for executables (not `-shared`/`-r`). If the toolchain
-/// objects can't be located, the inputs are returned unchanged (a static link
-/// with its own `_start`, e.g. the test-suite's hand-written objects, still works).
-fn inject_crt_objects(inputs: Vec<PathBuf>, args: &Args) -> Vec<PathBuf> {
-    let _t = peony_prof::trace("inject_crt_objects");
-    // Heuristic: skip if a Scrt1/crt1 object is already on the command line.
-    let already = inputs.iter().any(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "Scrt1.o" || n == "crt1.o" || n == "rcrt1.o")
-    });
-    // Only auto-inject for a PIE (the case rustc/cc drive without crt objects).
-    if already || !args.pie {
-        return inputs;
-    }
-    // Skip if the inputs already provide `_start` (a freestanding PIE that does
-    // not need the C runtime). crt's Scrt1.o also defines `_start`, so injecting
-    // would cause a duplicate-symbol error.
-    if inputs.iter().any(|p| object_defines_start(p)) {
-        return inputs;
-    }
-
-    // Locate the crt objects. First try the cached GCC library dirs (no
-    // subprocess — `gcc_library_dirs()` is memoised); only fall back to
-    // `gcc -print-file-name` if a crt isn't on those dirs. The old code spawned
-    // gcc 5× and each call PATH-walked (~117 execve on a typical link).
-    let find = |name: &str| -> Option<PathBuf> {
-        for dir in gcc_library_dirs() {
-            let p = dir.join(name);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-        let gcc = ["/usr/bin/gcc", "/usr/local/bin/gcc", "/usr/bin/cc"]
-            .into_iter()
-            .find(|p| std::fs::metadata(p).is_ok())
-            .unwrap_or("gcc");
-        let out = std::process::Command::new(gcc)
-            .arg(format!("-print-file-name={name}"))
-            .output()
-            .ok()?;
-        let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        // gcc returns the bare name unchanged when it can't find the file.
-        (p.is_absolute() && p.exists()).then_some(p)
-    };
-
-    let scrt1 = if args.pie { "Scrt1.o" } else { "crt1.o" };
-    let (begin, end) = if args.pie {
-        ("crtbeginS.o", "crtendS.o")
-    } else {
-        ("crtbegin.o", "crtend.o")
-    };
-    let (Some(c1), Some(ci), Some(cb), Some(ce), Some(cn)) = (
-        find(scrt1),
-        find("crti.o"),
-        find(begin),
-        find(end),
-        find("crtn.o"),
-    ) else {
-        return inputs; // toolchain crt unavailable — leave inputs as-is
-    };
-
-    let mut out = Vec::with_capacity(inputs.len() + 5);
-    out.push(c1);
-    out.push(ci);
-    out.push(cb);
-    out.extend(inputs);
-    out.push(ce);
-    out.push(cn);
-    out
-}
-
-/// True if `path` is a relocatable object that defines a global `_start`.
-/// Used to decide whether the C-runtime startup objects are needed.
-fn object_defines_start(path: &Path) -> bool {
-    // Only a bare relocatable object can be the freestanding `_start` provider;
-    // archives/shared objects never suppress crt injection. One header read
-    // (classify_file) instead of the former is_archive + is_shared_object double
-    // open, then a symbol-table-only scan (no full parse) for the bare case.
-    if peony_object::classify_file(path) != peony_object::FileKind::Bare {
+    let Some(path) = symbols.object_path(obj_id) else {
         return false;
-    }
-    peony_object::object_defines_global_start(path)
-}
-
-/// The full library search path: explicit `-L` dirs first (highest priority),
-/// then GCC's own library directories, then standard system locations.
-fn library_search_paths(explicit: &[PathBuf]) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = explicit.to_vec();
-    let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
-        if p.is_dir() && !out.contains(&p) {
-            out.push(p);
-        }
     };
-    for p in gcc_library_dirs() {
-        push(p.clone(), &mut out);
-    }
-    for p in [
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib64",
-        "/lib/x86_64-linux-gnu",
-        "/lib64",
-        "/usr/lib",
-        "/lib",
-    ] {
-        push(PathBuf::from(p), &mut out);
-    }
-    out
-}
-
-/// Parse `gcc -print-search-dirs` and return its `libraries:` entries.
-/// Returns an empty vector if `gcc` is unavailable, so peony still works with
-/// explicit `-L` paths on systems without a C compiler.
-fn gcc_library_dirs() -> &'static [PathBuf] {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        // Try known locations before a PATH search to avoid the 40+ failed
-        // `execve()`s the OS performs probing every PATH entry for `gcc`.
-        let gcc = ["/usr/bin/gcc", "/usr/local/bin/gcc", "/usr/bin/cc"]
-            .iter()
-            .find(|p| std::fs::metadata(p).is_ok())
-            .copied()
-            .unwrap_or("gcc");
-        let output = match std::process::Command::new(gcc)
-            .arg("-print-search-dirs")
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
-            _ => return Vec::new(),
-        };
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("libraries:") {
-                // Format: "libraries: =/path/a:/path/b:..."; entries are ':'-joined.
-                let rest = rest.trim_start().trim_start_matches('=');
-                return rest
-                    .split(':')
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-                    // Canonicalize to collapse the ../.. segments gcc emits.
-                    .map(|p| p.canonicalize().unwrap_or(p))
-                    .collect();
-            }
-        }
-        Vec::new()
+    let Some((archive, _member)) = path.split_once('(') else {
+        return false;
+    };
+    let archive_name = Path::new(archive)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(archive);
+    let stem = archive_name
+        .strip_prefix("lib")
+        .and_then(|s| s.strip_suffix(".a"))
+        .unwrap_or(archive_name);
+    exclude_libs.iter().any(|pat| {
+        pat == "ALL"
+            || pat == archive_name
+            || pat == stem
+            || wildcard_matches(pat, archive_name)
+            || wildcard_matches(pat, stem)
     })
+}
+
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    if !pattern.starts_with('*') && !name.starts_with(parts[0]) {
+        return false;
+    }
+    if !pattern.ends_with('*') && !name.ends_with(parts[parts.len() - 1]) {
+        return false;
+    }
+    let mut rest = name;
+    for part in parts.into_iter().filter(|p| !p.is_empty()) {
+        let Some(pos) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[pos + part.len()..];
+    }
+    true
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

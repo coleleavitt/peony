@@ -95,6 +95,78 @@ fn custom_entry() {
     assert!(readelf(&exe, &["-h"]).contains("Entry point"));
 }
 
+#[test]
+fn export_dynamic_symbol_exports_selected_executable_symbol() {
+    let dir = workdir("export_dynamic_symbol");
+    let o = assemble(
+        &dir,
+        "export",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n.globl public_api\npublic_api:\n ret\n.globl private_api\nprivate_api:\n ret\n",
+    );
+    let exe = dir.join("a.out");
+    link(&exe, &[o], &["--export-dynamic-symbol=public_api"]);
+    assert_eq!(run(&exe), 42);
+    let dynsyms = readelf(&exe, &["--dyn-syms", "-W"]);
+    assert!(
+        dynsyms.contains("public_api"),
+        "selected export missing:\n{dynsyms}"
+    );
+    assert!(
+        !dynsyms.contains("private_api"),
+        "unselected symbol should not be exported:\n{dynsyms}"
+    );
+}
+
+#[test]
+fn export_dynamic_respects_exclude_libs_all() {
+    let dir = workdir("exclude_libs_all");
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n call archive_api@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let member = assemble(
+        &dir,
+        "member",
+        ".text\n.globl archive_api\narchive_api:\n movl $42,%eax\n ret\n",
+    );
+    let ar = archive(&dir, "libhidden", &[member]);
+    let exe = dir.join("a.out");
+    link(
+        &exe,
+        &[main, ar],
+        &["--export-dynamic", "--exclude-libs", "ALL"],
+    );
+    assert_eq!(run(&exe), 42);
+    let dynsyms = readelf(&exe, &["--dyn-syms", "-W"]);
+    assert!(
+        !dynsyms.contains("archive_api"),
+        "--exclude-libs ALL should hide archive symbol:\n{dynsyms}"
+    );
+}
+
+#[test]
+fn hash_style_gnu_rejects_exported_symbols_without_populated_gnu_hash() {
+    let dir = workdir("hash_gnu_exports");
+    let o = assemble(
+        &dir,
+        "export",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n.globl public_api\npublic_api:\n ret\n",
+    );
+    let exe = dir.join("a.out");
+    let out = link_raw(
+        &exe,
+        &[o],
+        &["--export-dynamic-symbol=public_api", "--hash-style=gnu"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--hash-style=gnu"),
+        "stderr should explain unsupported GNU hash export case: {stderr}"
+    );
+}
+
 /// `-T` linker scripts provide ENTRY, base address, output section naming, and
 /// output-section order for the subset Peony's fixed segment model supports.
 #[test]
@@ -129,9 +201,59 @@ fn linker_script_sections_entry_and_base() {
     );
 }
 
-/// Compiler LTO reaches Peony through GNU's `-plugin` linker API. Peony hands
-/// that path to the system GNU linker so the real plugin can produce native
-/// replacement objects instead of treating slim LTO objects as ordinary ELF.
+#[test]
+fn linker_script_keep_roots_sections_under_gc() {
+    let dir = workdir("script_keep");
+    let script = dir.join("keep.ld");
+    std::fs::write(
+        &script,
+        "SECTIONS {\n  .text : { KEEP(*(.text.keep)) *(.text*) }\n}\n",
+    )
+    .unwrap();
+    let o = assemble(
+        &dir,
+        "keep",
+        ".section .text.keep,\"ax\",@progbits\n.globl kept\nkept:\n ret\n.section .text.start,\"ax\",@progbits\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    link(
+        &exe,
+        &[o],
+        &["--gc-sections", "-T", script.to_str().unwrap()],
+    );
+    assert_eq!(run(&exe), 42);
+    let syms = readelf(&exe, &["-sW"]);
+    assert!(syms.contains("kept"), "KEEP should retain section:\n{syms}");
+}
+
+#[test]
+fn unsupported_linker_script_directives_fail_loudly() {
+    let dir = workdir("script_unsupported");
+    let script = dir.join("bad.ld");
+    std::fs::write(
+        &script,
+        "PROVIDE(foo = 1);\nSECTIONS { .text : { *(.text*) } }\n",
+    )
+    .unwrap();
+    let o = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let out = link_raw(&exe, &[o], &["-T", script.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported directive `PROVIDE`"),
+        "stderr was {stderr}"
+    );
+}
+
+/// Compiler LTO reaches Peony through GNU's `-plugin` linker API. Peony detects
+/// actual GCC LTO objects and hands that path to GNU ld so the real plugin can
+/// produce native replacement objects instead of treating slim LTO objects as
+/// ordinary ELF.
 #[test]
 fn gcc_lto_plugin_link_handoff() {
     let dir = workdir("lto_plugin");
@@ -144,18 +266,35 @@ fn gcc_lto_plugin_link_handoff() {
         "static int answer(void) { return 42; }\nint main(void) { return answer(); }\n",
     )
     .unwrap();
+    let host_exe = dir.join("host.out");
+    let host = std::process::Command::new("cc")
+        .args(["-flto", "-fuse-linker-plugin", "-fno-pie", "-no-pie", "-o"])
+        .arg(&host_exe)
+        .arg(&src)
+        .output()
+        .expect("probe host cc LTO support");
+    if !host.status.success() {
+        eprintln!(
+            "host compiler/linker does not support this LTO plugin test: {}",
+            String::from_utf8_lossy(&host.stderr)
+        );
+        return;
+    }
+
     let exe = dir.join("a.out");
-    let status = std::process::Command::new("cc")
+    let output = std::process::Command::new("cc")
         .arg(format!("-B{}/", bindir.display()))
         .args(["-flto", "-fuse-linker-plugin", "-fno-pie", "-no-pie", "-o"])
         .arg(&exe)
         .arg(&src)
-        .status()
+        .output()
         .expect("run cc with LTO");
-    if !status.success() {
-        eprintln!("host compiler/linker does not support this LTO plugin test");
-        return;
-    }
+    assert!(
+        output.status.success(),
+        "peony LTO handoff failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(run(&exe), 42);
 }
 
@@ -268,6 +407,26 @@ fn comdat_group_dedup() {
     let syms = readelf(&exe, &["-s"]);
     let count = syms.lines().filter(|l| l.ends_with(" inl")).count();
     assert_eq!(count, 1, "COMDAT should keep exactly one `inl`");
+}
+
+/// Duplicate COMDAT groups must discard the later group's symbol body instead of
+/// letting it override the first kept definition.
+#[test]
+fn comdat_excludes_later_group_symbols() {
+    let dir = workdir("comdat_excl");
+    let first = assemble(
+        &dir,
+        "first",
+        ".section .text.inl,\"axG\",@progbits,inl,comdat\n.globl inl\ninl:\n movl $42,%eax\n ret\n",
+    );
+    let duplicate = assemble(
+        &dir,
+        "duplicate",
+        ".section .text.inl,\"axG\",@progbits,inl,comdat\n.globl inl\ninl:\n movl $1,%eax\n ret\n.text\n.globl _start\n_start:\n call inl\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    link(&exe, &[first, duplicate], &[]);
+    assert_eq!(run(&exe), 42);
 }
 
 /// `--build-id` emits a `.note.gnu.build-id` (+ PT_NOTE) and is deterministic.

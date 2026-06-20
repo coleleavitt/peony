@@ -9,7 +9,12 @@ publish = false
 # regression came from. CodSpeed-compatible: `cargo codspeed build/run` in CI.
 
 [dependencies]
+peony-cache = { path = "../peony-cache" }
+peony-layout = { path = "../peony-layout" }
+peony-object = { path = "../peony-object" }
+peony-reloc = { path = "../peony-reloc" }
 peony-symbols = { path = "../peony-symbols" }
+rustc-hash = "2"
 
 [dev-dependencies]
 # codspeed-criterion-compat is a drop-in for criterion that also works under the

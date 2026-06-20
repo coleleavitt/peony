@@ -484,6 +484,19 @@ impl SymbolTable {
         self.resolutions.get_mut(name)
     }
 
+    /// Ensure `name` exists as a strong undefined reference. Used for linker
+    /// driver roots such as `-u foo`/`--require-defined=foo`, which should pull
+    /// matching lazy archive members even if no object referenced the symbol.
+    pub fn force_undefined(&mut self, name: &[u8]) {
+        let e = self
+            .resolutions
+            .entry(Name::from_slice(name))
+            .or_insert_with(Self::make_undefined_resolution);
+        if !e.is_defined() {
+            e.binding = Binding::Global;
+        }
+    }
+
     /// Mark currently-undefined symbols that a shared library exports as dynamic
     /// imports (resolved at runtime). Returns how many references were satisfied.
     pub fn register_shared_exports(&mut self, exports: &[Vec<u8>]) -> usize {
@@ -617,6 +630,11 @@ impl SymbolTable {
     /// Number of distinct objects registered.
     pub fn object_count(&self) -> usize {
         self.object_paths.len()
+    }
+
+    /// Human-readable path/label for an input object id.
+    pub fn object_path(&self, id: ObjectId) -> Option<&str> {
+        self.object_paths.get(id.0 as usize).map(String::as_str)
     }
 
     pub fn len(&self) -> usize {

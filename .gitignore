@@ -16,6 +16,22 @@ jfc-transcript.md
 .jfc/
 .codegraph/
 
+# agent scaffolding: keep reusable project guidance visible even when a
+# user-level global ignore hides agent folders by default; keep imported skills
+# and transient plans local unless explicitly added later.
+!.claude/
+!.claude/**
+!.junie/
+.junie/plans/
+.junie/skills/
+!.junie/AGENTS.md
+!.junie/agents/
+!.junie/agents/**
+!.junie/commands/
+!.junie/commands/**
+!.junie/rules/
+!.junie/rules/**
+
 # core dumps
 core
 core.*

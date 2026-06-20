@@ -21,16 +21,19 @@ designed to be fast, incremental, and drop-in compatible with the standard
   entry point and (for shared objects) all exported symbols
 - **COMDAT deduplication** — eliminates duplicate C++ inline/template sections
   across translation units
-- **Incremental linking** (`--incremental`) — fingerprint-based cache that
-  skips re-linking when inputs are unchanged
+- **Incremental linking** (`--incremental`) — fingerprint/stat cache for
+  byte-identical no-change reuse plus red/green changed-input patching when
+  section layout stays stable; unsafe size/layout changes conservatively fall
+  back to a full emit instead of serving stale bytes
 - **Linker-synthesised symbols** — `_end`, `_edata`, `__bss_start`,
   `_GLOBAL_OFFSET_TABLE_`, `__executable_start`, `__dso_handle`, etc.
 - **`--defsym`** — define absolute symbols on the command line
 - **`--build-id`** — emit a `.note.gnu.build-id` section
 - **Parallel** — work-stealing thread pool ([ws-deque]) for parallel section
   scanning and layout
-- **`ld`-compatible CLI** — unknown flags are silently ignored so `cc`/`rustc`
-  can invoke peony as a drop-in replacement
+- **`ld`-compatible CLI subset** — compiler-driver noise is tolerated, response
+  files are expanded, and known unsupported output-changing flags fail
+  explicitly instead of silently producing the wrong binary
 
 [ws-deque]: https://github.com/coleleavitt/ws-deque
 
@@ -71,24 +74,130 @@ peony -o output input.o [input2.o ...] [-L dir] [-l lib] [flags]
 | `-L DIR` | Add library search directory |
 | `-l NAME` | Link library `libNAME.{a,so}` |
 | `--gc-sections` | Dead-strip unreachable sections |
-| `--incremental` | Enable incremental link cache |
+| `--incremental` | Enable no-change reuse and safe changed-input patching |
+| `--cache-report FILE` | Write JSON explaining cache reuse, partial relink, or full-emit fallback |
 | `--build-id` | Emit `.note.gnu.build-id` |
 | `-pie` / `-no-pie` | Position-independent executable |
 | `-shared` | Produce a shared object (`ET_DYN`) |
 | `-soname NAME` | Set `DT_SONAME` |
+| `-dynamic-linker PATH` | Set `PT_INTERP` for dynamic executables |
+| `-rpath PATH` / `--enable-new-dtags` | Emit `DT_RUNPATH` (or `DT_RPATH` with `--disable-new-dtags`) |
+| `--as-needed` / `--no-as-needed` | Scope `DT_NEEDED` retention for shared libraries |
+| `-Bstatic` / `-Bdynamic` | Scope `-l` lookup to archives or shared libraries |
+| `--whole-archive` | Include every member of following archives |
+| `--start-lib` / `--end-lib` | Treat following object files as lazy archive-style members |
+| `--export-dynamic` / `--export-dynamic-symbol` | Export executable symbols into `.dynsym` |
+| `--exclude-libs LIST` | Hide archive-provided symbols from dynamic exports |
+| `--hash-style=sysv\|gnu\|both` | Select dynamic hash-table style where supported |
+| `--no-undefined` / `-z defs` | Reject unresolved symbols in shared-object links |
+| `-r` | Produce relocatable output through GNU `ld` compatibility handoff |
 | `--version-script FILE` | Export/localise symbols per version script |
 | `--defsym SYM=VAL` | Define an absolute symbol |
 | `--threads N` | Worker thread count (0 = auto) |
 | `-s` / `--strip-all` | Strip symbol table and debug sections |
 | `-S` / `--strip-debug` | Strip debug sections but keep `.symtab` |
 
-### Invoking from rustc
+### Current limits
+
+Native GCC/LLVM LTO plugin integration is not implemented; actual GCC LTO
+objects and LLVM bitcode objects are handed to GNU `ld` so the real plugin can
+materialize native code. Relocatable `-r` output uses the same GNU `ld`
+compatibility handoff while Peony's native emitter remains focused on
+executables and shared objects.
+
+### Invoking from rustc/Cargo
+
+Peony is an `ld`-style final linker. When pointing `rustc` directly at Peony,
+set `linker-flavor=ld` so `rustc` sends raw linker arguments instead of
+compiler-driver (`cc`/`gcc`) arguments:
 
 ```sh
-RUSTFLAGS="-C linker=/path/to/peony" cargo build
+RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no" cargo build
 ```
 
-Or set `linker = "/path/to/peony"` in `.cargo/config.toml`.
+Or set it in `.cargo/config.toml`:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "/path/to/peony"
+rustflags = [
+    "-C", "linker-flavor=ld",
+    "-C", "link-self-contained=no",
+]
+```
+
+For a checked-in project recipe, keep the direct-linker form in
+`.cargo/config.toml` and avoid changing `RUSTFLAGS` between retries:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "/path/to/peony"
+rustflags = [
+    "-C", "linker-flavor=ld",
+    "-C", "link-self-contained=no",
+]
+```
+
+If the configured linker is a compiler driver such as `/usr/bin/cc`, `clang`, or
+a wrapper script that expects compiler-driver flags, use `linker-flavor=gcc` for
+that driver; do not copy that flavor to direct Peony invocations. For example:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "/usr/bin/cc"
+rustflags = [
+    "-C", "linker-flavor=gcc",
+]
+```
+
+To enable Peony's linker cache from Cargo, pass Peony's flag through `rustc` as a
+linker argument:
+
+```sh
+RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no -C link-arg=--incremental" cargo build
+```
+
+For large projects where you want to tell Cargo-facing tooling what the final
+linker did, add a machine-readable cache report. The report path is deliberately
+excluded from Peony's cache key so turning diagnostics on does not dirty an
+otherwise reusable link:
+
+```sh
+RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no -C link-arg=--incremental -C link-arg=--cache-report=target/peony-cache-report.json" cargo build
+```
+
+Use `--stats` when invoking Peony directly if you also want a human-readable
+stderr line such as `reused unchanged output`, `partial relink used`, or
+`full emit fallback: section ... size changed`. The JSON report has stable
+top-level fields for future build-system consumption:
+
+```json
+{
+  "version": 1,
+  "output": "target/debug/app",
+  "cache": { "enabled": true },
+  "action": "partial_relink",
+  "message": "partial relink used: 1 red sections, 8 green sections",
+  "sections": {
+    "red": [".text"],
+    "green": [".rodata"]
+  }
+}
+```
+
+Fallback reports use `action: "full_emit"` and include a stable
+`reason.code`, for example `cache_state_unavailable`, `section_size_changed`,
+`section_capacity_exceeded`, or `section_virtual_address_changed`.
+
+Cargo decides whether to rerun build scripts or recompile crates from its own
+fingerprints before the final linker starts. Peony can skip or patch the final
+link once `rustc` invokes it, but it cannot make Cargo treat a dirty crate as
+clean. If a retry rebuilds more than expected, inspect Cargo's dirty reasons
+first, for example with:
+
+```sh
+CARGO_LOG=cargo::core::compiler::fingerprint=trace cargo test -p your-crate
+```
 
 ## Testing
 

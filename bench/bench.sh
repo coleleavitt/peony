@@ -3,7 +3,8 @@
 #
 # Methodology (see bench/BENCHMARKING.md for the why):
 #   1. CORRECTNESS GATE FIRST. Every linker links the corpus; the output binary
-#      must run and produce identical stdout/exit to the reference (lld) link.
+#      must run with the corpus' REFERENCE.run argv and produce identical
+#      stdout/exit to the reference (lld) link.
 #      A linker that fails the gate is EXCLUDED from timing — a fast wrong linker
 #      is worthless.
 #   2. Isolate the link step. We replay a frozen `cc @link.args` (see capture.sh);
@@ -76,6 +77,20 @@ thread_flag() { # $1=linker
   esac
 }
 
+load_run_args() { # $1=corpus dir
+  local cdir="$1"
+  RUN_ARGS=()
+  [ -f "$cdir/REFERENCE.run" ] || return 0
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ""|\#*) continue ;;
+      inputs/*) RUN_ARGS+=("$cdir/$line") ;;
+      *) RUN_ARGS+=("$line") ;;
+    esac
+  done < "$cdir/REFERENCE.run"
+}
+
 governor_note() {
   local g; g="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
   echo "$g"
@@ -94,9 +109,16 @@ run_corpus() {
   for a in "${ARGS[@]}"; do
     case "$a" in inputs/*) A+=("$cdir/$a") ;; *) A+=("$a") ;; esac
   done
+  local RUN_ARGS=()
+  load_run_args "$cdir"
 
   # --- Correctness gate: link with each linker, run, compare to lld reference --
   echo "── correctness gate ──"
+  if [ ${#RUN_ARGS[@]} -gt 0 ]; then
+    printf "  run argv:"
+    printf " %q" "${RUN_ARGS[@]}"
+    printf "\n"
+  fi
   local ref_out="" ref_rc="" gate_ok=()
   for L in "${linkers[@]}"; do
     local bin="$shm/out.$cname.$L"; local tf; tf="$(thread_flag "$L")"
@@ -107,7 +129,7 @@ run_corpus() {
     if [ "$link_rc" = 0 ]; then
       # /dev/shm is often noexec; copy to an exec-capable dir to actually run.
       local rbin="$execdir/out.$cname.$L"; cp -f "$bin" "$rbin"; chmod +x "$rbin"
-      out="$("$rbin" 2>/dev/null)"; rc=$?
+      out="$("$rbin" "${RUN_ARGS[@]}" 2>/dev/null)"; rc=$?
       set -e
       printf "  %-6s link=ok run_rc=%s\n" "$L" "$rc"
       gate_ok+=("$L"); eval "G_${L}_out=\$out"; eval "G_${L}_rc=\$rc"

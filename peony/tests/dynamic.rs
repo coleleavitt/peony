@@ -28,6 +28,91 @@ fn dynamic_data_import() {
     assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
 }
 
+#[test]
+fn as_needed_omits_unused_shared_library() {
+    let dir = workdir("as_needed_unused");
+    compile_shared(&dir, "unused", "int unused(void) { return 7; }\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(&exe, &[m], &["-L", dir_str, "--as-needed", "-l", "unused"]);
+    let d = readelf(&exe, &["-d"]);
+    assert!(
+        !d.contains("libunused.so"),
+        "--as-needed should suppress unused DT_NEEDED:\n{d}"
+    );
+    assert_eq!(run(&exe), 42);
+}
+
+#[test]
+fn no_as_needed_retains_unused_shared_library() {
+    let dir = workdir("no_as_needed_unused");
+    compile_shared(&dir, "unused", "int unused(void) { return 7; }\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(
+        &exe,
+        &[m],
+        &["-L", dir_str, "--no-as-needed", "-l", "unused"],
+    );
+    let d = readelf(&exe, &["-d"]);
+    assert!(
+        d.contains("libunused.so"),
+        "--no-as-needed should retain unused DT_NEEDED:\n{d}"
+    );
+}
+
+#[test]
+fn rpath_emits_runpath_and_is_used_by_loader() {
+    let dir = workdir("rpath_runpath");
+    compile_shared(&dir, "rp", "int get_answer(void) { return 42; }\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n call get_answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(&exe, &[m], &["-L", dir_str, "-rpath", dir_str, "-l", "rp"]);
+    let d = readelf(&exe, &["-d"]);
+    assert!(
+        d.contains("RUNPATH") && d.contains(dir_str),
+        "missing DT_RUNPATH:\n{d}"
+    );
+    assert_eq!(run(&exe), 42);
+}
+
+#[test]
+fn dynamic_linker_sets_program_interpreter() {
+    let dir = workdir("dynamic_linker");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    link(
+        &exe,
+        &[m],
+        &["-dynamic-linker", "/lib64/ld-linux-x86-64.so.2"],
+    );
+    let phdrs = readelf(&exe, &["-lW"]);
+    assert!(
+        phdrs.contains("/lib64/ld-linux-x86-64.so.2"),
+        "missing custom PT_INTERP:\n{phdrs}"
+    );
+    assert_eq!(run(&exe), 42);
+}
+
 /// A direct reference to DSO data uses executable-owned copy storage plus
 /// `R_X86_64_COPY`, not a GOT `GLOB_DAT` import.
 #[test]
@@ -75,6 +160,65 @@ fn dynamic_function_import() {
     let dir_str = dir.to_str().unwrap();
     link(&exe, &[m], &["-L", dir_str, "-l", "bar"]);
     assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn hash_style_sysv_omits_gnu_hash() {
+    let dir = workdir("hash_sysv");
+    compile_shared(&dir, "hashsysv", "int get_answer(void){ return 42; }\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n call get_answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(
+        &exe,
+        &[m],
+        &["-L", dir_str, "--hash-style=sysv", "-l", "hashsysv"],
+    );
+    let d = readelf(&exe, &["-d"]);
+    assert!(d.contains("(HASH)"), "missing DT_HASH:\n{d}");
+    assert!(!d.contains("GNU_HASH"), "unexpected DT_GNU_HASH:\n{d}");
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn hash_style_gnu_omits_sysv_hash_for_import_only_executable() {
+    let dir = workdir("hash_gnu");
+    compile_shared(&dir, "hashgnu", "int get_answer(void){ return 42; }\n");
+    let m = assemble(
+        &dir,
+        "m",
+        ".text\n.globl _start\n_start:\n call get_answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let exe = dir.join("a.out");
+    let dir_str = dir.to_str().unwrap();
+    link(
+        &exe,
+        &[m],
+        &["-L", dir_str, "--hash-style=gnu", "-l", "hashgnu"],
+    );
+    let d = readelf(&exe, &["-d"]);
+    assert!(d.contains("GNU_HASH"), "missing DT_GNU_HASH:\n{d}");
+    assert!(!d.contains("(HASH)"), "unexpected DT_HASH:\n{d}");
+    assert_eq!(run_env(&exe, &[("LD_LIBRARY_PATH", dir_str)]), 42);
+}
+
+#[test]
+fn no_undefined_rejects_shared_object_undefineds() {
+    let dir = workdir("shared_no_undefined");
+    let o = assemble(
+        &dir,
+        "missing",
+        ".text\n.globl call_missing\ncall_missing:\n call missing@PLT\n ret\n",
+    );
+    let so = dir.join("libmissing.so");
+    let out = link_raw(&so, &[o], &["-shared", "--no-undefined"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing"), "stderr was {stderr}");
 }
 
 #[test]

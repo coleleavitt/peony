@@ -16,6 +16,8 @@
 #   bench/capture.sh cxx        <name>  <main.cpp> [extra c++ args...]
 #
 # Result: bench/corpora/<name>/{link.args, inputs/, meta.json, REFERENCE.run}
+# `REFERENCE.run` is one runtime argument per line. Blank lines and `#` comments
+# are ignored by bench.sh; edit it after capture for corpus-specific checks.
 set -Eeuo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,6 +117,10 @@ for a in "${raw[@]}"; do
 done
 
 printf '%s\n' "${out[@]}" > "$dest/link.args"
+cat > "$dest/REFERENCE.run" <<'EOF'
+# Runtime arguments for the benchmark correctness gate, one argv item per line.
+# Empty/comment-only means "run the linked binary with no arguments".
+EOF
 # The compiler driver used for the final link; the harness must replay through
 # the same one so driver-injected libs (-lstdc++, crt objects) match.
 case "$mode" in cxx) echo c++ ;; *) echo cc ;; esac > "$dest/driver"

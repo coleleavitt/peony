@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::process::Command;
+
 use common::*;
 
 /// Freestanding `exit(42)` — no relocations. Validates header/segment/entry.
@@ -111,6 +113,147 @@ fn static_archive() {
     let ar = archive(&dir, "libstuff", &[used, unused]);
     let exe = dir.join("a.out");
     link(&exe, &[main, ar], &[]);
+    assert_eq!(run(&exe), 42);
+}
+
+#[test]
+fn whole_archive_includes_unreferenced_members() {
+    let dir = workdir("whole_archive");
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n call answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let used = assemble(
+        &dir,
+        "used",
+        ".text\n.globl answer\nanswer:\n movl $42,%eax\n ret\n",
+    );
+    let unused = assemble(
+        &dir,
+        "unused",
+        ".text\n.globl never\nnever:\n movl $7,%eax\n ret\n",
+    );
+    let ar = archive(&dir, "libwhole", &[used, unused]);
+    let exe = dir.join("a.out");
+    let out = Command::new(PEONY)
+        .arg("-o")
+        .arg(&exe)
+        .arg(&main)
+        .arg("--whole-archive")
+        .arg(&ar)
+        .arg("--no-whole-archive")
+        .output()
+        .expect("run peony");
+    assert!(
+        out.status.success(),
+        "peony link failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(run(&exe), 42);
+    let syms = readelf(&exe, &["-sW"]);
+    assert!(
+        syms.contains("never"),
+        "--whole-archive should include unreferenced member:\n{syms}"
+    );
+}
+
+#[test]
+fn start_lib_members_are_lazy_objects() {
+    let dir = workdir("start_lib");
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n call answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let used = assemble(
+        &dir,
+        "used",
+        ".text\n.globl answer\nanswer:\n movl $42,%eax\n ret\n",
+    );
+    let unused = assemble(
+        &dir,
+        "unused",
+        ".text\n.globl never\nnever:\n movl $7,%eax\n ret\n",
+    );
+    let exe = dir.join("a.out");
+    let out = Command::new(PEONY)
+        .arg("-o")
+        .arg(&exe)
+        .arg(&main)
+        .arg("--start-lib")
+        .arg(&used)
+        .arg(&unused)
+        .arg("--end-lib")
+        .output()
+        .expect("run peony");
+    assert!(
+        out.status.success(),
+        "peony link failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(run(&exe), 42);
+    let syms = readelf(&exe, &["-sW"]);
+    assert!(
+        !syms.contains("never"),
+        "--start-lib should not include unreferenced object:\n{syms}"
+    );
+}
+
+#[test]
+fn require_defined_pulls_archive_member() {
+    let dir = workdir("require_defined");
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n movl $42,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let forced = assemble(&dir, "forced", ".text\n.globl forced\nforced:\n ret\n");
+    let ar = archive(&dir, "libforced", &[forced]);
+    let exe = dir.join("a.out");
+    link(&exe, &[main, ar], &["--require-defined", "forced"]);
+    assert_eq!(run(&exe), 42);
+    let syms = readelf(&exe, &["-sW"]);
+    assert!(
+        syms.contains("forced"),
+        "--require-defined should seed archive pull:\n{syms}"
+    );
+}
+
+#[test]
+fn relocatable_handoff_produces_linkable_object() {
+    let dir = workdir("relocatable_handoff");
+    let main = assemble(
+        &dir,
+        "main",
+        ".text\n.globl _start\n_start:\n call answer@PLT\n movl %eax,%edi\n movl $60,%eax\n syscall\n",
+    );
+    let used = assemble(
+        &dir,
+        "used",
+        ".text\n.globl answer\nanswer:\n movl $42,%eax\n ret\n",
+    );
+    let combined = dir.join("combined.o");
+    let out = Command::new(PEONY)
+        .args(["-r", "-o"])
+        .arg(&combined)
+        .arg(&main)
+        .arg(&used)
+        .output()
+        .expect("run peony -r");
+    assert!(
+        out.status.success(),
+        "peony -r failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hdr = readelf(&combined, &["-h"]);
+    assert!(
+        hdr.contains("REL (Relocatable file)"),
+        "-r output should be ET_REL:\n{hdr}"
+    );
+
+    let exe = dir.join("a.out");
+    link(&exe, &[combined], &[]);
     assert_eq!(run(&exe), 42);
 }
 

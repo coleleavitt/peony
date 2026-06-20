@@ -23,10 +23,11 @@ Results land in `bench/results/<corpus>.{json,md}`.
 ## The cardinal rules
 
 1. **Correctness before speed, always.** `bench.sh` first links the corpus with
-   every linker, runs the output binary, and compares stdout+exit to an lld
-   reference. A linker whose output differs is **excluded from timing** — a fast
-   wrong linker is worthless. Never quote a speed number for a link you did not
-   first prove correct.
+   every linker, runs the output binary with the corpus-specific
+   `REFERENCE.run` argv, and compares stdout+exit to an lld reference. A linker
+   whose output differs is **excluded from timing** — a fast wrong linker is
+   worthless. Never quote a speed number for a link you did not first prove
+   correct.
 
 2. **Measure the link step, not the build.** `capture.sh` freezes the exact
    `cc`-level argv of a real final link (the `.o`/`.rlib`/`.a` set + flags) so
@@ -54,12 +55,16 @@ Results land in `bench/results/<corpus>.{json,md}`.
   make that warning fatal for publishable Peony-vs-mold numbers.
 - Pin cores: `bench/bench.sh --pin 0-7` wraps each link in `taskset -c 0-7`.
 - Normalize thread count: `bench/bench.sh --threads 8` passes `--threads`/
-  `-Wl,--threads=` to each linker that supports it.
+  `-Wl,--threads=` to each linker that supports it. For Peony, `--threads 0`
+  means auto-tuned default, not necessarily all cores.
 - Close other workloads; run on AC power.
 
 ## What the numbers mean (current honest baseline)
 
-Measured on a 24-core machine, warm cache, plugin-stripped, identical flags.
+Historical committed baselines were measured on a 24-core machine, warm cache,
+plugin-stripped, identical flags. Re-run the harness on a `performance` governor
+before quoting fresh numbers; Peony's current `--threads 0` is auto-tuned, so
+older labels that said "0=all" should be read as "auto".
 peony is built `--release`. These are **honest** numbers — peony links every
 corpus itself (no fallback to bfd).
 
@@ -132,18 +137,20 @@ peony --incremental <args> -o out   # first call links + caches
 peony --incremental <args> -o out   # unchanged inputs → ~instant reuse
 ```
 
-**Edit-one-object relink (in progress):** currently this falls back to a full
-link (~36 ms, ~3.8× behind mold's 9.5 ms). The capacity-stable in-place patch
-that wins this case is proven in `rocq-tests/IncrementalCostBound.v`
-(`incremental_beats_fromscratch`: a single-file edit touches 1 section, not n)
-and is the next increment — the from-scratch wall-clock gap is a constant
-factor, but the incremental gap is asymptotic and is the design's real edge.
+**Edit-one-object relink (not wired yet):** currently this falls back to a full
+link. The manifest records cheap input/output fingerprints plus section and
+symbol records, but output-section capacity still equals size and the driver
+does not yet patch only red sections. The capacity-stable in-place patch that
+wins this case is proven in `rocq-tests/IncrementalCostBound.v`
+(`incremental_beats_fromscratch`: a single-file edit touches 1 section, not n);
+until that lands, quote only the no-change reuse path as implemented.
 
 ## Continuous benchmarking (CI)
 
-`bench/criterion/` holds criterion micro-benchmarks of the internal hot paths
-(symbol resolution, GC BFS, relocation apply). They run under
-`cargo bench -p peony-bench` locally and under `cargo codspeed` in CI
+`peony-bench/benches/hot_paths.rs` holds criterion micro-benchmarks of internal
+hot paths: symbol hashing/table operations, GC BFS, relocation scanning,
+relocation reverse-index construction, and red/green cache coloring. They run
+under `cargo bench -p peony-bench` locally and under `cargo codspeed` in CI
 (`.github/workflows/bench.yml`) so regressions are caught per-PR. End-to-end
 wall-clock (this harness) is the source of truth; the criterion benches localize
 *where* a regression came from.

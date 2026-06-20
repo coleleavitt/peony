@@ -113,6 +113,60 @@ fn linker_defined_symbols() {
     assert!(syms.contains("_end"), "_end should appear in .symtab");
 }
 
+/// Common linker-defined symbols have sensible final addresses, not just names.
+#[test]
+fn linker_defined_symbol_addresses() {
+    let dir = workdir("lds_addr");
+    let o = assemble(
+        &dir,
+        "lds_addr",
+        "
+        .text
+        .globl _start
+    _start:
+        leaq __executable_start(%rip), %rax
+        leaq __ehdr_start(%rip), %rbx
+        cmpq %rbx, %rax
+        jne 1f
+        leaq __bss_start(%rip), %rcx
+        leaq _edata(%rip), %rdx
+        cmpq %rdx, %rcx          # __bss_start >= _edata
+        jb 1f
+        leaq _end(%rip), %r8
+        cmpq %rcx, %r8           # _end > __bss_start once .bss is present
+        jbe 1f
+        movl $42, %edi
+        jmp 2f
+    1:
+        movl $1, %edi
+    2:
+        movl $60, %eax
+        syscall
+        .data
+    payload:
+        .quad 7
+        .bss
+        .balign 8
+    buf:
+        .skip 16
+    ",
+    );
+    let exe = dir.join("a.out");
+    link(&exe, &[o], &[]);
+    assert_eq!(run(&exe), 42);
+
+    let syms = readelf(&exe, &["-s"]);
+    for name in [
+        "__executable_start",
+        "__ehdr_start",
+        "__bss_start",
+        "_edata",
+        "_end",
+    ] {
+        assert!(syms.contains(name), "{name} should appear in .symtab");
+    }
+}
+
 /// `--defsym SYM=VALUE`.
 #[test]
 fn defsym() {

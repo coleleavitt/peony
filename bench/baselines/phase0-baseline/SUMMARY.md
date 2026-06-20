@@ -19,7 +19,7 @@ other                 481.8us    4.7%  (startup/teardown/untimed)
 TOTAL                 10.31ms
 ───────────────────────────────────────────────────────────
 ```
-### --stats @ threads=24 (0=all)
+### --stats @ threads=auto (0=auto, host cores=24)
 ```
 phase                    wall       %         bytes      items
 resolve-inputs         8.37ms   60.2%           0B          0
@@ -49,7 +49,7 @@ other                 593.4us    3.5%  (startup/teardown/untimed)
 TOTAL                 17.17ms
 ───────────────────────────────────────────────────────────
 ```
-### --stats @ threads=24 (0=all)
+### --stats @ threads=auto (0=auto, host cores=24)
 ```
 phase                    wall       %         bytes      items
 resolve-inputs         7.75ms   48.0%           0B          0
@@ -79,7 +79,7 @@ other                 34.33ms   16.5%  (startup/teardown/untimed)
 TOTAL                207.69ms
 ───────────────────────────────────────────────────────────
 ```
-### --stats @ threads=24 (0=all)
+### --stats @ threads=auto (0=auto, host cores=24)
 ```
 phase                    wall       %         bytes      items
 resolve-inputs        12.98ms    7.5%           0B          0
@@ -109,7 +109,7 @@ other                  2.41ms    4.8%  (startup/teardown/untimed)
 TOTAL                 50.17ms
 ───────────────────────────────────────────────────────────
 ```
-### --stats @ threads=24 (0=all)
+### --stats @ threads=auto (0=auto, host cores=24)
 ```
 phase                    wall       %         bytes      items
 resolve-inputs         7.66ms   16.9%           0B          0
@@ -121,4 +121,3 @@ other                  2.31ms    5.1%  (startup/teardown/untimed)
 TOTAL                 45.45ms
 ───────────────────────────────────────────────────────────
 ```
-
