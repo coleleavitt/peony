@@ -1,11 +1,27 @@
 # Incremental Front-End — Sub-5ms One-File Relink (Executable Blueprint)
 
-Status: Phase 0 + 2 + 3-4 + 5 LANDED (layout reuse + parse-only-changed +
-object-granular/minimal emit + record fast-path; byte-identical, thread-stable).
-A one-`.o` size-stable relink is now **~19ms vs a full link ~32ms** on the
-402-obj harness — a ~38% win, down from the ~73ms NET LOSS we started with. Goal
-remains a <5ms relink (10× vs mold's ~37ms-every-link). **Every phase MUST keep
-the output byte-identical to a full link** (the non-negotiable gate).
+Status: Phases 0 + 2 + 3-4 + 5 + **resident daemon** LANDED. A one-`.o`
+size-stable relink:
+- one-shot CLI: **~19ms** vs a full link ~32ms (402-obj harness);
+- **resident daemon: ~3.3–4ms warm in-RAM** (~0.24ms on a 2-obj link) — **the
+  <5ms / 10× thesis, ACHIEVED** (vs mold's ~37ms-every-link).
+
+Down from the ~73ms NET LOSS we started with. **Every path keeps the output
+byte-identical to a full link** (the non-negotiable gate, verified across all
+phases + an adversarial sweep).
+
+> **The daemon (`peony --daemon`) is what breaks the one-shot floor.** It loads
+> the expensive state — deserialized `Layout`, cached symbol view, input list +
+> per-object digests — into RAM ONCE and serves relinks over a Unix socket
+> (`app.incr/daemon.sock`); a normal `peony --incremental` client delegates to a
+> live daemon (`daemon::try_delegate`) and exits, else runs the one-shot path. A
+> daemon relink reuses the SAME `emit_parse_only_changed` core, with layout +
+> symbols sourced from RAM instead of disk — so it skips the per-relink
+> library-search + ~MB deserialize + 16k-symbol view rebuild, leaving only
+> re-parse-changed + emit. This is exactly the "deserialize ≈ recompute → needs a
+> resident daemon" conclusion, now realized. Limits: requires a prior
+> `--incremental` seed link; one output per socket; a layout-changing edit falls
+> the client back to a one-shot full link (daemon reloads via `layout.bin` mtime).
 
 > **THE load-bearing finding (2026-06-21, measured): for a one-shot CLI,
 > persisting + deserializing front-end state costs ≈ recomputing it.** Layout
