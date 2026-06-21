@@ -4,11 +4,11 @@ A fast, **incremental** ELF linker for x86-64 Linux, written in Rust. Drop-in
 compatible with the `ld`/`cc` command line, so it can be the final linker for
 `rustc`- and `gcc`-based toolchains.
 
-**The thesis.** You edit one file and rebuild a thousand times a day — but every
+**My thesis.** You edit one file and rebuild a thousand times a day but every
 linker relinks the whole program from scratch, every time (mold and lld are
 fast, but they still redo all of it). peony doesn't. A one-file change relinks in
-**~19 ms** one-shot, or **~3–4 ms** with a resident daemon — versus a ~32 ms full
-link — and the result is **byte-for-byte identical to a full link**, every time.
+**~19 ms** one-shot, or **~3–4 ms** with a resident daemon, versus a ~32 ms full
+link and the result is **byte-for-byte identical to a full link**, every time.
 
 ## How
 
@@ -20,7 +20,7 @@ A relink does work proportional to what *changed*, not to the size of the progra
 | one file | re-parse only that `.o`, reuse the cached layout + symbol table, patch its bytes in place | **~19 ms** |
 | + daemon | keep the layout + symbols resident in RAM | **~3–4 ms** |
 
-The fast path is taken only when peony can *prove* the output is identical — same
+The fast path is taken only when peony can *prove* the output is identical, same
 sizes, same symbols, same GOT/PLT/TLS demand, no `--gc-sections`/`--icf`, no
 archive change. Anything else falls back to a full link. **peony never serves
 stale bytes**; that is the one rule everything else bends to.
@@ -29,9 +29,7 @@ Incremental is on by default. For the daemon, `export PEONY_DAEMON=1` and peony
 spawns and reuses one automatically.
 
 ## Proofs
-
-The edit–rebuild claim isn't only measured — it's *proved*. `rocq-tests/` holds
-machine-checked Rocq/Coq proofs (`make` is the oracle; zero axioms beyond
+`rocq-tests/` holds machine-checked Rocq/Coq proofs (`make` is the oracle; zero axioms beyond
 functional extensionality). A few of the load-bearing ones:
 
 **Byte-identity.** A "green" (unchanged) section renders byte-for-byte the same,
@@ -97,19 +95,6 @@ PEONY_DAEMON=1 cargo build           # sub-5 ms relinks, automatically
 ```
 
 Point `rustc` at it with `-C linker=/path/to/peony -C linker-flavor=ld`.
-
-peony is a real linker, not a toy: PIE and shared objects, TLS (GD/LD/IE),
-GOT/PLT/IFUNC, dynamic relocations, `--gc-sections`, COMDAT dedup, ICF, version
-scripts, native `-r` partial linking, and build-ids. `peony --help` lists the
-flags; `peony --stats` / `--trace` profile a link from the inside;
-[`bench/BENCHMARKING.md`](bench/BENCHMARKING.md) has the correctness-gated
-numbers. LTO/bitcode objects (and `-r` with COMDAT) are handed to GNU `ld`.
-
-## Crates
-
-`peony` (driver) · `peony-object` (parse) · `peony-symbols` (resolve) ·
-`peony-layout` (layout / GC / TLS) · `peony-reloc` (relocations) ·
-`peony-emit` (serialize) · `peony-cache` (incremental).
 
 ## License
 
