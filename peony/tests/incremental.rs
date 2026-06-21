@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{PEONY, run, workdir};
+use common::{PEONY, cc_file, run, workdir};
 
 /// A freestanding `_start` that calls `compute()` and exits with its return
 /// value — no libc, so the link is small, deterministic, and self-contained.
@@ -201,6 +201,86 @@ fn parse_only_changed_applies_relocs_from_cache() {
         "reloc-bearing changed object: incremental output must equal a full link"
     );
     assert_eq!(run(&app), 84, "relinked: 77 + helper()=7");
+}
+
+/// The changed object calls a libc function — a `PLT32` (and `GOTPCREL`)
+/// relocation to an IMPORTED symbol, the most common real edit. The parse-only
+/// path re-applies it from the cached `plt_address`/`got_address` with the
+/// fabricated `import=false` resolution; this locks in that those fields are
+/// dead for the whitelisted relocs (the subtle soundness the adversarial audit
+/// confirmed). Skips gracefully if the toolchain crt/libc is unavailable.
+#[test]
+fn parse_only_changed_import_plt_byte_identical() {
+    let dir = workdir("inc-import");
+    let crt1 = cc_file("crt1.o");
+    let crti = cc_file("crti.o");
+    let crtn = cc_file("crtn.o");
+    let Some(libcdir) = cc_file("libc.so").parent().map(Path::to_path_buf) else {
+        eprintln!("skipping: libc.so unavailable");
+        return;
+    };
+    if !crt1.exists() {
+        eprintln!("skipping: toolchain crt unavailable");
+        return;
+    }
+
+    let compile = |body: &str| {
+        let c = dir.join("app.c");
+        std::fs::write(&c, body).unwrap();
+        let st = Command::new("cc")
+            .args(["-c", "-fno-pic", "-o"])
+            .arg(dir.join("app.o"))
+            .arg(&c)
+            .status()
+            .expect("cc -c");
+        assert!(st.success(), "compiling app.c failed");
+    };
+    let link = |out: &Path, incr: bool| -> (bool, String) {
+        let mut cmd = Command::new(PEONY);
+        cmd.arg("-o").arg(out);
+        if incr {
+            cmd.arg("--incremental");
+        }
+        cmd.arg(&crt1)
+            .arg(&crti)
+            .arg(dir.join("app.o"))
+            .arg(&crtn)
+            .args(["-L", libcdir.to_str().unwrap(), "-l", "c"]);
+        let o = cmd
+            .env("PEONY_LOG", "peony=info")
+            .output()
+            .expect("run peony");
+        (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).into(),
+        )
+    };
+
+    let app = dir.join("app");
+    // Seed: main calls putchar (an imported libc function) → PLT32 import reloc.
+    compile("#include <stdio.h>\nint main(void){ putchar('A'); return 42; }\n");
+    let (ok, _) = link(&app, true);
+    assert!(ok, "seed link failed");
+    assert_eq!(run(&app), 42, "seed exit 42");
+
+    // Size-stable edit: same putchar call, different return constant.
+    compile("#include <stdio.h>\nint main(void){ putchar('A'); return 77; }\n");
+    let (ok, stderr) = link(&app, true);
+    assert!(ok, "incremental relink failed");
+    assert!(
+        took_fast_path(&stderr),
+        "expected a fast path; stderr:\n{stderr}"
+    );
+
+    let full = dir.join("full");
+    let (ok, _) = link(&full, false);
+    assert!(ok, "full link failed");
+    assert_eq!(
+        std::fs::read(&app).unwrap(),
+        std::fs::read(&full).unwrap(),
+        "import-PLT changed object: incremental output must equal a full link"
+    );
+    assert_eq!(run(&app), 77, "relinked exit 77");
 }
 
 /// Alternating size-stable relinks stay byte-identical across many iterations
