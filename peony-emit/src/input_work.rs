@@ -78,23 +78,26 @@ pub(crate) fn collect_input_work_items<'a>(
     layout
         .output_sections
         .iter()
-        .filter(|sec| sec.source == SecSource::Input && filter.writes_input_section(&sec.name))
+        .filter(|sec| sec.source == SecSource::Input && filter.collects_output_section(&sec.name))
         .flat_map(|sec| {
-            sec.contributions.iter().filter_map(move |c| {
-                let obj = objects.get(c.object_id)?;
-                let isec = obj.sections.get(c.section_pos)?;
-                let file_off = usize::try_from(sec.sh_offset.saturating_add(c.offset)).ok()?;
-                Some(WorkItem {
-                    file_off,
-                    file_len: isec.data.len(),
-                    section_va: sec.sh_addr.saturating_add(c.offset),
-                    obj,
-                    isec,
-                    obj_id: c.object_id,
-                    input_section_index: c.section_index,
-                    reloc_count: isec.relocs.len(),
+            sec.contributions
+                .iter()
+                .filter(|c| filter.writes_contribution(c.object_id))
+                .filter_map(move |c| {
+                    let obj = objects.get(c.object_id)?;
+                    let isec = obj.sections.get(c.section_pos)?;
+                    let file_off = usize::try_from(sec.sh_offset.saturating_add(c.offset)).ok()?;
+                    Some(WorkItem {
+                        file_off,
+                        file_len: isec.data.len(),
+                        section_va: sec.sh_addr.saturating_add(c.offset),
+                        obj,
+                        isec,
+                        obj_id: c.object_id,
+                        input_section_index: c.section_index,
+                        reloc_count: isec.relocs.len(),
+                    })
                 })
-            })
         })
         .collect()
 }

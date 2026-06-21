@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
-use peony_emit::{EmitConfig, emit_full, emit_partial};
+use peony_emit::{EmitConfig, emit_full, emit_partial, emit_partial_objects};
 use peony_layout::{
     LayoutConfig,
     ScriptLayout,
@@ -542,6 +542,7 @@ fn main() -> Result<()> {
     // full layout, so reuse is only taken when provably pure.
     let fe_eligible = args.incremental && !args.gc_sections && !args.icf;
     let mut reused_snapshot: Option<peony_cache::FrontEndSnapshot> = None;
+    let mut reused_changed_objects: Option<FxHashSet<usize>> = None;
     let mut layout_reused = false;
     let mut layout = match try_reuse_layout(
         &args.output,
@@ -558,10 +559,11 @@ fn main() -> Result<()> {
         &tls_got,
         fold_map.as_ref(),
     ) {
-        Some((cached_layout, snapshot)) => {
+        Some((cached_layout, snapshot, changed_objects)) => {
             tracing::info!("incremental: reusing cached layout (drivers match)");
             peony_prof::count("layout_reused", 1);
             reused_snapshot = Some(snapshot);
+            reused_changed_objects = Some(changed_objects);
             layout_reused = true;
             cached_layout
         }
@@ -709,18 +711,36 @@ fn main() -> Result<()> {
             green = plan.green_count(),
             "incremental red/green patch plan accepted"
         );
-        emitted = emit_partial(
-            &args.output,
-            &arena,
-            &objects,
-            &symbols,
-            &layout,
-            &emit_config,
-            plan.red_sections(),
-        )
-        .context("incremental patch emission failed")?;
+        emitted = if let Some(changed) = &reused_changed_objects {
+            // Layout was reused: a drivers match proves every address, synthetic
+            // section, header, and unchanged object's bytes are byte-identical to
+            // the prior link on disk, so patch ONLY the changed objects'
+            // contributions (object-granular, not all of reddened `.text`).
+            let changed_std: HashSet<usize> = changed.iter().copied().collect();
+            emit_partial_objects(
+                &args.output,
+                &arena,
+                &objects,
+                &symbols,
+                &layout,
+                &emit_config,
+                &changed_std,
+            )
+            .context("incremental object-patch emission failed")?
+        } else {
+            emit_partial(
+                &args.output,
+                &arena,
+                &objects,
+                &symbols,
+                &layout,
+                &emit_config,
+                plan.red_sections(),
+            )
+            .context("incremental patch emission failed")?
+        };
         if emitted {
-            tracing::info!("incremental red/green patch emitted");
+            tracing::info!(layout_reused, "incremental patch emitted");
             cache_report.record(&args.output, CacheOutcome::PartialRelink { plan })?;
         }
     }
@@ -837,7 +857,11 @@ fn try_reuse_layout(
     config: &LayoutConfig,
     tls_got: &peony_layout::TlsGotInfo,
     fold_map: Option<&peony_layout::icf::FoldMap>,
-) -> Option<(peony_layout::Layout, peony_cache::FrontEndSnapshot)> {
+) -> Option<(
+    peony_layout::Layout,
+    peony_cache::FrontEndSnapshot,
+    FxHashSet<usize>,
+)> {
     if !eligible {
         return None;
     }
@@ -917,8 +941,9 @@ fn try_reuse_layout(
     };
     // The drivers matched, so the cached snapshot is still valid for the NEXT
     // relink — hand it back so recording persists the small manifest verbatim
-    // and skips rewriting `layout.bin` entirely.
-    Some((layout, cached.front_end.unwrap()))
+    // and skips rewriting `layout.bin` entirely. `changed_object_ids` drives the
+    // object-granular fast emit (only these objects' bytes need rewriting).
+    Some((layout, cached.front_end.unwrap(), changed_object_ids))
 }
 
 /// Build the persisted front-end snapshot for the next relink, or `None` when

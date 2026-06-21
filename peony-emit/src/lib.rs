@@ -55,14 +55,39 @@ pub type Result<T> = std::result::Result<T, EmitError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SectionWriteFilter<'a> {
     All,
+    /// Re-emit only input sections in these (red) OUTPUT sections, by name.
     RedOnly(&'a HashSet<String>),
+    /// Re-emit only the input-section contributions from these object ids —
+    /// the layout-reuse fast path, where a drivers-hash match proves every
+    /// address and synthetic section is byte-identical, so only the changed
+    /// object's bytes need rewriting (overwrite-in-place preserves the rest).
+    ChangedObjects(&'a HashSet<usize>),
 }
 
 impl SectionWriteFilter<'_> {
-    pub(crate) fn writes_input_section(self, name: &str) -> bool {
+    /// Whether the work-item collector should descend into this output section.
+    pub(crate) fn collects_output_section(self, name: &str) -> bool {
+        match self {
+            SectionWriteFilter::All | SectionWriteFilter::ChangedObjects(_) => true,
+            SectionWriteFilter::RedOnly(red) => red.contains(name),
+        }
+    }
+
+    /// Whether one input contribution (by defining object id) is re-emitted.
+    pub(crate) fn writes_contribution(self, object_id: usize) -> bool {
+        match self {
+            SectionWriteFilter::All | SectionWriteFilter::RedOnly(_) => true,
+            SectionWriteFilter::ChangedObjects(objs) => objs.contains(&object_id),
+        }
+    }
+
+    /// Whether to re-zero the inter-contribution padding of this output section.
+    /// Skipped for `ChangedObjects` (size-stable reuse → gaps already correct).
+    pub(crate) fn zeroes_gaps(self, name: &str) -> bool {
         match self {
             SectionWriteFilter::All => true,
             SectionWriteFilter::RedOnly(red) => red.contains(name),
+            SectionWriteFilter::ChangedObjects(_) => false,
         }
     }
 }
@@ -129,6 +154,34 @@ pub fn emit_partial(
         layout,
         config,
         SectionWriteFilter::RedOnly(red_sections),
+        true,
+    )
+}
+
+/// Patch only the contributions of `changed_objects` into an existing output,
+/// for the layout-reuse fast path. The cached layout was reused, so every
+/// address, synthetic section, header, and unchanged object's bytes are
+/// byte-identical to the prior link already on disk — only the changed object's
+/// input sections (and the build-id / `.eh_frame_hdr` derived from the final
+/// image) need rewriting. Returns `false` (→ caller falls back to a full emit)
+/// if the output is missing or not already at `layout.file_size`.
+pub fn emit_partial_objects(
+    output_path: &Path,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    config: &EmitConfig,
+    changed_objects: &HashSet<usize>,
+) -> Result<bool> {
+    emit_with_filter(
+        output_path,
+        arena,
+        objects,
+        symbols,
+        layout,
+        config,
+        SectionWriteFilter::ChangedObjects(changed_objects),
         true,
     )
 }

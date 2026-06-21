@@ -75,7 +75,7 @@ pub(crate) fn write_section_data_parallel(
     for sec in &layout.output_sections {
         match sec.source {
             SecSource::Input => {
-                if filter.writes_input_section(&sec.name) {
+                if filter.zeroes_gaps(&sec.name) {
                     zero_input_gaps(buf, sec.sh_offset, sec.sh_size, &sec.contributions);
                 }
             } // handled in phase 2
