@@ -2,7 +2,7 @@ use std::path::Path;
 
 use object::read::archive::{ArchiveFile, ArchiveOffset};
 
-use crate::{ObjectError, Result};
+use crate::{MappedInput, ObjectError, Result};
 
 /// A single member extracted from an `.rlib` / `.a` archive.
 pub struct ArchiveMember {
@@ -17,19 +17,21 @@ pub struct ArchiveMember {
 /// archive members, so byte-level comparison is required for incremental
 /// diffing.
 pub fn iter_archive_members(path: &Path) -> Result<Vec<ArchiveMember>> {
-    let data = read_archive(path)?;
-    let Some(file) = parse_archive(path, &data)? else {
+    let mapped = read_archive(path)?;
+    let data = mapped.bytes();
+    let Some(file) = parse_archive(path, data)? else {
         return Ok(Vec::new());
     };
-    archive_members(path, &data, &file)
+    archive_members(path, data, &file)
 }
 
 pub fn archive_defines_needed(
     path: &Path,
     mut is_needed: impl FnMut(&[u8]) -> bool,
 ) -> Result<Option<bool>> {
-    let data = read_archive(path)?;
-    let Some(file) = parse_archive(path, &data)? else {
+    let mapped = read_archive(path)?;
+    let data = mapped.bytes();
+    let Some(file) = parse_archive(path, data)? else {
         return Ok(None);
     };
     Ok(archive_matching_offsets(&file, &mut is_needed).map(|offsets| !offsets.is_empty()))
@@ -40,8 +42,9 @@ pub fn iter_archive_members_matching(
     mut is_needed: impl FnMut(&[u8]) -> bool,
     mut is_new_offset: impl FnMut(u64) -> bool,
 ) -> Result<Option<Vec<ArchiveMember>>> {
-    let data = read_archive(path)?;
-    let Some(file) = parse_archive(path, &data)? else {
+    let mapped = read_archive(path)?;
+    let data = mapped.bytes();
+    let Some(file) = parse_archive(path, data)? else {
         return Ok(Some(Vec::new()));
     };
     let Some(mut offsets) = archive_matching_offsets(&file, &mut is_needed) else {
@@ -58,15 +61,19 @@ pub fn iter_archive_members_matching(
         let member = file
             .member(ArchiveOffset(offset))
             .map_err(|source| archive_parse_error(path, source))?;
-        members.push(archive_member(path, &data, member, Some(offset))?);
+        members.push(archive_member(path, data, member, Some(offset))?);
     }
     Ok(Some(members))
 }
 
-fn read_archive(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|source| ObjectError::Io {
+/// Memory-map an archive rather than copying it onto the heap. A no-pull link
+/// only reads the symbol index (a few KB at the front); pulled-member data faults
+/// in lazily. Avoids `std::fs::read` copying every multi-MB `.a` (libc.a, libm.a,
+/// …) in full just to scan its index. The map outlives every member-byte copy.
+fn read_archive(path: &Path) -> Result<MappedInput> {
+    MappedInput::open(path).ok_or_else(|| ObjectError::Io {
         path: path.display().to_string(),
-        source,
+        source: std::io::Error::new(std::io::ErrorKind::Other, "could not memory-map archive"),
     })
 }
 

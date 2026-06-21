@@ -1,6 +1,7 @@
 use peony_layout::Layout;
 use peony_object::{Binding, InputObject};
 use peony_symbols::{SymbolId, SymbolTable};
+use rayon::prelude::*;
 
 use crate::{count_tls_relocs, r_x86_64};
 
@@ -12,6 +13,18 @@ pub struct DynamicRelocCounts {
     pub tls: usize,
 }
 
+impl std::ops::Add for DynamicRelocCounts {
+    type Output = Self;
+    fn add(self, b: Self) -> Self {
+        Self {
+            relative_total: self.relative_total + b.relative_total,
+            irelative: self.irelative + b.irelative,
+            symbolic_data: self.symbolic_data + b.symbolic_data,
+            tls: self.tls + b.tls,
+        }
+    }
+}
+
 pub fn count_dynamic_relocs(
     objects: &[InputObject],
     symbols: &SymbolTable,
@@ -19,8 +32,12 @@ pub fn count_dynamic_relocs(
     tls: &peony_layout::TlsGotInfo,
     shared: bool,
 ) -> DynamicRelocCounts {
-    let mut counts = DynamicRelocCounts::default();
-    for obj in objects {
+    // Per-object R64 counts are order-independent sums, so fold them across the
+    // pool on large links. Identical to the serial sum (used only to size
+    // `.rela.dyn`).
+    const PARALLEL_THRESHOLD: usize = 64;
+    let count_obj = |obj: &InputObject| -> DynamicRelocCounts {
+        let mut c = DynamicRelocCounts::default();
         for sec in &obj.sections {
             if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
                 continue;
@@ -34,8 +51,8 @@ pub fn count_dynamic_relocs(
                 };
                 if sym.binding == Binding::Local {
                     if sym.section.is_some() {
-                        counts.relative_total += 1;
-                        counts.irelative += usize::from(sym.is_ifunc);
+                        c.relative_total += 1;
+                        c.irelative += usize::from(sym.is_ifunc);
                     }
                     continue;
                 }
@@ -43,14 +60,26 @@ pub fn count_dynamic_relocs(
                     continue;
                 };
                 if res.import && !res.copy_reloc {
-                    counts.symbolic_data += 1;
+                    c.symbolic_data += 1;
                 } else if res.is_defined() {
-                    counts.relative_total += 1;
-                    counts.irelative += usize::from(!res.import && res.is_ifunc);
+                    c.relative_total += 1;
+                    c.irelative += usize::from(!res.import && res.is_ifunc);
                 }
             }
         }
-    }
+        c
+    };
+    let mut counts = if objects.len() >= PARALLEL_THRESHOLD {
+        objects
+            .par_iter()
+            .map(count_obj)
+            .reduce(DynamicRelocCounts::default, |a, b| a + b)
+    } else {
+        objects
+            .iter()
+            .map(count_obj)
+            .fold(DynamicRelocCounts::default(), |a, b| a + b)
+    };
 
     for id in got_syms {
         let Some(res) = symbols

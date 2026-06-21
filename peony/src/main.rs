@@ -1258,14 +1258,32 @@ fn load_and_resolve(inputs: &[ResolvedInput], forced_undefined: &[String]) -> Re
     }
 
     // ── Shared objects: their exports satisfy remaining undefined refs ────────
-    let mut needed = Vec::new();
-    for (input, _) in inputs
+    // Parse the DSOs in parallel (each is an independent mmap + dynsym scan),
+    // then register them SERIALLY in input order so `--as-needed` gating observes
+    // a consistent symbol-table state (whether a DSO satisfied a still-undefined
+    // ref depends on the registers that ran before it).
+    let shared_inputs: Vec<&ResolvedInput> = inputs
         .iter()
         .zip(&kinds)
         .filter(|(_, k)| **k == Kind::Shared)
-    {
-        let lib = peony_object::parse_shared_object(&input.path)
-            .with_context(|| format!("reading shared object `{}`", input.path.display()))?;
+        .map(|(input, _)| input)
+        .collect();
+    let parse_shared = |input: &&ResolvedInput| -> Result<peony_object::SharedObject> {
+        peony_object::parse_shared_object(&input.path)
+            .with_context(|| format!("reading shared object `{}`", input.path.display()))
+    };
+    let parsed_shared: Vec<Result<peony_object::SharedObject>> = {
+        let _t = peony_prof::trace("parse-shared");
+        const PARALLEL_SHARED_THRESHOLD: usize = 4;
+        if shared_inputs.len() >= PARALLEL_SHARED_THRESHOLD {
+            shared_inputs.par_iter().map(parse_shared).collect()
+        } else {
+            shared_inputs.iter().map(parse_shared).collect()
+        }
+    };
+    let mut needed = Vec::new();
+    for (input, lib) in shared_inputs.iter().zip(parsed_shared) {
+        let lib = lib?;
         let satisfied = r
             .symbols
             .register_shared_export_symbols(&lib.export_symbols, &lib.soname);

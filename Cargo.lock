@@ -661,6 +661,7 @@ dependencies = [
  "peony-object",
  "peony-prof",
  "peony-symbols",
+ "rayon",
  "rustc-hash",
  "thiserror",
  "tracing",

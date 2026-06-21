@@ -10,6 +10,7 @@ peony-object      = { path = "../peony-object" }
 peony-prof        = { path = "../peony-prof" }
 peony-symbols     = { path = "../peony-symbols" }
 ws-deque.workspace   = true
+rayon.workspace      = true
 rustc-hash.workspace = true
 thiserror.workspace  = true
 tracing.workspace    = true

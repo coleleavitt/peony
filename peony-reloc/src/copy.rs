@@ -1,12 +1,18 @@
 use peony_object::{Binding, InputObject};
 use peony_symbols::{SymbolId, SymbolTable};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::may_need_copy_reloc;
 
 pub fn copy_reloc_symbols(objects: &[InputObject], symbols: &SymbolTable) -> Vec<SymbolId> {
-    let mut out = FxHashMap::<SymbolId, Vec<u8>>::default();
-    for obj in objects {
+    // Each object's copy-reloc candidates are independent (read-only on the
+    // frozen symbol table), so collect them across the pool, then merge serially
+    // and sort by name. The result is name-sorted, so it is identical to the
+    // serial walk regardless of collection order.
+    const PARALLEL_THRESHOLD: usize = 64;
+    let collect_obj = |obj: &InputObject| -> Vec<(SymbolId, Vec<u8>)> {
+        let mut found = Vec::new();
         for sec in &obj.sections {
             if sec.flags & peony_object::elf::SHF_ALLOC == 0 {
                 continue;
@@ -73,8 +79,22 @@ pub fn copy_reloc_symbols(objects: &[InputObject], symbols: &SymbolTable) -> Vec
                 if res.size == 0 && res.st_type != peony_object::elf::STT_OBJECT {
                     continue;
                 }
-                out.entry(res.id).or_insert_with(|| sym.name.to_vec());
+                found.push((res.id, sym.name.to_vec()));
             }
+        }
+        found
+    };
+    let per_object: Vec<Vec<(SymbolId, Vec<u8>)>> = if objects.len() >= PARALLEL_THRESHOLD {
+        objects.par_iter().map(collect_obj).collect()
+    } else {
+        objects.iter().map(collect_obj).collect()
+    };
+    // First-seen (object-order) name wins per id; every reference to a given id
+    // carries the same name anyway, so the dedup is order-insensitive.
+    let mut out = FxHashMap::<SymbolId, Vec<u8>>::default();
+    for found in per_object {
+        for (id, name) in found {
+            out.entry(id).or_insert(name);
         }
     }
     let mut out: Vec<(SymbolId, Vec<u8>)> = out.into_iter().collect();

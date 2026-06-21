@@ -1,5 +1,6 @@
 use peony_object::{Binding, InputObject, InputSymbol};
 use peony_symbols::SymbolTable;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 const NO_TARGET: u64 = u64::MAX;
@@ -25,12 +26,39 @@ enum GcObjectTargets {
 
 impl<'a> GcTargetMaps<'a> {
     pub(super) fn new(objects: &[InputObject], symbols: &'a SymbolTable) -> Self {
-        let mut stats = GcTargetStats::default();
-        let objects = objects
-            .iter()
-            .enumerate()
-            .map(|(object_id, obj)| build_object_targets(object_id, obj, symbols, &mut stats))
-            .collect();
+        // Each object's target map is independent (it only reads the immutable
+        // object + frozen symbol table), so build them in parallel on large links
+        // and fold the per-object stat partials. Output is keyed by object_id, so
+        // par_iter's order-preserving collect is bit-for-bit identical to serial.
+        const PARALLEL_THRESHOLD: usize = 64;
+        let (objects, stats) = if objects.len() >= PARALLEL_THRESHOLD {
+            let built: Vec<(GcObjectTargets, GcTargetStats)> = objects
+                .par_iter()
+                .enumerate()
+                .map(|(object_id, obj)| {
+                    let mut s = GcTargetStats::default();
+                    let t = build_object_targets(object_id, obj, symbols, &mut s);
+                    (t, s)
+                })
+                .collect();
+            let mut stats = GcTargetStats::default();
+            let mut maps = Vec::with_capacity(built.len());
+            for (map, s) in built {
+                maps.push(map);
+                stats.entries += s.entries;
+                stats.dense_objects += s.dense_objects;
+                stats.sparse_objects += s.sparse_objects;
+            }
+            (maps, stats)
+        } else {
+            let mut stats = GcTargetStats::default();
+            let maps = objects
+                .iter()
+                .enumerate()
+                .map(|(object_id, obj)| build_object_targets(object_id, obj, symbols, &mut stats))
+                .collect();
+            (maps, stats)
+        };
         Self {
             symbols,
             objects,
