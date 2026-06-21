@@ -31,15 +31,61 @@ spawns and reuses one automatically.
 ## Proofs
 
 The edit–rebuild claim isn't only measured — it's *proved*. `rocq-tests/` holds
-machine-checked Rocq/Coq proofs (zero axioms beyond functional extensionality)
-for the load-bearing results: incremental-relink **soundness** and its
-**O(affected)** cost bound, parallel-schedule work–span optimality, relocation
-disjoint-write determinism, GC reachability, layout congruence, symbol-resolution
-semilattice, and ICF soundness.
+machine-checked Rocq/Coq proofs (`make` is the oracle; zero axioms beyond
+functional extensionality). A few of the load-bearing ones:
 
-And the byte-identity guarantee is enforced, not asserted: a `cmp`-against-a-full-link
-test runs on every relink path, across thread counts, plus an adversarial
-relocation sweep.
+**Byte-identity.** A "green" (unchanged) section renders byte-for-byte the same,
+which is what licenses skipping it:
+
+```coq
+Theorem green_is_byte_stable :
+  forall s s' m,
+    s_offset s = s_offset s' ->          (* same place *)
+    s_content s = s_content s' ->        (* same bytes  *)
+    forall a, render_section s' m a = render_section s m a.
+```
+
+**Cost is O(affected), not O(program).** A relink's cost equals the number of
+changed sections — and a from-scratch link's cost grows without bound while a
+one-edit relink stays at 1:
+
+```coq
+Theorem incremental_cost_eq_num_changed :
+  forall old new, incremental_cost old new = num_changed old new.
+
+Theorem incremental_beats_fromscratch :
+  forall n, exists old new,
+    length new = S n  /\  incremental_cost old new = 1  /\  fromscratch_cost new = S n.
+```
+
+**Parallel emit is deterministic.** Relocations that touch disjoint bytes may be
+applied in any order, on any number of threads, and produce identical memory:
+
+```coq
+Corollary parallel_reloc_deterministic :
+  forall sched1 sched2 m,
+    Permutation sched1 sched2 ->
+    pairwise_disjoint sched1 ->
+    apply_all sched1 m = apply_all sched2 m.
+```
+
+**ICF is sound.** Folding identical functions to one copy preserves every call's
+result, and only moves addresses where they can't be observed:
+
+```coq
+Theorem icf_observationally_equivalent :
+  forall P (F : fold_map P),
+    address_safe P F ->
+      (forall f, call_result P (rep F f) = call_result P f) /\
+      (forall f g, observably_compared P f g ->
+         addr_eq_after P F f g = addr_eq_before f g).
+```
+
+The rest cover parallel-schedule work–span optimality (within 2× of the Brent
+bound), GC reachability, layout page-congruence, and the symbol-resolution
+semilattice. And the byte-identity guarantee is enforced in CI too: a
+`cmp`-against-a-full-link test on every relink path, across thread counts, plus
+an adversarial relocation sweep.
 
 ## Use it
 
