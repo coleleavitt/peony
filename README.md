@@ -98,13 +98,6 @@ PEONY_DAEMON=1 cargo build           # sub-5 ms relinks, automatically
 
 Point `rustc` at it with `-C linker=/path/to/peony -C linker-flavor=ld`.
 
-peony is a real linker, not a toy: PIE and shared objects, TLS (GD/LD/IE),
-GOT/PLT/IFUNC, dynamic relocations, `--gc-sections`, COMDAT dedup, ICF, version
-scripts, native `-r` partial linking, and build-ids. `peony --help` lists the
-flags; `peony --stats` / `--trace` profile a link from the inside;
-[`bench/BENCHMARKING.md`](bench/BENCHMARKING.md) has the correctness-gated
-numbers. LTO/bitcode objects (and `-r` with COMDAT) are handed to GNU `ld`.
-
 ## License
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
