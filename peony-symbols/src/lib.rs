@@ -278,87 +278,84 @@ impl SymbolTable {
 
         let def_section = sym.section.map(|s| s.0);
 
-        // A real definition overrides any prior tentative (common) definition.
-        // Single lookup: inspect `common` and mutate the same entry in place,
-        // avoiding the former get-then-get_mut double hash of the name (this is
-        // the hottest resolve function; symbol-name hashing showed up in the
-        // alloc/hash profile).
-        if let Some(e) = self.resolutions.get_mut(&sym.name) {
-            if e.common.is_some() {
-                e.binding = sym.binding;
-                e.defined_in = Some(obj_id);
-                e.section_index = def_section;
-                e.value = sym.value;
-                e.size = sym.size;
-                e.common = None;
-                e.st_type = sym.st_type;
-                e.visibility = sym.visibility;
-                return Ok(());
-            }
-        }
-
-        if let Some(existing) = self.resolutions.get(&sym.name) {
-            let action = conflict_action(existing, obj_id, sym, &self.object_paths)?;
-            match action {
-                ConflictAction::SatisfyUndef | ConflictAction::Upgrade => {
-                    // (Re)bind to this definition. SatisfyUndef assigns a fresh ID;
-                    // Upgrade keeps the existing ID (a weak def already had one).
-                    let assign_id = matches!(action, ConflictAction::SatisfyUndef);
-                    let new_id = if assign_id {
-                        let id = SymbolId(self.names.len() as u32);
-                        self.names.push(sym.name.clone());
-                        Some(id)
-                    } else {
-                        None
-                    };
-                    let e = self.resolutions.get_mut(&sym.name).unwrap();
-                    if let Some(id) = new_id {
-                        e.id = id;
-                    }
+        // ONE name lookup for the whole defined-symbol merge: a real definition
+        // overrides a prior tentative (common) def, resolves a conflict, or is a
+        // brand-new entry — all decided from a single `get_mut` instead of the
+        // former get_mut + get + get_mut triple-hash. This is the hottest resolve
+        // function and hashing the (Arc<[u8]>) name dominates it. ID-minting stays
+        // in the same serial order, so SymbolId assignment is byte-identical.
+        match self.resolutions.get_mut(&sym.name) {
+            Some(e) => {
+                if e.common.is_some() {
+                    // A real definition overrides any prior tentative (common) def.
                     e.binding = sym.binding;
                     e.defined_in = Some(obj_id);
                     e.section_index = def_section;
                     e.value = sym.value;
                     e.size = sym.size;
-                    e.is_ifunc = sym.is_ifunc;
+                    e.common = None;
                     e.st_type = sym.st_type;
                     e.visibility = sym.visibility;
+                    return Ok(());
                 }
-                ConflictAction::KeepExisting => {}
-                ConflictAction::WarnLocal => {
-                    tracing::warn!(
-                        "local symbol `{}` unexpectedly reached global table",
-                        String::from_utf8_lossy(&sym.name)
-                    );
+                let action = conflict_action(e, obj_id, sym, &self.object_paths)?;
+                match action {
+                    ConflictAction::SatisfyUndef | ConflictAction::Upgrade => {
+                        // (Re)bind to this definition. SatisfyUndef assigns a fresh
+                        // ID; Upgrade keeps the existing ID (a weak def already had
+                        // one). `self.names` is a disjoint field from the `e`
+                        // borrow into `self.resolutions`, so the push is allowed.
+                        if matches!(action, ConflictAction::SatisfyUndef) {
+                            let id = SymbolId(self.names.len() as u32);
+                            self.names.push(sym.name.clone());
+                            e.id = id;
+                        }
+                        e.binding = sym.binding;
+                        e.defined_in = Some(obj_id);
+                        e.section_index = def_section;
+                        e.value = sym.value;
+                        e.size = sym.size;
+                        e.is_ifunc = sym.is_ifunc;
+                        e.st_type = sym.st_type;
+                        e.visibility = sym.visibility;
+                    }
+                    ConflictAction::KeepExisting => {}
+                    ConflictAction::WarnLocal => {
+                        tracing::warn!(
+                            "local symbol `{}` unexpectedly reached global table",
+                            String::from_utf8_lossy(&sym.name)
+                        );
+                    }
                 }
             }
-        } else {
-            let id = SymbolId(self.names.len() as u32);
-            self.names.push(sym.name.clone());
-            self.resolutions.insert(
-                sym.name.clone(),
-                SymbolResolution {
-                    id,
-                    binding: sym.binding,
-                    defined_in: Some(obj_id),
-                    section_index: def_section,
-                    value: sym.value,
-                    size: sym.size,
-                    common: None,
-                    import: false,
-                    copy_reloc: false,
-                    dynsym_index: 0,
-                    virtual_address: 0,
-                    got_address: 0,
-                    plt_address: 0,
-                    gottp_address: 0,
-                    version: None,
-                    soname: None,
-                    is_ifunc: sym.is_ifunc,
-                    st_type: sym.st_type,
-                    visibility: sym.visibility,
-                },
-            );
+            None => {
+                let id = SymbolId(self.names.len() as u32);
+                self.names.push(sym.name.clone());
+                self.resolutions.insert(
+                    sym.name.clone(),
+                    SymbolResolution {
+                        id,
+                        binding: sym.binding,
+                        defined_in: Some(obj_id),
+                        section_index: def_section,
+                        value: sym.value,
+                        size: sym.size,
+                        common: None,
+                        import: false,
+                        copy_reloc: false,
+                        dynsym_index: 0,
+                        virtual_address: 0,
+                        got_address: 0,
+                        plt_address: 0,
+                        gottp_address: 0,
+                        version: None,
+                        soname: None,
+                        is_ifunc: sym.is_ifunc,
+                        st_type: sym.st_type,
+                        visibility: sym.visibility,
+                    },
+                );
+            }
         }
         Ok(())
     }
