@@ -54,7 +54,7 @@ pub enum CacheError {
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 /// Bump when the manifest format changes incompatibly.
-pub const CACHE_VERSION: u32 = 6;
+pub const CACHE_VERSION: u32 = 7;
 
 /// Sentinel for "no next entry" in the relocation reverse index.
 pub const NO_ENTRY: u32 = u32::MAX;
@@ -174,6 +174,11 @@ pub struct CachedSymbolEntry {
     pub name: Vec<u8>,
     pub virtual_address: u64,
     pub got_address: u64,
+    /// PLT stub address (0 = none). Needed so the incremental fast path can
+    /// re-apply a changed object's `call foo@PLT` without re-resolving.
+    pub plt_address: u64,
+    /// Symbol size (for `SIZE`/diagnostic relocations).
+    pub size: u64,
 }
 
 /// Persisted front-end state for the layout-reuse fast path (blueprint Phase 2).

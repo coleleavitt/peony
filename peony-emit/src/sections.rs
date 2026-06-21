@@ -72,7 +72,14 @@ pub(crate) fn write_section_data_parallel(
     // Phase 1: Write all synthetic sections serially (fast — small data,
     // except build-id which hashes all input bytes; framed separately).
     let synth = peony_prof::trace("emit:synthetic-sections");
+    let skip_synthetics = filter.is_minimal();
     for sec in &layout.output_sections {
+        // Minimal-emit (layout-reuse fast path) rewrites NO synthetic section:
+        // they are byte-identical to the prior link already on disk, and the
+        // minimal cached symbol view could not rebuild `.got`/`.symtab` anyway.
+        if skip_synthetics {
+            break;
+        }
         match sec.source {
             SecSource::Input => {
                 if filter.zeroes_gaps(&sec.name) {

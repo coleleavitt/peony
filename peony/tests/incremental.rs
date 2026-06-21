@@ -64,6 +64,36 @@ fn compile_compute(dir: &Path, body: &str) -> PathBuf {
     o
 }
 
+/// Did the relink take an incremental fast path (parse-only-changed, or the
+/// layout-reuse late path)?
+fn took_fast_path(stderr: &str) -> bool {
+    stderr.contains("parse-only-changed fast relink")
+        || stderr.contains("reusing cached layout")
+        || stderr.contains("incremental patch emitted")
+}
+
+/// Compile a freestanding C object named `name.c` with the given body.
+fn compile_named(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let c = dir.join(format!("{name}.c"));
+    let o = dir.join(format!("{name}.o"));
+    std::fs::write(&c, body).unwrap();
+    let st = Command::new("cc")
+        .args([
+            "-c",
+            "-fno-pic",
+            "-fno-asynchronous-unwind-tables",
+            "-ffreestanding",
+            "-O2",
+            "-o",
+        ])
+        .arg(&o)
+        .arg(&c)
+        .status()
+        .expect("run `cc`");
+    assert!(st.success(), "compiling {name}.c failed");
+    o
+}
+
 /// Run a peony link, returning (success, stderr).
 fn peony_link(out: &Path, inputs: &[&PathBuf], extra: &[&str]) -> (bool, String) {
     let mut cmd = Command::new(PEONY);
@@ -101,12 +131,13 @@ fn layout_reuse_is_byte_identical_to_full_link() {
     // Size-stable edit: only the returned immediate changes (42 → 77).
     let _ = compile_compute(&dir, "int compute(void){ return 77; }\n");
 
-    // Incremental relink — must take the layout-reuse fast path.
+    // Incremental relink — must take an incremental fast path (parse-only-changed
+    // when eligible, else layout-reuse).
     let (ok, stderr) = peony_link(&app, &[&start, &dir.join("compute.o")], &["--incremental"]);
     assert!(ok, "incremental relink failed");
     assert!(
-        stderr.contains("reusing cached layout"),
-        "expected the layout-reuse fast path to fire on a size-stable relink; stderr:\n{stderr}"
+        took_fast_path(&stderr),
+        "expected an incremental fast path to fire on a size-stable relink; stderr:\n{stderr}"
     );
 
     // Full reference link of the same inputs (no incremental machinery).
@@ -122,6 +153,54 @@ fn layout_reuse_is_byte_identical_to_full_link() {
         "incremental layout-reuse output must be byte-identical to a full link"
     );
     assert_eq!(run(&app), 77, "relinked output must exit 77");
+}
+
+/// The changed object has a RELOCATION (a call to a function defined in another,
+/// unchanged object): the parse-only fast path must re-apply it against the
+/// cached symbol VA and stay byte-identical to a full link. (The 402-object
+/// benchmark's `compute.o` is reloc-free, so this is the dedicated coverage for
+/// reloc-apply from the minimal cached symbol view.)
+#[test]
+fn parse_only_changed_applies_relocs_from_cache() {
+    let dir = workdir("inc-reloc");
+    let start = assemble_start(&dir);
+    // A separate, unchanged object that `compute` calls — forces a relocation.
+    let helper = compile_named(&dir, "helper", "int helper(void){ return 7; }\n");
+    let app = dir.join("app");
+    let inputs = [&start, &dir.join("compute.o"), &helper];
+
+    // Seed: compute calls helper.
+    compile_named(
+        &dir,
+        "compute",
+        "extern int helper(void);\nint compute(void){ return 42 + helper(); }\n",
+    );
+    let (ok, _) = peony_link(&app, &inputs, &["--incremental"]);
+    assert!(ok, "seed link failed");
+    assert_eq!(run(&app), 49, "seed: 42 + helper()=7");
+
+    // Size-stable edit: still calls helper, only the constant changes.
+    compile_named(
+        &dir,
+        "compute",
+        "extern int helper(void);\nint compute(void){ return 77 + helper(); }\n",
+    );
+    let (ok, stderr) = peony_link(&app, &inputs, &["--incremental"]);
+    assert!(ok, "incremental relink failed");
+    assert!(
+        took_fast_path(&stderr),
+        "expected a fast path; stderr:\n{stderr}"
+    );
+
+    let full = dir.join("full");
+    let (ok, _) = peony_link(&full, &inputs, &[]);
+    assert!(ok, "full link failed");
+    assert_eq!(
+        std::fs::read(&app).unwrap(),
+        std::fs::read(&full).unwrap(),
+        "reloc-bearing changed object: incremental output must equal a full link"
+    );
+    assert_eq!(run(&app), 84, "relinked: 77 + helper()=7");
 }
 
 /// Alternating size-stable relinks stay byte-identical across many iterations
@@ -144,7 +223,7 @@ fn layout_reuse_stable_across_alternating_relinks() {
         let _ = compile_compute(&dir, body);
         let (ok, stderr) = peony_link(&app, &inputs, &["--incremental"]);
         assert!(ok, "incremental link {i} failed");
-        if stderr.contains("reusing cached layout") {
+        if took_fast_path(&stderr) {
             reused += 1;
         }
         let (ok, _) = peony_link(&full, &inputs, &[]);

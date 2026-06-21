@@ -491,6 +491,17 @@ pub struct LayoutFingerprint {
 /// emit-copied from the live object, so their content is deliberately excluded:
 /// a size-stable body edit must NOT change the digest, or the fast path would
 /// never fire.
+/// Public single-object digest for the incremental fast path: recompute one
+/// freshly-parsed object's reuse digest in isolation (no `--gc-sections`/`--icf`
+/// → `SectionFilter::All`, no fold map) and compare it to the cached
+/// `object_digests[obj_idx]` to prove the changed object's layout/symbol/reloc
+/// contribution is unchanged. Per-object digests are context-free (they read
+/// only this object + arena), so this matches what `compute_layout_fingerprint`
+/// recorded.
+pub fn object_reuse_digest(arena: &InputArena, obj: &InputObject, obj_idx: usize) -> u64 {
+    object_layout_digest(arena, obj, obj_idx, SectionFilter::All, None)
+}
+
 fn object_layout_digest(
     arena: &InputArena,
     obj: &InputObject,
@@ -527,6 +538,20 @@ fn object_layout_digest(
         h = fnv_u64(h, sec.size);
         if is_property || sec.kind == SectionKind::EhFrame {
             h = fnv_bytes(h, arena.bytes(sec.data));
+        }
+        // Fold this section's relocations (offset, type, addend, target-symbol
+        // NAME). This makes the digest reloc-complete: the incremental fast path
+        // verifies reuse safety from ONLY the changed object's digest, so it must
+        // capture the object's GOT/PLT/TLS/data-reloc demand. A reloc-target or
+        // -type change busts the digest → full link (conservative, always safe).
+        for r in &sec.relocs {
+            h = fnv_u64(h, r.offset);
+            h = fnv_u64(h, u64::from(r.r_type));
+            h = fnv_u64(h, r.addend as u64);
+            match obj.symbol_by_index(r.symbol.0) {
+                Some(s) => h = fnv_bytes(fnv_byte(h, 1), &s.name),
+                None => h = fnv_byte(h, 0),
+            }
         }
     }
     // COMDAT groups: their first-seen-wins resolution decides which sections are

@@ -36,6 +36,12 @@ pub(crate) fn finalize_build_id(buf: &mut [u8], layout: &Layout) {
     if off + 16 > buf.len() {
         return;
     }
+    // Zero the descriptor before hashing so the result does NOT depend on a
+    // stale build-id left in place by a prior link: the minimal-emit fast path
+    // (layout reuse) skips the synthetic write that would otherwise zero it, so
+    // without this the hash would fold in the previous build-id and diverge from
+    // a full link.
+    buf[off..off + 16].copy_from_slice(&[0u8; 16]);
     let digest = build_id_hash(buf);
     buf[off..off + 16].copy_from_slice(&digest);
 }

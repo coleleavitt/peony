@@ -90,6 +90,16 @@ impl SectionWriteFilter<'_> {
             SectionWriteFilter::ChangedObjects(_) => false,
         }
     }
+
+    /// Minimal-emit mode: rewrite ONLY the changed objects' input sections and
+    /// the image-derived `.eh_frame_hdr`/build-id, leaving every synthetic
+    /// section, ELF header, and the section-header table untouched on disk. A
+    /// drivers-hash match proves they are byte-identical to the prior link, so
+    /// re-deriving them is unnecessary — and, on the parse-only-changed path,
+    /// impossible (the minimal cached symbol view cannot rebuild `.got`/`.symtab`).
+    pub(crate) fn is_minimal(self) -> bool {
+        matches!(self, SectionWriteFilter::ChangedObjects(_))
+    }
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -222,8 +232,13 @@ fn emit_with_filter(
         open_output_map(output_path, file_size, can_overwrite).map_err(io)?
     };
 
+    // Minimal-emit mode (layout-reuse fast path) leaves every synthetic section,
+    // header, and the SHT untouched on disk — they are byte-identical to the
+    // prior link. Only input contributions + `.eh_frame_hdr` + build-id below run.
+    let minimal = filter.is_minimal();
+
     // Write ELF header + program headers (serial, small, must be first).
-    {
+    if !minimal {
         let _t = peony_prof::trace("emit:headers");
         write_headers(&mut mmap, layout);
     }
@@ -246,7 +261,7 @@ fn emit_with_filter(
 
     // Shared-object TLS GOT static slots (DTPOFF in GD/LDM pair slot1) — written
     // directly by VA→file-offset mapping through the `.got` section.
-    {
+    if !minimal {
         let _t = peony_prof::trace("emit:tls-got");
         write_tls_got(&mut mmap, layout);
     }
@@ -260,7 +275,7 @@ fn emit_with_filter(
     }
 
     // Section header table (serial, small, at end of file).
-    {
+    if !minimal {
         let _t = peony_prof::trace("emit:section-headers");
         write_section_headers(&mut mmap, layout);
     }

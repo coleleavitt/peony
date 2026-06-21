@@ -155,6 +155,42 @@ pub struct SymbolResolution {
 }
 
 impl SymbolResolution {
+    /// Fabricate a defined resolution from the cached symbol manifest, carrying
+    /// only the fields a relocation needs (`virtual_address`, `got_address`,
+    /// `plt_address`, `size`). `defined_in = Some` makes [`is_defined`] true so
+    /// `apply_reloc` takes the defined branch. This is ONLY sound for the
+    /// incremental fast path's allowed relocation kinds (PC32/PLT32/GOT/abs/PC64
+    /// against an already-placed symbol); TLS / IFUNC / COPY relocations read
+    /// fields not carried here and MUST be descoped to a full link.
+    pub fn cached_defined(
+        virtual_address: u64,
+        got_address: u64,
+        plt_address: u64,
+        size: u64,
+    ) -> Self {
+        SymbolResolution {
+            id: SymbolId(u32::MAX),
+            binding: Binding::Global,
+            defined_in: Some(ObjectId(0)),
+            section_index: None,
+            value: 0,
+            size,
+            common: None,
+            import: false,
+            copy_reloc: false,
+            dynsym_index: 0,
+            virtual_address,
+            got_address,
+            plt_address,
+            gottp_address: 0,
+            version: None,
+            soname: None,
+            is_ifunc: false,
+            st_type: 0,
+            visibility: 0,
+        }
+    }
+
     /// True if this symbol should be placed in a shared object's `.dynsym` as an
     /// export: it is locally defined (not an import, not still-undefined, not a
     /// pending common) and has default/protected visibility.
@@ -450,6 +486,15 @@ impl SymbolTable {
     /// Look up a symbol by name.
     pub fn lookup(&self, name: &[u8]) -> Option<&SymbolResolution> {
         self.resolutions.get(name)
+    }
+
+    /// Insert a pre-resolved symbol directly (incremental fast path): used to
+    /// build a MINIMAL symbol view from the cached symbol manifest, sufficient
+    /// to re-apply the changed object's relocations without re-parsing and
+    /// re-resolving every input. Only `lookup`/`SymIndex` (by name) consume this
+    /// view; `name_by_id`/`names` are intentionally not populated.
+    pub fn insert_cached(&mut self, name: &[u8], res: SymbolResolution) {
+        self.resolutions.insert(Name::from_slice(name), res);
     }
 
     /// Build an id-indexed view of resolutions: `out[id.0] = Some(&resolution)`.

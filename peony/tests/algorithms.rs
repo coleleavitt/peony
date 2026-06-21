@@ -530,8 +530,9 @@ fn incremental_cache_invalidates_on_input_change() {
     );
     let changed_log = String::from_utf8_lossy(&changed.stderr);
     assert!(
-        changed_log.contains("incremental patch emitted"),
-        "changed-input stable-layout relink should use the incremental patch path; stderr was:\n{changed_log}"
+        changed_log.contains("incremental patch emitted")
+            || changed_log.contains("parse-only-changed fast relink"),
+        "changed-input stable-layout relink should use an incremental fast path; stderr was:\n{changed_log}"
     );
     assert_eq!(
         run(&out),

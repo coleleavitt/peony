@@ -43,6 +43,7 @@ use peony_layout::{
 };
 use peony_object::{
     Binding,
+    IndexLookup,
     InputArena,
     InputObject,
     Name,
@@ -52,7 +53,7 @@ use peony_object::{
     parse_owned_member,
 };
 use peony_reloc::scan_relocations;
-use peony_symbols::{SymbolId, SymbolTable};
+use peony_symbols::{SymbolId, SymbolResolution, SymbolTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing_subscriber::EnvFilter;
@@ -201,6 +202,28 @@ fn main() -> Result<()> {
         tracing::info!(output = %args.output.display(), "incremental: inputs unchanged, reused cached output");
         cache_report.record(&args.output, CacheOutcome::ReusedUnchanged)?;
         return Ok(());
+    }
+
+    // Incremental parse-only-changed fast path (blueprint Phase 3-4): when only
+    // plain object(s) changed size-stably, parse JUST those, reuse the cached
+    // layout + symbol manifest, and re-emit in place — skipping the full
+    // parse+resolve of the 400+ unchanged inputs. Any ineligibility falls
+    // through to the full pipeline below (which still reuses the layout).
+    if args.incremental && !args.gc_sections && !args.icf {
+        let emit_config = EmitConfig::default();
+        let _p = peony_prof::phase("parse-only-changed");
+        if try_parse_only_changed(
+            &args.output,
+            &input_paths,
+            args_hash,
+            &emit_config,
+            &cache_report,
+        )? {
+            drop(_p);
+            tracing::info!(output = %args.output.display(), "link complete (fast relink)");
+            peony_prof::report();
+            return Ok(());
+        }
     }
 
     init_thread_pool(args.threads, input_paths.len())?;
@@ -583,26 +606,6 @@ fn main() -> Result<()> {
     };
     drop(layout_trace);
     drop(layout_span);
-    // Snapshot the PRE-finalize layout bytes + drivers fingerprint for the next
-    // relink's fast path. Captured HERE, before `finalize_symbols` and the
-    // dynamic-reloc assembly mutate `layout` in place, so the bytes are exactly
-    // what `compute_layout` returns and downstream substitution is transparent.
-    // Only produced when reuse is in scope (no gc/icf); otherwise `None`, so a
-    // gc/icf link records no snapshot and the next relink full-links.
-    let (front_end_snapshot, layout_blob) = build_front_end_snapshot(
-        fe_eligible,
-        &arena,
-        &objects,
-        &symbols,
-        &got_syms,
-        &plt_syms,
-        live.as_filter(),
-        &config,
-        &tls_got,
-        fold_map.as_ref(),
-        reused_snapshot,
-        &layout,
-    );
     peony_prof::count("layout_sections", layout.output_sections.len() as u64);
     peony_prof::count("layout_segments", layout.segments.len() as u64);
     peony_prof::record_items("layout", layout.output_sections.len() as u64);
@@ -637,7 +640,11 @@ fn main() -> Result<()> {
     // Assemble `.rela.dyn` now that symbol VAs are final: the R_X86_64_RELATIVE
     // entries (ET_DYN only) come first, then the GLOB_DATs. For a non-PIE dynamic
     // executable there are no relatives, so this just materialises the GLOB_DATs.
-    if dynamic.is_some() {
+    //
+    // SKIP on a layout-reuse relink: the cached `layout.bin` is the FINAL,
+    // post-append layout, so `dyn_blobs.rela_dyn` + `tls_got_writes` are already
+    // assembled — re-appending would double the dynamic relocs.
+    if dynamic.is_some() && !layout_reused {
         // Partition data relocations into RELATIVE (normal), IRELATIVE (IFUNC,
         // resolver run at startup), and symbolic R64 (imported DSO data) in a
         // single post-layout walk. Meaningful for any ET_DYN (PIE or shared); a
@@ -686,6 +693,27 @@ fn main() -> Result<()> {
     }
     drop(_finalize);
     peony_prof::record_rss("after-finalize");
+
+    // Snapshot the FINAL (post-append) layout + drivers fingerprint for the next
+    // relink's fast path. Captured HERE, after dynamic-reloc assembly, so the
+    // cached `layout.bin` already contains the assembled `.rela.dyn`/TLS state —
+    // a reuse relink (which SKIPS the append above) emits the correct synthetic
+    // sections. On a reuse link `reused_snapshot` is `Some`, so the cached
+    // snapshot is reused verbatim and `layout.bin` is not rewritten.
+    let (front_end_snapshot, layout_blob) = build_front_end_snapshot(
+        fe_eligible,
+        &arena,
+        &objects,
+        &symbols,
+        &got_syms,
+        &plt_syms,
+        live.as_filter(),
+        &config,
+        &tls_got,
+        fold_map.as_ref(),
+        reused_snapshot,
+        &layout,
+    );
 
     let _emit_span = peony_prof::phase("emit");
     let emit_config = EmitConfig::default();
@@ -831,6 +859,198 @@ fn section_records(layout: &peony_layout::Layout) -> Option<Vec<peony_cache::Sec
         });
     }
     Some(records)
+}
+
+/// Relocation kinds the incremental fast path can re-apply from the MINIMAL
+/// cached symbol view (`{virtual_address, got_address, plt_address, size}` +
+/// the reused layout). All are PC-relative / GOT / PLT code relocations whose
+/// value is a pure function of those fields — no dynamic relocation, no TLS, no
+/// IFUNC/COPY. Anything else (absolute `R64`/`32`/`32S` → dynamic RELATIVE in a
+/// PIE, all TLS models, SIZE, IRELATIVE, COPY) is descoped to a full link.
+fn reloc_apply_simple(r_type: u32) -> bool {
+    use peony_reloc::r_x86_64 as r;
+    matches!(
+        r_type,
+        r::PC32
+            | r::PLT32
+            | r::GOT32
+            | r::GOTPCREL
+            | r::GOTPCRELX
+            | r::REX_GOTPCRELX
+            | r::PC16
+            | r::PC8
+            | r::PC64
+            | r::GOTOFF64
+            | r::GOTPC32
+    )
+}
+
+/// An empty placeholder object for the sparse `objects` vec on the parse-only
+/// fast path: the changed objects sit at their original ids and everything else
+/// is empty. Only the changed objects' contributions are emitted, so these are
+/// never read for bytes; `SymIndex::build` iterates their (empty) symbol lists.
+fn empty_object(path: String) -> InputObject {
+    InputObject {
+        path,
+        sections: Vec::new(),
+        symbols: Vec::new(),
+        section_map: IndexLookup::default(),
+        symbol_map: IndexLookup::default(),
+        comdat_groups: Vec::new(),
+    }
+}
+
+/// The incremental fast path that parses ONLY the changed object(s) — blueprint
+/// Phase 3-4. Runs BEFORE the full parse+resolve. When the cached layout +
+/// symbol manifest let us reuse everything and re-apply only the changed
+/// object's relocations, it emits in place and returns `Ok(true)` (the caller
+/// returns). On ANY ineligibility (no snapshot, object-set drift, digest
+/// mismatch, a non-simple relocation, a missing cached symbol, size drift) it
+/// returns `Ok(false)` and the caller falls through to the full pipeline (which
+/// still reuses the layout via [`try_reuse_layout`]). Never serves stale bytes:
+/// the digest match proves the changed object's layout/symbol/reloc demand is
+/// unchanged, and the reloc whitelist proves the minimal view can apply it.
+fn try_parse_only_changed(
+    output: &Path,
+    input_paths: &[PathBuf],
+    args_hash: u64,
+    emit_config: &EmitConfig,
+    cache_report: &CacheReportSink,
+) -> Result<bool> {
+    let Some(cached) = peony_cache::load_changed_state(output, input_paths, args_hash)? else {
+        return Ok(false);
+    };
+    let Some(snap) = cached.front_end.as_ref() else {
+        return Ok(false);
+    };
+    if cached.changed_inputs.is_empty() {
+        return Ok(false);
+    }
+    // Each changed input must be a plain object already in the cached object set.
+    let mut changed_ids: Vec<usize> = Vec::new();
+    for ci in &cached.changed_inputs {
+        match snap.object_paths.iter().position(|p| p == ci) {
+            Some(idx) => changed_ids.push(idx),
+            None => return Ok(false), // archive/.so/script changed → full link
+        }
+    }
+
+    // Minimal symbol view from the cached manifest (name → VA/GOT/PLT/size).
+    let mut symbols = SymbolTable::with_capacity(cached.symbols.len());
+    for e in &cached.symbols {
+        symbols.insert_cached(
+            &e.name,
+            SymbolResolution::cached_defined(
+                e.virtual_address,
+                e.got_address,
+                e.plt_address,
+                e.size,
+            ),
+        );
+    }
+
+    // Parse ONLY the changed objects; verify each is reuse-safe (digest match)
+    // and that every relocation is fast-path-applicable from the minimal view.
+    let mut arena = InputArena::new();
+    let mut parsed: Vec<(usize, InputObject)> = Vec::new();
+    for &idx in &changed_ids {
+        let path = Path::new(&snap.object_paths[idx]);
+        let obj = match parse_object(&mut arena, path) {
+            Ok(o) => o,
+            Err(_) => return Ok(false),
+        };
+        if peony_layout::object_reuse_digest(&arena, &obj, idx)
+            != snap.object_digests.get(idx).copied().unwrap_or(u64::MAX)
+        {
+            return Ok(false); // layout/symbol/reloc demand changed → full link
+        }
+        for sec in &obj.sections {
+            for r in &sec.relocs {
+                if !reloc_apply_simple(r.r_type) {
+                    return Ok(false);
+                }
+                // Every referenced global must be resolvable from the cache.
+                if let Some(s) = obj.symbol_by_index(r.symbol.0) {
+                    if s.binding != Binding::Local
+                        && !s.name.is_empty()
+                        && symbols.lookup(&s.name).is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        parsed.push((idx, obj));
+    }
+
+    // Reuse the cached layout (verify the blob matches the manifest).
+    let blob = match peony_cache::read_layout_blob(output)?
+        .filter(|b| peony_cache::blob_hash(b) == snap.blob_hash)
+    {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+    let Some(layout) = peony_layout::deserialize_layout(&blob) else {
+        return Ok(false);
+    };
+
+    // Assemble the sparse object set (changed objects at their original ids).
+    let mut objects: Vec<InputObject> = snap
+        .object_paths
+        .iter()
+        .cloned()
+        .map(empty_object)
+        .collect();
+    let mut changed_set: HashSet<usize> = HashSet::with_capacity(parsed.len());
+    for (idx, obj) in parsed {
+        objects[idx] = obj;
+        changed_set.insert(idx);
+    }
+
+    // Emit ONLY the changed objects' contributions in place. A size mismatch
+    // (output not already at layout.file_size) bails to the full pipeline.
+    let emitted = emit_partial_objects(
+        output,
+        &arena,
+        &objects,
+        &symbols,
+        &layout,
+        emit_config,
+        &changed_set,
+    )?;
+    if !emitted {
+        return Ok(false);
+    }
+
+    // Refresh the manifest (the layout blob + symbols are unchanged → reuse the
+    // cached snapshot, do not rewrite layout.bin).
+    let sections = section_records(&layout).unwrap_or_default();
+    peony_cache::record_link_with_sections(
+        output,
+        input_paths,
+        args_hash,
+        &sections,
+        &cached.symbols,
+        cached.front_end.as_ref(),
+        None,
+    )
+    .context("incremental cache record")?;
+
+    tracing::info!(
+        objects = changed_set.len(),
+        "incremental: parse-only-changed fast relink (skipped full parse+resolve)"
+    );
+    let patch_sections = patch_section_records(&layout, &objects, &cached.changed_inputs);
+    if let Ok(plan) = peony_cache::plan_partial_relink(
+        &cached,
+        &patch_sections,
+        &[],
+        &peony_cache::RelocReverseIndex::new(0, 0),
+        &[],
+    ) {
+        cache_report.record(output, CacheOutcome::PartialRelink { plan: &plan })?;
+    }
+    Ok(true)
 }
 
 /// Attempt the incremental layout-reuse fast path (blueprint Phase 2).
@@ -1170,6 +1390,8 @@ fn symbol_records(symbols: &SymbolTable) -> Vec<peony_cache::CachedSymbolEntry> 
             name: name.to_vec(),
             virtual_address: res.virtual_address,
             got_address: res.got_address,
+            plt_address: res.plt_address,
+            size: res.size,
         })
         .collect()
 }
