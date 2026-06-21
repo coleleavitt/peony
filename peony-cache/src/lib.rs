@@ -509,7 +509,7 @@ fn manifest_path(output: &Path) -> PathBuf {
 }
 
 /// Path of the serialized `Layout` blob for the layout-reuse fast path.
-fn layout_blob_path(output: &Path) -> PathBuf {
+pub fn layout_blob_path(output: &Path) -> PathBuf {
     cache_dir(output).join("layout.bin")
 }
 

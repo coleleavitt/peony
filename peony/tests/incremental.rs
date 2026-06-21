@@ -10,6 +10,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use common::{PEONY, cc_file, run, workdir};
 
@@ -281,6 +282,74 @@ fn parse_only_changed_import_plt_byte_identical() {
         "import-PLT changed object: incremental output must equal a full link"
     );
     assert_eq!(run(&app), 77, "relinked exit 77");
+}
+
+/// The resident daemon: a `peony --daemon` server holds the layout + symbol view
+/// in RAM and serves relinks over a Unix socket; a normal `--incremental` client
+/// delegates to it. The relink MUST be byte-identical to a full link. (This is
+/// the sub-5ms path: the daemon skips the per-relink deserialize + symbol-view
+/// rebuild.) The daemon child is always killed before assertions.
+#[test]
+fn daemon_relink_is_byte_identical_to_full_link() {
+    let dir = workdir("inc-daemon");
+    let start = assemble_start(&dir);
+    let app = dir.join("app");
+    let compute = dir.join("compute.o");
+
+    // Seed link establishes the cache the daemon loads.
+    compile_compute(&dir, "int compute(void){ return 42; }\n");
+    let (ok, _) = peony_link(&app, &[&start, &compute], &["--incremental"]);
+    assert!(ok, "seed link failed");
+
+    // Start the daemon as a background child.
+    let mut daemon = Command::new(PEONY)
+        .arg("--daemon")
+        .arg("-o")
+        .arg(&app)
+        .arg(&start)
+        .arg(&compute)
+        .env("PEONY_LOG", "peony=info")
+        .spawn()
+        .expect("spawn daemon");
+
+    // Wait for the socket (give up + skip if the daemon never comes up).
+    let sock = dir.join("app.incr").join("daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !sock.exists() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        eprintln!("skipping: daemon did not come up");
+        return;
+    }
+
+    // Size-stable edit, then relink via the client (delegates to the daemon).
+    compile_compute(&dir, "int compute(void){ return 77; }\n");
+    let (relink_ok, stderr) = peony_link(&app, &[&start, &compute], &["--incremental"]);
+    let app_bytes = std::fs::read(&app).ok();
+
+    // Full reference link of the edited inputs.
+    let full = dir.join("full");
+    let (full_ok, _) = peony_link(&full, &[&start, &compute], &[]);
+    let full_bytes = std::fs::read(&full).ok();
+
+    // Always kill the daemon before asserting.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(relink_ok, "client relink failed");
+    assert!(full_ok, "full link failed");
+    assert!(
+        stderr.contains("daemon relink"),
+        "expected the client to delegate to the daemon; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        app_bytes, full_bytes,
+        "daemon relink output must be byte-identical to a full link"
+    );
+    assert_eq!(run(&app), 77, "relinked output must exit 77");
 }
 
 /// Alternating size-stable relinks stay byte-identical across many iterations

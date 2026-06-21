@@ -51,6 +51,9 @@ pub(crate) struct Args {
     pub(crate) link_specs: Vec<LinkSpec>,
     pub(crate) output: PathBuf,
     pub(crate) incremental: bool,
+    /// Run as a resident daemon: load the incremental cache into RAM and serve
+    /// relinks over a Unix socket (requires a prior `--incremental` link).
+    pub(crate) daemon: bool,
     pub(crate) cache_report: Option<PathBuf>,
     pub(crate) threads: usize,
     pub(crate) base_address: String,
@@ -109,6 +112,7 @@ impl Default for Args {
             link_specs: Vec::new(),
             output: PathBuf::from("a.out"),
             incremental: false,
+            daemon: false,
             cache_report: None,
             threads: 0,
             base_address: "0x400000".to_string(),
@@ -298,6 +302,10 @@ fn parse_expanded_args(argv: Vec<String>) -> Result<Args> {
             "--icf=none" | "--no-icf" => a.icf = false,
             "--build-id" => a.build_id = true,
             "--incremental" => a.incremental = true,
+            "--daemon" => {
+                a.incremental = true;
+                a.daemon = true;
+            }
             "--cache-report" => a.cache_report = Some(PathBuf::from(take(&argv, &mut i, arg)?)),
             "-s" | "--strip-all" => {
                 a.strip_all = true;
@@ -580,7 +588,8 @@ pub(crate) fn cache_key_args(raw_args: &[String]) -> Vec<String> {
             continue;
         }
         match arg.as_str() {
-            "--incremental" | "--stats" | "--trace" | "--trace-stack" | "--trace-detail" => {
+            "--incremental" | "--daemon" | "--stats" | "--trace" | "--trace-stack"
+            | "--trace-detail" => {
                 continue;
             }
             "--cache-report" | "--threads" => {

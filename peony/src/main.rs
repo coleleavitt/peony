@@ -60,6 +60,7 @@ use tracing_subscriber::EnvFilter;
 
 mod args;
 mod cache_report;
+mod daemon;
 mod handoff;
 mod inputs;
 mod provided_symbols;
@@ -195,6 +196,26 @@ fn main() -> Result<()> {
     // look dirty, while real linker-mode changes still invalidate the cache.
     let cache_args = cache_key_args(&args.raw_args);
     let args_hash = peony_cache::hash_args(&cache_args);
+
+    // Resident-daemon SERVER: load the incremental cache into RAM and serve
+    // relinks until killed. Requires a prior `--incremental` link.
+    if args.daemon {
+        return daemon::serve(&args.output, &input_paths, args_hash);
+    }
+
+    // Resident-daemon CLIENT: if a daemon is serving this output, delegate the
+    // relink to it (it holds the layout + symbols in RAM → sub-5ms) and exit.
+    // Falls through to the one-shot path if the daemon declines or is absent.
+    if args.incremental {
+        if let Some(handled) = daemon::try_delegate(&args.output, args_hash) {
+            if handled {
+                tracing::info!(output = %args.output.display(), "link complete (daemon relink)");
+                cache_report.record(&args.output, CacheOutcome::ReusedUnchanged)?;
+                return Ok(());
+            }
+        }
+    }
+
     if args.incremental
         && peony_cache::try_reuse(&args.output, &input_paths, args_hash)
             .context("incremental cache")?
@@ -936,52 +957,7 @@ fn try_parse_only_changed(
     }
 
     // Minimal symbol view from the cached manifest (name → VA/GOT/PLT/size).
-    let mut symbols = SymbolTable::with_capacity(cached.symbols.len());
-    for e in &cached.symbols {
-        symbols.insert_cached(
-            &e.name,
-            SymbolResolution::cached_defined(
-                e.virtual_address,
-                e.got_address,
-                e.plt_address,
-                e.size,
-            ),
-        );
-    }
-
-    // Parse ONLY the changed objects; verify each is reuse-safe (digest match)
-    // and that every relocation is fast-path-applicable from the minimal view.
-    let mut arena = InputArena::new();
-    let mut parsed: Vec<(usize, InputObject)> = Vec::new();
-    for &idx in &changed_ids {
-        let path = Path::new(&snap.object_paths[idx]);
-        let obj = match parse_object(&mut arena, path) {
-            Ok(o) => o,
-            Err(_) => return Ok(false),
-        };
-        if peony_layout::object_reuse_digest(&arena, &obj, idx)
-            != snap.object_digests.get(idx).copied().unwrap_or(u64::MAX)
-        {
-            return Ok(false); // layout/symbol/reloc demand changed → full link
-        }
-        for sec in &obj.sections {
-            for r in &sec.relocs {
-                if !reloc_apply_simple(r.r_type) {
-                    return Ok(false);
-                }
-                // Every referenced global must be resolvable from the cache.
-                if let Some(s) = obj.symbol_by_index(r.symbol.0) {
-                    if s.binding != Binding::Local
-                        && !s.name.is_empty()
-                        && symbols.lookup(&s.name).is_none()
-                    {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-        parsed.push((idx, obj));
-    }
+    let symbols = build_cached_symbol_view(&cached.symbols);
 
     // Reuse the cached layout (verify the blob matches the manifest).
     let blob = match peony_cache::read_layout_blob(output)?
@@ -994,33 +970,19 @@ fn try_parse_only_changed(
         return Ok(false);
     };
 
-    // Assemble the sparse object set (changed objects at their original ids).
-    let mut objects: Vec<InputObject> = snap
-        .object_paths
-        .iter()
-        .cloned()
-        .map(empty_object)
-        .collect();
-    let mut changed_set: HashSet<usize> = HashSet::with_capacity(parsed.len());
-    for (idx, obj) in parsed {
-        objects[idx] = obj;
-        changed_set.insert(idx);
-    }
-
-    // Emit ONLY the changed objects' contributions in place. A size mismatch
-    // (output not already at layout.file_size) bails to the full pipeline.
-    let emitted = emit_partial_objects(
+    // Shared core: parse the changed objects, verify, and emit them in place.
+    let Some(changed_set) = emit_parse_only_changed(
         output,
-        &arena,
-        &objects,
-        &symbols,
         &layout,
+        &symbols,
+        &snap.object_paths,
+        &snap.object_digests,
+        &changed_ids,
         emit_config,
-        &changed_set,
-    )?;
-    if !emitted {
+    )?
+    else {
         return Ok(false);
-    }
+    };
 
     // Refresh the manifest (the layout blob + symbols are unchanged → reuse the
     // cached snapshot, do not rewrite layout.bin).
@@ -1040,7 +1002,7 @@ fn try_parse_only_changed(
         objects = changed_set.len(),
         "incremental: parse-only-changed fast relink (skipped full parse+resolve)"
     );
-    let patch_sections = patch_section_records(&layout, &objects, &cached.changed_inputs);
+    let patch_sections = patch_sections_for_changed(&layout, &changed_set);
     if let Ok(plan) = peony_cache::plan_partial_relink(
         &cached,
         &patch_sections,
@@ -1051,6 +1013,131 @@ fn try_parse_only_changed(
         cache_report.record(output, CacheOutcome::PartialRelink { plan: &plan })?;
     }
     Ok(true)
+}
+
+/// Build the MINIMAL cached symbol view (name → fabricated resolution carrying
+/// VA/GOT/PLT/size) used to re-apply the changed object's relocations without a
+/// full re-resolve. Shared by the one-shot disk fast path and the daemon.
+pub(crate) fn build_cached_symbol_view(entries: &[peony_cache::CachedSymbolEntry]) -> SymbolTable {
+    let mut symbols = SymbolTable::with_capacity(entries.len());
+    for e in entries {
+        symbols.insert_cached(
+            &e.name,
+            SymbolResolution::cached_defined(
+                e.virtual_address,
+                e.got_address,
+                e.plt_address,
+                e.size,
+            ),
+        );
+    }
+    symbols
+}
+
+/// The shared parse-only-changed CORE: parse each changed object, verify it is
+/// reuse-safe (reloc-complete digest match + every relocation in the simple
+/// whitelist with its target resolvable from `symbols`), and emit ONLY its
+/// contributions against the reused `layout`. Returns `Some(changed_object_ids)`
+/// when emitted, `None` on any ineligibility (caller falls back / full-links).
+///
+/// Used by BOTH the one-shot disk fast path (`try_parse_only_changed`, which
+/// deserializes `layout`/`symbols` from disk each call) and the resident daemon
+/// (which supplies them from RAM — the only structural difference, and the whole
+/// point of the daemon: skip the per-relink deserialize + symbol-view rebuild).
+fn emit_parse_only_changed(
+    output: &Path,
+    layout: &peony_layout::Layout,
+    symbols: &SymbolTable,
+    object_paths: &[String],
+    object_digests: &[u64],
+    changed_ids: &[usize],
+    emit_config: &EmitConfig,
+) -> Result<Option<HashSet<usize>>> {
+    let mut arena = InputArena::new();
+    let mut parsed: Vec<(usize, InputObject)> = Vec::new();
+    for &idx in changed_ids {
+        let Some(path) = object_paths.get(idx) else {
+            return Ok(None);
+        };
+        let obj = match parse_object(&mut arena, Path::new(path)) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        if peony_layout::object_reuse_digest(&arena, &obj, idx)
+            != object_digests.get(idx).copied().unwrap_or(u64::MAX)
+        {
+            return Ok(None); // layout/symbol/reloc demand changed → full link
+        }
+        for sec in &obj.sections {
+            for r in &sec.relocs {
+                if !reloc_apply_simple(r.r_type) {
+                    return Ok(None);
+                }
+                if let Some(s) = obj.symbol_by_index(r.symbol.0) {
+                    if s.binding != Binding::Local
+                        && !s.name.is_empty()
+                        && symbols.lookup(&s.name).is_none()
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        parsed.push((idx, obj));
+    }
+
+    // Sparse object set: changed objects at their original ids, empties else.
+    let mut objects: Vec<InputObject> = object_paths.iter().cloned().map(empty_object).collect();
+    let mut changed_set: HashSet<usize> = HashSet::with_capacity(parsed.len());
+    for (idx, obj) in parsed {
+        objects[idx] = obj;
+        changed_set.insert(idx);
+    }
+
+    let emitted = emit_partial_objects(
+        output,
+        &arena,
+        &objects,
+        symbols,
+        layout,
+        emit_config,
+        &changed_set,
+    )?;
+    if !emitted {
+        return Ok(None);
+    }
+    Ok(Some(changed_set))
+}
+
+/// Red/green section records for the `--cache-report`, computed from the changed
+/// object-id set alone (no objects vec needed): an Input output section is "red"
+/// iff a changed object contributes to it; synthetics are byte-identical.
+fn patch_sections_for_changed(
+    layout: &peony_layout::Layout,
+    changed: &HashSet<usize>,
+) -> Vec<peony_cache::PatchSectionRecord> {
+    layout
+        .output_sections
+        .iter()
+        .filter(|sec| {
+            sec.sh_type != peony_object::elf::SHT_NOBITS
+                && sec.sh_flags & peony_object::elf::SHF_ALLOC != 0
+        })
+        .map(|sec| {
+            let input_changed = matches!(sec.source, peony_layout::SecSource::Input)
+                && sec
+                    .contributions
+                    .iter()
+                    .any(|c| changed.contains(&c.object_id));
+            peony_cache::PatchSectionRecord {
+                name: sec.name.clone(),
+                file_offset: sec.sh_offset,
+                size: sec.sh_size,
+                virtual_address: sec.sh_addr,
+                input_changed,
+            }
+        })
+        .collect()
 }
 
 /// Attempt the incremental layout-reuse fast path (blueprint Phase 2).
