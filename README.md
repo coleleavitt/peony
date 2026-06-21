@@ -105,12 +105,6 @@ flags; `peony --stats` / `--trace` profile a link from the inside;
 [`bench/BENCHMARKING.md`](bench/BENCHMARKING.md) has the correctness-gated
 numbers. LTO/bitcode objects (and `-r` with COMDAT) are handed to GNU `ld`.
 
-## Crates
-
-`peony` (driver) · `peony-object` (parse) · `peony-symbols` (resolve) ·
-`peony-layout` (layout / GC / TLS) · `peony-reloc` (relocations) ·
-`peony-emit` (serialize) · `peony-cache` (incremental).
-
 ## License
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
