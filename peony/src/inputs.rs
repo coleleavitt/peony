@@ -174,7 +174,7 @@ fn extract_script_refs(text: &str) -> Vec<String> {
     refs
 }
 
-fn next_ref_directive_body<'a>(text: &'a str, start: usize) -> Option<(&'a str, usize)> {
+fn next_ref_directive_body(text: &str, start: usize) -> Option<(&str, usize)> {
     ["GROUP", "INPUT", "AS_NEEDED"]
         .into_iter()
         .filter_map(|keyword| directive_body_with_pos(text, keyword, start))
