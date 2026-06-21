@@ -18,7 +18,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use peony_cache::{CachedSymbolEntry, FastFingerprint, FrontEndSnapshot};
@@ -55,9 +55,67 @@ pub(crate) fn try_delegate(output: &Path, args_hash: u64) -> Option<bool> {
     }
 }
 
+/// Auto-spawn a background daemon for `output` when `PEONY_DAEMON=1` is set, no
+/// daemon is already serving it, and a cache exists to load — then wait briefly
+/// for it to come up. This makes the sub-5ms path automatic inside a dev shell
+/// (`export PEONY_DAEMON=1`) without affecting clean/CI builds or the test
+/// suite. The spawned daemon replicates our argv + `--daemon`, detaches its IO
+/// to `<output>.incr/daemon.log`, and idle-times-out on its own.
+pub(crate) fn ensure_autospawn(output: &Path) {
+    if std::env::var("PEONY_DAEMON").as_deref() != Ok("1") {
+        return;
+    }
+    // Already serving, or no cache to load yet (first link) → nothing to do.
+    if UnixStream::connect(socket_path(output)).is_ok() {
+        return;
+    }
+    if !peony_cache::layout_blob_path(output).exists() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&argv)
+        .arg("--daemon")
+        .stdin(std::process::Stdio::null());
+    // Detach the daemon's output to a log file in the cache dir (so it does not
+    // clutter the client's terminal); fall back to /dev/null.
+    match std::fs::File::create(peony_cache::cache_dir(output).join("daemon.log")) {
+        Ok(out) => {
+            let err = out.try_clone();
+            cmd.stdout(std::process::Stdio::from(out));
+            cmd.stderr(match err {
+                Ok(e) => std::process::Stdio::from(e),
+                Err(_) => std::process::Stdio::null(),
+            });
+        }
+        Err(_) => {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
+    if cmd.spawn().is_err() {
+        return;
+    }
+    // Wait up to ~1s for the daemon to bind its socket.
+    let sock = socket_path(output);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 /// Server side: load the incremental state into RAM and serve relinks until
-/// killed. Requires a prior `--incremental` link to have written the cache.
+/// killed or idle. Requires a prior `--incremental` link to have written the
+/// cache. Idle timeout: `PEONY_DAEMON_IDLE_SECS` (default 300s).
 pub(crate) fn serve(output: &Path, input_paths: &[PathBuf], args_hash: u64) -> Result<()> {
+    // If another daemon already bound the socket (a race between two clients
+    // auto-spawning), defer to it and exit quietly.
+    if UnixStream::connect(socket_path(output)).is_ok() {
+        return Ok(());
+    }
     let mut state = DaemonState::load(output, input_paths, args_hash)?.context(
         "no incremental cache for this output; run `peony --incremental` once before `--daemon`",
     )?;
@@ -65,23 +123,46 @@ pub(crate) fn serve(output: &Path, input_paths: &[PathBuf], args_hash: u64) -> R
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)
         .with_context(|| format!("bind daemon socket {}", sock.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("set daemon socket non-blocking")?;
+    let idle_timeout = Duration::from_secs(
+        std::env::var("PEONY_DAEMON_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    );
     eprintln!(
-        "peony daemon: serving {} ({} objects resident) on {}",
+        "peony daemon: serving {} ({} objects resident) on {} (idle timeout {}s)",
         output.display(),
         state.snapshot.object_paths.len(),
-        sock.display()
+        sock.display(),
+        idle_timeout.as_secs()
     );
-    for conn in listener.incoming() {
-        let Ok(mut conn) = conn else { continue };
-        let mut buf = [0u8; 8];
-        if conn.read_exact(&mut buf).is_err() {
-            continue;
+    let mut last_active = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                let _ = conn.set_nonblocking(false);
+                let mut buf = [0u8; 8];
+                if conn.read_exact(&mut buf).is_ok() {
+                    let status = state.handle(u64::from_le_bytes(buf));
+                    let _ = conn.write_all(&[status]);
+                    let _ = conn.flush();
+                }
+                last_active = Instant::now();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_active.elapsed() >= idle_timeout {
+                    let _ = std::fs::remove_file(&sock);
+                    eprintln!("peony daemon: idle, shutting down");
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(e.into()),
         }
-        let status = state.handle(u64::from_le_bytes(buf));
-        let _ = conn.write_all(&[status]);
-        let _ = conn.flush();
     }
-    Ok(())
 }
 
 /// The expensive incremental state, held resident in RAM.
@@ -120,9 +201,22 @@ impl DaemonState {
             return Ok(None);
         };
         let symbols = crate::build_cached_symbol_view(&cached.symbols);
+        // Baseline = the fingerprints the manifest was LAST LINKED against, NOT
+        // a re-stat of the current files. This lets the daemon notice an edit
+        // that landed before it loaded (e.g. when auto-spawned mid-relink) — the
+        // first relink request then applies that pending change instead of
+        // seeing "no change" against an already-edited file.
+        let baseline = peony_cache::manifest_fast_inputs(output)?.unwrap_or_default();
         let input_fps = input_paths
             .iter()
-            .map(|p| FastFingerprint::of_file(p).unwrap_or_default())
+            .map(|p| {
+                let s = p.display().to_string();
+                baseline
+                    .iter()
+                    .find(|(bp, _)| bp == &s)
+                    .map(|(_, fp)| *fp)
+                    .unwrap_or_default()
+            })
             .collect();
         Ok(Some(Self {
             output: output.to_path_buf(),

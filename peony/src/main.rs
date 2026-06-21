@@ -114,6 +114,16 @@ fn main() -> Result<()> {
         print_help();
         return Ok(());
     }
+    // Env opt-out for build systems that invoke the linker via `cc`/`ld` and
+    // can't pass `--no-incremental`: `PEONY_INCREMENTAL=0` (also `false`/`no`)
+    // turns off the (default-on) incremental cache for clean/CI builds.
+    if matches!(
+        std::env::var("PEONY_INCREMENTAL").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    ) {
+        args.incremental = false;
+        args.daemon = false;
+    }
     let cache_report = CacheReportSink::new(args.cache_report.clone(), args.stats);
     // `--stats`: turn on the in-linker phase profiler so the breakdown table is
     // printed at the end. `--trace` additionally records the call-flow tree
@@ -206,7 +216,10 @@ fn main() -> Result<()> {
     // Resident-daemon CLIENT: if a daemon is serving this output, delegate the
     // relink to it (it holds the layout + symbols in RAM → sub-5ms) and exit.
     // Falls through to the one-shot path if the daemon declines or is absent.
+    // With `PEONY_DAEMON=1`, auto-spawn one first (once a cache exists) so the
+    // sub-5ms path is automatic in a dev shell.
     if args.incremental {
+        daemon::ensure_autospawn(&args.output);
         if let Some(handled) = daemon::try_delegate(&args.output, args_hash) {
             if handled {
                 tracing::info!(output = %args.output.display(), "link complete (daemon relink)");

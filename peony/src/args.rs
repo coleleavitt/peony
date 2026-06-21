@@ -111,7 +111,11 @@ impl Default for Args {
             libraries: Vec::new(),
             link_specs: Vec::new(),
             output: PathBuf::from("a.out"),
-            incremental: false,
+            // Incremental linking is ON by default: a relink reuses the cache
+            // for a fast (and, with a daemon, sub-5ms) byte-identical patch.
+            // Opt out with `--no-incremental` or `PEONY_INCREMENTAL=0` (e.g. for
+            // a clean/CI build that never relinks and does not want the cache).
+            incremental: true,
             daemon: false,
             cache_report: None,
             threads: 0,
@@ -302,6 +306,10 @@ fn parse_expanded_args(argv: Vec<String>) -> Result<Args> {
             "--icf=none" | "--no-icf" => a.icf = false,
             "--build-id" => a.build_id = true,
             "--incremental" => a.incremental = true,
+            "--no-incremental" => {
+                a.incremental = false;
+                a.daemon = false;
+            }
             "--daemon" => {
                 a.incremental = true;
                 a.daemon = true;
@@ -588,8 +596,8 @@ pub(crate) fn cache_key_args(raw_args: &[String]) -> Vec<String> {
             continue;
         }
         match arg.as_str() {
-            "--incremental" | "--daemon" | "--stats" | "--trace" | "--trace-stack"
-            | "--trace-detail" => {
+            "--incremental" | "--no-incremental" | "--daemon" | "--stats" | "--trace"
+            | "--trace-stack" | "--trace-detail" => {
                 continue;
             }
             "--cache-report" | "--threads" => {
@@ -654,6 +662,6 @@ mod tests {
 
 pub(crate) fn print_help() {
     println!(
-        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table and cache diagnostics\n  --trace             Print phase timing and call-flow trace\n  --trace-detail      Include capped byte/address detail records\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Enable incremental cache\n  --cache-report FILE Write JSON cache reuse/fallback report\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  --no-crt            Do not auto-inject C runtime startup objects\n  -shared             Produce a shared object\n  --help              Print this help"
+        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table and cache diagnostics\n  --trace             Print phase timing and call-flow trace\n  --trace-detail      Include capped byte/address detail records\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Incremental cache (ON by default)\n  --no-incremental    Disable incremental (also PEONY_INCREMENTAL=0)\n  --daemon            Run a resident daemon serving sub-5ms relinks\n                      (or set PEONY_DAEMON=1 to auto-spawn one)\n  --cache-report FILE Write JSON cache reuse/fallback report\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  --no-crt            Do not auto-inject C runtime startup objects\n  -shared             Produce a shared object\n  --help              Print this help"
     );
 }

@@ -597,6 +597,24 @@ pub fn try_reuse(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<bo
     }
 }
 
+/// The per-input cheap fingerprints recorded in the manifest (the state the
+/// output was last linked against), in input order. The daemon uses these as
+/// its change-detection baseline so it correctly notices an edit that landed
+/// before it loaded (e.g. when auto-spawned mid-relink).
+pub fn manifest_fast_inputs(output: &Path) -> Result<Option<Vec<(String, FastFingerprint)>>> {
+    let path = manifest_path(output);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Some(manifest) = read_manifest(&path)? else {
+        return Ok(None);
+    };
+    if manifest.version != CACHE_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(manifest.fast_inputs))
+}
+
 pub fn load_changed_state(
     output: &Path,
     inputs: &[PathBuf],

@@ -23,6 +23,16 @@ phases + an adversarial sweep).
 > `--incremental` seed link; one output per socket; a layout-changing edit falls
 > the client back to a one-shot full link (daemon reloads via `layout.bin` mtime).
 
+**Defaults / automation.** Incremental is **ON by default** (opt out with
+`--no-incremental` or `PEONY_INCREMENTAL=0` for clean/CI builds). The daemon
+**auto-spawns** when `PEONY_DAEMON=1` is set (e.g. `export PEONY_DAEMON=1` in a
+dev shell): once a cache exists, a relink spawns a detached background daemon
+(logging to `<output>.incr/daemon.log`) and delegates to it; it idle-times-out
+after `PEONY_DAEMON_IDLE_SECS` (default 300s). The daemon's change-detection
+baseline is the manifest's last-linked fingerprints (not a re-stat), so an edit
+that lands before it loads — e.g. auto-spawned mid-relink — is still applied.
+Without the env, incremental gives the ~19ms one-shot relink, no resident process.
+
 > **THE load-bearing finding (2026-06-21, measured): for a one-shot CLI,
 > persisting + deserializing front-end state costs ≈ recomputing it.** Layout
 > blob deserialize ~1.36ms vs `compute_layout` ~6.9ms looks like a win, but the

@@ -71,6 +71,7 @@ fn took_fast_path(stderr: &str) -> bool {
     stderr.contains("parse-only-changed fast relink")
         || stderr.contains("reusing cached layout")
         || stderr.contains("incremental patch emitted")
+        || stderr.contains("daemon relink")
 }
 
 /// Compile a freestanding C object named `name.c` with the given body.
@@ -348,6 +349,67 @@ fn daemon_relink_is_byte_identical_to_full_link() {
     assert_eq!(
         app_bytes, full_bytes,
         "daemon relink output must be byte-identical to a full link"
+    );
+    assert_eq!(run(&app), 77, "relinked output must exit 77");
+}
+
+/// `PEONY_DAEMON=1` auto-spawns a daemon on a relink (once a cache exists) and
+/// delegates to it — the "automatic sub-5ms" dev-shell experience. Verifies the
+/// auto-spawn fires (a daemon.log appears) and the relink is byte-identical. A
+/// short idle timeout reaps the detached daemon shortly after.
+#[test]
+fn daemon_autospawn_is_byte_identical_to_full_link() {
+    let dir = workdir("inc-autospawn");
+    let start = assemble_start(&dir);
+    let app = dir.join("app");
+    let compute = dir.join("compute.o");
+    let inputs = [&start, &compute];
+
+    let link_auto = |out: &Path| -> (bool, String) {
+        let o = Command::new(PEONY)
+            .arg("-o")
+            .arg(out)
+            .arg(&start)
+            .arg(&compute)
+            .env("PEONY_LOG", "peony=info")
+            .env("PEONY_DAEMON", "1")
+            .env("PEONY_DAEMON_IDLE_SECS", "2")
+            .output()
+            .expect("run peony");
+        (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).into(),
+        )
+    };
+
+    // Seed (default-on incremental; no daemon yet, no cache → just links).
+    compile_compute(&dir, "int compute(void){ return 42; }\n");
+    let (ok, _) = link_auto(&app);
+    assert!(ok, "seed link failed");
+
+    // Size-stable edit → relink: auto-spawns a daemon (cache now exists) + uses it.
+    compile_compute(&dir, "int compute(void){ return 77; }\n");
+    let (ok, stderr) = link_auto(&app);
+    assert!(ok, "auto-spawn relink failed");
+
+    // Full reference (opt out of incremental).
+    let full = dir.join("full");
+    let (ok, _) = peony_link(&full, &inputs, &["--no-incremental"]);
+    assert!(ok, "full link failed");
+
+    let daemon_log = dir.join("app.incr").join("daemon.log");
+    assert!(
+        daemon_log.exists(),
+        "PEONY_DAEMON=1 should have auto-spawned a daemon (no daemon.log); stderr:\n{stderr}"
+    );
+    assert!(
+        took_fast_path(&stderr),
+        "auto-spawn relink should take a fast path; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&app).unwrap(),
+        std::fs::read(&full).unwrap(),
+        "auto-spawned daemon relink must be byte-identical to a full link"
     );
     assert_eq!(run(&app), 77, "relinked output must exit 77");
 }
