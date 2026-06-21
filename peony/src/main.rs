@@ -906,19 +906,22 @@ fn try_reuse_layout(
             }
         }
     }
-    let fp = peony_layout::compute_layout_fingerprint(
-        arena,
-        objects,
-        symbols,
-        got_syms,
-        plt_syms,
-        live,
-        config,
-        tls_got,
-        fold_map,
-        &changed_object_ids,
-        Some(&snap.object_digests),
-    );
+    let fp = {
+        let _t = peony_prof::trace("reuse:fingerprint");
+        peony_layout::compute_layout_fingerprint(
+            arena,
+            objects,
+            symbols,
+            got_syms,
+            plt_syms,
+            live,
+            config,
+            tls_got,
+            fold_map,
+            &changed_object_ids,
+            Some(&snap.object_digests),
+        )
+    };
     if fp.drivers_hash != snap.drivers_hash {
         tracing::debug!(
             current = fp.drivers_hash,
@@ -930,14 +933,26 @@ fn try_reuse_layout(
     // Read the cached layout from its own file and verify it matches the
     // manifest's `blob_hash` (guards against a stale blob from a crash between
     // writing `layout.bin` and the manifest).
-    let blob = peony_cache::read_layout_blob(output).ok().flatten()?;
-    if peony_cache::blob_hash(&blob) != snap.blob_hash {
-        tracing::debug!("reuse-gate: layout.bin hash mismatch (stale blob)");
-        return None;
+    let blob = {
+        let _t = peony_prof::trace("reuse:read-blob");
+        peony_cache::read_layout_blob(output).ok().flatten()?
+    };
+    {
+        let _t = peony_prof::trace("reuse:blob-hash");
+        if peony_cache::blob_hash(&blob) != snap.blob_hash {
+            tracing::debug!("reuse-gate: layout.bin hash mismatch (stale blob)");
+            return None;
+        }
     }
-    let Some(layout) = peony_layout::deserialize_layout(&blob) else {
-        tracing::debug!("reuse-gate: layout blob failed to deserialize");
-        return None;
+    let layout = {
+        let _t = peony_prof::trace("reuse:deserialize");
+        match peony_layout::deserialize_layout(&blob) {
+            Some(l) => l,
+            None => {
+                tracing::debug!("reuse-gate: layout blob failed to deserialize");
+                return None;
+            }
+        }
     };
     // The drivers matched, so the cached snapshot is still valid for the NEXT
     // relink — hand it back so recording persists the small manifest verbatim

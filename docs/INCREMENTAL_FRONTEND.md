@@ -1,24 +1,35 @@
 # Incremental Front-End — Sub-5ms One-File Relink (Executable Blueprint)
 
-Status: Phase 0 + Phase 2 LANDED (layout reuse, byte-identical + thread-stable).
-Goal: a one-file-change relink in <5ms (10× vs mold's ~37ms-every-link), peony's
-whole thesis. **Every phase MUST keep the output byte-identical to a full link**
-(the non-negotiable gate).
+Status: Phase 0 + 2 + 5 LANDED (layout reuse + object-granular emit + record
+fast-path; byte-identical, thread-stable). A one-`.o` size-stable relink is now
+**at parity with a full link** (~32ms vs ~31ms on the 402-obj harness), down from
+the ~73ms NET LOSS we started with. Goal remains a <5ms relink (10× vs mold's
+~37ms-every-link). **Every phase MUST keep the output byte-identical to a full
+link** (the non-negotiable gate).
 
-> **Phase 2 measured finding (2026-06-21): blob-serialized layout reuse is near
-> break-even, NOT the projected ~9ms win.** On the 402-object harness,
-> `compute_layout` is ~6.9ms but **deserializing the 1.4MB bincode `Layout` blob
-> costs ~5.5ms** — so skipping layout nets only ~1.5ms. This is the SAME trap the
-> blueprint already flags for parsed objects ("deserializing costs more than
-> re-parsing"): bincode deserialize ≈ recompute. The incremental relink is still
-> > a full link because the front-end (parse+resolve ~8ms) re-runs (Phases 3–4)
-> and `incremental:record` re-hashes the whole output for red/green coloring
-> (~7ms, Phase 5). **The 10× thesis needs zero-copy mmap'd persistent state
-> (Wild's actual design) or a resident daemon, not bincode blobs.** What Phase 2
-> *did* deliver and is reusable: a complete, hard-gated **hazard fingerprint**
-> (`peony_layout::compute_layout_fingerprint`) that folds every layout-determining
-> input, and the **persistence schema** (`FrontEndSnapshot`) — the foundation the
-> next phases build on regardless of the serialization format chosen.
+> **THE load-bearing finding (2026-06-21, measured): for a one-shot CLI,
+> persisting + deserializing front-end state costs ≈ recomputing it.** Layout
+> blob deserialize ~1.36ms vs `compute_layout` ~6.9ms looks like a win, but the
+> hazard fingerprint that GATES the reuse costs ~1.59ms (the id→name bijection
+> fold — kept; it is the id-stability safety proof) + blob-hash 0.74ms, so the
+> whole layout phase is ~4.8ms ≈ a from-scratch layout. The SAME wall kills
+> Phases 3–4: deserializing 16k symbol resolutions ≈ re-resolving them
+> (resolve-bare is only ~4ms). **So blob-persistence is structurally break-even;
+> the 10× thesis needs a resident DAEMON (parse/resolve/layout/symbols stay in
+> RAM, only the changed `.o` is reprocessed) or true zero-copy mmap'd state —
+> NOT a faster bincode.** The mmap pivot is NOT worth it as a layout-only change:
+> the deserialize it removes is just ~1.36ms.
+>
+> What Phases 2+5 DID deliver (all reusable, all byte-identical-gated): the
+> hard-gated **hazard fingerprint** (`compute_layout_fingerprint`), the
+> **persistence schema** (`FrontEndSnapshot` + separate `layout.bin`),
+> **object-granular emit** (`emit_partial_objects` — only the changed object's
+> contributions, not all of reddened `.text`), and the **record fast path**
+> (separate blob file + killed two vestigial whole-output hashes: 6ms→2ms). The
+> remaining big lever is **parsing only the changed object** (~8ms parse+resolve
+> is fully redundant on reuse): resolve the changed object's relocs against the
+> cached `name→VA` map + reuse layout, skipping the 406 unchanged parses — a
+> large dedicated restructure, the real Phase 3–4.
 
 Distilled from a 6-agent design pass (peony-object/parse, peony-symbols/resolve,
 peony-layout, peony-reloc, peony-cache, and Wild/mold reference) + direct
@@ -99,14 +110,15 @@ is cheaper than deserializing + re-interning + re-binding arena file_ids.
 | 0 ✅ | record reuses unchanged-input fingerprints | re-hash all inputs | 73→47ms |
 | 1 | Capacity SLACK on initial link (Wild STEP 1) so a same-or-smaller edit keeps file_offset/vaddr → `plan_partial_relink` stays green for size-*growing* edits too | — (robustness; **changes baseline output** → re-baseline) | — |
 | 2 ✅ | Reuse cached **layout** when size-stable + no-hazard: hazard-fingerprint the whole front-end, and on a match deserialize the cached `Layout` and skip `compute_layout` (substituted *before* finalize, so finalize/reloc/emit run unchanged). Descopes `--gc-sections`/`--icf` + changed non-object inputs → full-link. **Net only ~1.5ms** (deserialize ~5.5ms ≈ compute ~6.9ms — see finding above). Also skips the reverse-index build on reuse (no symbol can move) and re-persists the cached blob verbatim (no re-serialize). | `compute_layout` minus deserialize | ~1.5ms saved |
-| 3 | Reuse cached **symbol table** (persist id-order + resolution; patch the changed object's defs without renumbering survivors) | `resolve-bare` ~4ms | ~26ms |
-| 4 | Re-parse ONLY the changed object; reuse other parses' downstream state | most of `parse-bare` + the front-end barrier | ~10ms |
-| 5 | `emit_partial` iterates only RED sections (today walks all 16k) + drop the `incremental:record` full-output re-hash (~7ms) | emit iteration + record | **<5ms** |
+| 5a ✅ | **Record fast path**: serialized layout moved to its own `layout.bin` (reuse relink rewrites only the small manifest, not the ~MB blob); killed two vestigial whole-output hashes (`SectionRecord.fingerprint` for dead `compute_red_green`, and the never-read `manifest.output`). | `incremental:record` 6ms→2ms | record −4ms |
+| 5b ✅ | **Object-granular emit** (`emit_partial_objects`): a drivers match proves no address moved, so re-emit ONLY the changed objects' contributions (overwrite-in-place leaves all else byte-identical) instead of all of reddened `.text`. section-copy 16407 sections → 3 on the harness; scales with project size. | unchanged objects' input copy | emit 7→5ms |
+| 3–4 | **Parse only the changed object** (the real remaining ~8ms lever, NOT yet done): resolve the changed `.o`'s relocs against the cached `name→VA` map + reuse layout, skipping the 406 unchanged parses + the full re-resolve. Large dedicated restructure; hits the deserialize≈recompute wall unless symbols stay resident. | most of `parse+resolve` | the big one |
 
 **Phase 2 implementation (landed):** serde on `Layout`+nested types (peony-layout/object/symbols);
 `compute_layout_fingerprint` (per-object geometry+symbol digests, reused for unchanged objects, +
 global drivers: full id→name bijection, GOT/PLT/TLS demand, commons, copy relocs, imports/exports,
-config); manifest v6 `FrontEndSnapshot{drivers_hash, object_digests, object_paths, layout_blob}`;
+config); manifest v6 `FrontEndSnapshot{drivers_hash, blob_hash, object_digests, object_paths}` +
+the serialized layout in a separate `<output>.incr/layout.bin` (`blob_hash` guards a stale blob);
 driver `try_reuse_layout` gate before `compute_layout`. Gate proven by `peony/tests/incremental.rs`
 (byte-identical vs full link, alternating relinks) + the `/tmp/incbench` 402-object harness
 (0 mismatches across 6 thread counts + cross-thread reuse). NOTE the original `compute_a.o`/`compute_b.o`
