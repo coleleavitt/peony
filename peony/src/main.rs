@@ -587,7 +587,7 @@ fn main() -> Result<()> {
     // what `compute_layout` returns and downstream substitution is transparent.
     // Only produced when reuse is in scope (no gc/icf); otherwise `None`, so a
     // gc/icf link records no snapshot and the next relink full-links.
-    let front_end_snapshot = build_front_end_snapshot(
+    let (front_end_snapshot, layout_blob) = build_front_end_snapshot(
         fe_eligible,
         &arena,
         &objects,
@@ -756,8 +756,12 @@ fn main() -> Result<()> {
 
     if args.incremental {
         let _t = peony_prof::trace("incremental:record");
-        let sections = section_records(&args.output, &layout).unwrap_or_default();
+        let sections = {
+            let _t = peony_prof::trace("record:section-records");
+            section_records(&layout).unwrap_or_default()
+        };
         let cached_symbols = symbol_records(&symbols);
+        let _t2 = peony_prof::trace("record:write-manifest");
         peony_cache::record_link_with_sections(
             &args.output,
             &input_paths,
@@ -765,6 +769,7 @@ fn main() -> Result<()> {
             &sections,
             &cached_symbols,
             front_end_snapshot.as_ref(),
+            layout_blob.as_deref(),
         )
         .context("incremental cache record")?;
     }
@@ -782,11 +787,12 @@ fn main() -> Result<()> {
 /// without relaying out. Capacity currently equals size (no incremental padding
 /// is reserved yet); a future padding pass can widen it. Reads the emitted
 /// output once and slices each allocatable section by its file range.
-fn section_records(
-    output: &Path,
-    layout: &peony_layout::Layout,
-) -> Option<Vec<peony_cache::SectionRecord>> {
-    let bytes = std::fs::read(output).ok()?;
+fn section_records(layout: &peony_layout::Layout) -> Option<Vec<peony_cache::SectionRecord>> {
+    // Pure walk of the laid-out sections — no output read. The active patch
+    // planner (`plan_partial_relink`) consumes only offset/size/capacity/vaddr;
+    // the per-section content `fingerprint` fed the now-dead `compute_red_green`
+    // path, so we no longer read+hash the whole output to compute it (that was
+    // ~1ms of wasted work on every incremental link).
     let mut records = Vec::new();
     for sec in &layout.output_sections {
         // Only file-backed allocatable sections have stable, patchable bytes.
@@ -795,15 +801,9 @@ fn section_records(
         {
             continue;
         }
-        let start = sec.sh_offset as usize;
-        let end = start + sec.sh_size as usize;
-        let fingerprint = match bytes.get(start..end) {
-            Some(slice) => peony_cache::Fingerprint::of_bytes(slice),
-            None => continue, // out-of-range (e.g. .tbss): skip
-        };
         records.push(peony_cache::SectionRecord {
             name: sec.name.clone(),
-            fingerprint,
+            fingerprint: peony_cache::Fingerprint::default(),
             file_offset: sec.sh_offset,
             size: sec.sh_size,
             capacity: sec.sh_size, // no padding reserved yet
@@ -903,13 +903,21 @@ fn try_reuse_layout(
         );
         return None;
     }
-    let Some(layout) = peony_layout::deserialize_layout(&snap.layout_blob) else {
+    // Read the cached layout from its own file and verify it matches the
+    // manifest's `blob_hash` (guards against a stale blob from a crash between
+    // writing `layout.bin` and the manifest).
+    let blob = peony_cache::read_layout_blob(output).ok().flatten()?;
+    if peony_cache::blob_hash(&blob) != snap.blob_hash {
+        tracing::debug!("reuse-gate: layout.bin hash mismatch (stale blob)");
+        return None;
+    }
+    let Some(layout) = peony_layout::deserialize_layout(&blob) else {
         tracing::debug!("reuse-gate: layout blob failed to deserialize");
         return None;
     };
-    // The drivers matched, so the freshly-computed fingerprint equals the cached
-    // one and the cached snapshot is still valid for the NEXT relink — hand it
-    // back so recording can persist it verbatim, skipping a 1.4MB re-serialize.
+    // The drivers matched, so the cached snapshot is still valid for the NEXT
+    // relink — hand it back so recording persists the small manifest verbatim
+    // and skips rewriting `layout.bin` entirely.
     Some((layout, cached.front_end.unwrap()))
 }
 
@@ -930,16 +938,18 @@ fn build_front_end_snapshot(
     fold_map: Option<&peony_layout::icf::FoldMap>,
     reused_snapshot: Option<peony_cache::FrontEndSnapshot>,
     layout: &peony_layout::Layout,
-) -> Option<peony_cache::FrontEndSnapshot> {
+) -> (Option<peony_cache::FrontEndSnapshot>, Option<Vec<u8>>) {
     if !eligible {
-        return None;
+        return (None, None);
     }
     // Reuse path: the cached snapshot is still valid (drivers matched), so
-    // persist it verbatim — no re-fingerprint, no 1.4MB re-serialize.
+    // persist its metadata verbatim and DON'T rewrite `layout.bin` (`None` blob)
+    // — the cached blob is byte-identical.
     if let Some(snapshot) = reused_snapshot {
-        return Some(snapshot);
+        return (Some(snapshot), None);
     }
-    // Full/first link: digest every object and serialize the fresh layout.
+    // Full/first link: digest every object and serialize the fresh layout into
+    // its own blob file.
     let fp = peony_layout::compute_layout_fingerprint(
         arena,
         objects,
@@ -953,12 +963,14 @@ fn build_front_end_snapshot(
         &FxHashSet::default(),
         None,
     );
-    Some(peony_cache::FrontEndSnapshot {
+    let blob = peony_layout::serialize_layout(layout);
+    let meta = peony_cache::FrontEndSnapshot {
         drivers_hash: fp.drivers_hash,
+        blob_hash: peony_cache::blob_hash(&blob),
         object_digests: fp.object_digests,
         object_paths: objects.iter().map(|o| o.path.clone()).collect(),
-        layout_blob: peony_layout::serialize_layout(layout),
-    })
+    };
+    (Some(meta), Some(blob))
 }
 
 enum IncrementalEmitPlan {

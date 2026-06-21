@@ -180,20 +180,24 @@ pub struct CachedSymbolEntry {
 ///
 /// On a changed-input relink, if the freshly-computed layout drivers reproduce
 /// `drivers_hash` (and the object set matches `object_paths`), the cached
-/// `Layout` serialized in `layout_blob` is byte-identical to what a fresh
-/// `compute_layout` would produce, so it is substituted verbatim and the
-/// expensive layout pass is skipped. `object_digests` lets a relink reuse the
-/// per-object fingerprints of unchanged objects instead of re-walking them.
+/// `Layout` in `layout.bin` is byte-identical to what a fresh `compute_layout`
+/// would produce, so it is substituted verbatim and the expensive layout pass
+/// is skipped. `object_digests` lets a relink reuse the per-object fingerprints
+/// of unchanged objects instead of re-walking them.
 ///
-/// `layout_blob` is opaque to this crate (produced/consumed by
-/// `peony-layout::{serialize_layout, deserialize_layout}`); the cache only
-/// stores and returns the bytes.
+/// The serialized `Layout` blob is stored SEPARATELY in `<output>.incr/layout.bin`
+/// (not inline here), so a reuse relink — which does not change the layout —
+/// rewrites only this small manifest, never the ~MB blob. `blob_hash` ties this
+/// metadata to the exact `layout.bin` it expects: if the blob on disk does not
+/// match (e.g. a crash between writing the blob and the manifest, or a stale
+/// file), reuse falls back to a full link rather than deserializing a layout
+/// that does not correspond to these drivers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontEndSnapshot {
     pub drivers_hash: u64,
+    pub blob_hash: u64,
     pub object_digests: Vec<u64>,
     pub object_paths: Vec<String>,
-    pub layout_blob: Vec<u8>,
 }
 
 /// Previously recorded state that is safe to consult for a changed-input relink.
@@ -499,6 +503,32 @@ fn manifest_path(output: &Path) -> PathBuf {
     cache_dir(output).join("manifest.bin")
 }
 
+/// Path of the serialized `Layout` blob for the layout-reuse fast path.
+fn layout_blob_path(output: &Path) -> PathBuf {
+    cache_dir(output).join("layout.bin")
+}
+
+/// Read the cached `Layout` blob (`<output>.incr/layout.bin`), or `None` if it
+/// is absent. The bytes are opaque to this crate (deserialized by
+/// `peony-layout::deserialize_layout`); the caller must still verify the blob
+/// hash against the manifest's [`FrontEndSnapshot::blob_hash`].
+pub fn read_layout_blob(output: &Path) -> Result<Option<Vec<u8>>> {
+    let path = layout_blob_path(output);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CacheError::Io {
+            path: path.display().to_string(),
+            source: e,
+        }),
+    }
+}
+
+/// FNV-1a-64 hash of a `Layout` blob, used as [`FrontEndSnapshot::blob_hash`].
+pub fn blob_hash(blob: &[u8]) -> u64 {
+    Fingerprint::of_bytes(blob).hash
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Returns `true` if the output can be fully reused (epoch unchanged + output unmodified).
@@ -611,7 +641,7 @@ pub fn load_changed_state(
 /// the output-affecting flags ([`hash_args`]); it is folded into the stored
 /// epoch key so [`try_reuse`] can reject a relink with changed flags.
 pub fn record_link(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<()> {
-    record_link_with_sections(output, inputs, args_hash, &[], &[], None)
+    record_link_with_sections(output, inputs, args_hash, &[], &[], None, None)
 }
 
 /// Record fingerprints + section records + symbol cache after a successful link.
@@ -625,12 +655,21 @@ pub fn record_link_with_sections(
     sections: &[SectionRecord],
     symbols: &[CachedSymbolEntry],
     front_end: Option<&FrontEndSnapshot>,
+    layout_blob: Option<&[u8]>,
 ) -> Result<()> {
     let dir = cache_dir(output);
     std::fs::create_dir_all(&dir).map_err(|e| CacheError::Io {
         path: dir.display().to_string(),
         source: e,
     })?;
+
+    // Persist the (large) serialized layout to its own file FIRST, so the
+    // manifest written below only ever commits a `blob_hash` that already exists
+    // on disk. A reuse relink passes `None` here: the blob is unchanged, so we
+    // skip rewriting ~MB of layout bytes and only refresh the small manifest.
+    if let Some(blob) = layout_blob {
+        atomic_write(&layout_blob_path(output), blob)?;
+    }
 
     // Cheap stat fingerprints for the no-change gate (always recorded).
     let mut fast_inputs = Vec::with_capacity(inputs.len());
@@ -675,11 +714,10 @@ pub fn record_link_with_sections(
         }
         v
     };
-    let output_fp = if sections.is_empty() {
-        Fingerprint::default()
-    } else {
-        Fingerprint::of_file(output)?
-    };
+    // The content fingerprint of the output is never read back (the reuse and
+    // changed-state gates compare the cheap `fast_output` stat fingerprint), so
+    // do NOT hash the whole output here — that was ~1ms of dead work per link.
+    let output_fp = Fingerprint::default();
 
     let epoch_key = compute_epoch_key(inputs, args_hash);
     let manifest = Manifest {
@@ -1134,7 +1172,7 @@ mod tests {
                 virtual_address: 0x2000,
             },
         ];
-        record_link_with_sections(&out, &[inp], 0, &secs, &[], None).unwrap();
+        record_link_with_sections(&out, &[inp], 0, &secs, &[], None, None).unwrap();
 
         // Read the manifest back and confirm the records survived intact.
         let bytes = std::fs::read(manifest_path(&out)).unwrap();
