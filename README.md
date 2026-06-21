@@ -5,6 +5,11 @@ designed to be fast, incremental, and drop-in compatible with the standard
 `ld`/`cc` command line so it can be used directly as the linker for `rustc` and
 `gcc`-based toolchains.
 
+Its headline is the **edit–rebuild loop**: a one-file change relinks in **~19 ms**
+as a one-shot, or **~3–4 ms** with a resident daemon — vs a ~32 ms full link
+(402-object program), always **byte-identical to a full link**. Incremental is on
+by default; the daemon is one `PEONY_DAEMON=1` away.
+
 ## Features
 
 - **ELF x86-64** — produces `ET_EXEC`, `ET_DYN` (PIE), and shared-object
@@ -21,10 +26,18 @@ designed to be fast, incremental, and drop-in compatible with the standard
   entry point and (for shared objects) all exported symbols
 - **COMDAT deduplication** — eliminates duplicate C++ inline/template sections
   across translation units
-- **Incremental linking** (`--incremental`) — fingerprint/stat cache for
-  byte-identical no-change reuse plus red/green changed-input patching when
-  section layout stays stable; unsafe size/layout changes conservatively fall
-  back to a full emit instead of serving stale bytes
+- **Incremental linking** (on by default) — a multi-tier fast relink that is
+  always **byte-identical to a full link** (the non-negotiable gate). A no-change
+  relink is reused from a stat cache; a size-stable one-`.o` edit re-parses *only*
+  the changed object, reuses the cached layout + symbol table, and patches just
+  that object's bytes in place. Any unsafe change (size, layout, symbol set, or
+  GOT/PLT/TLS demand) conservatively falls back to a full link rather than serving
+  stale bytes. Opt out with `--no-incremental` or `PEONY_INCREMENTAL=0`.
+- **Resident daemon** (`--daemon`, or `PEONY_DAEMON=1` to auto-spawn) — holds the
+  deserialized layout and symbol table in RAM and serves relinks over a Unix
+  socket, so each relink skips the per-invocation library search, layout
+  deserialize, and symbol-table rebuild — **~3–4 ms** warm, ~10× faster than
+  re-linking from scratch every time. Idle-times-out on its own.
 - **Linker-synthesised symbols** — `_end`, `_edata`, `__bss_start`,
   `_GLOBAL_OFFSET_TABLE_`, `__executable_start`, `__dso_handle`, etc.
 - **`--defsym`** — define absolute symbols on the command line
@@ -74,7 +87,9 @@ peony -o output input.o [input2.o ...] [-L dir] [-l lib] [flags]
 | `-L DIR` | Add library search directory |
 | `-l NAME` | Link library `libNAME.{a,so}` |
 | `--gc-sections` | Dead-strip unreachable sections |
-| `--incremental` | Enable no-change reuse and safe changed-input patching |
+| `--incremental` | Incremental cache + fast relinks (**on by default**) |
+| `--no-incremental` | Disable incremental (also `PEONY_INCREMENTAL=0`) |
+| `--daemon` | Run a resident daemon serving sub-5 ms relinks (also `PEONY_DAEMON=1` to auto-spawn) |
 | `--cache-report FILE` | Write JSON explaining cache reuse, partial relink, or full-emit fallback |
 | `--build-id` | Emit `.note.gnu.build-id` |
 | `-pie` / `-no-pie` | Position-independent executable |
@@ -104,6 +119,38 @@ objects and LLVM bitcode objects are handed to GNU `ld` so the real plugin can
 materialize native code. Relocatable `-r` output uses the same GNU `ld`
 compatibility handoff while Peony's native emitter remains focused on
 executables and shared objects.
+
+## Incremental relinks & the daemon
+
+Peony's edit–rebuild loop has three tiers, each **byte-identical to a full link**
+(verified by a `cmp`-vs-full gate across thread counts and an adversarial
+relocation sweep):
+
+| Tier | What it does | One-`.o` relink (402-obj program) |
+|---|---|---|
+| **no-change reuse** | stat-cache hit → reuse the existing output untouched | instant |
+| **one-shot fast relink** | re-parse *only* the changed `.o`, reuse the cached layout + symbol table, patch its bytes in place | **~19 ms** (vs ~32 ms full) |
+| **resident daemon** | the above, but layout + symbols stay in RAM across invocations | **~3–4 ms** warm |
+
+Anything the fast path can't prove safe (a size/layout change, a new symbol, a
+new GOT/PLT/TLS demand, `--gc-sections`/`--icf`, a changed archive/shared lib)
+falls back to a full link — peony never serves stale bytes.
+
+Incremental is **on by default**. Turn it off for clean/CI builds that never
+relink (and don't want the `<output>.incr/` cache) with `--no-incremental` or
+`PEONY_INCREMENTAL=0`.
+
+The daemon gives the sub-5 ms tier. Either run it explicitly:
+
+```sh
+peony --incremental -o app … objs…   # one seed link establishes the cache
+peony --daemon       -o app … objs… &  # resident server on app.incr/daemon.sock
+```
+
+…or just export `PEONY_DAEMON=1` in your dev shell and let peony **auto-spawn**
+one: once a cache exists, a relink spawns a detached background daemon (logging
+to `<output>.incr/daemon.log`) and delegates to it. The daemon idle-times-out
+after `PEONY_DAEMON_IDLE_SECS` (default 300 s), so it cleans up after itself.
 
 ### Invoking from rustc/Cargo
 
@@ -150,11 +197,15 @@ rustflags = [
 ]
 ```
 
-To enable Peony's linker cache from Cargo, pass Peony's flag through `rustc` as a
-linker argument:
+Peony's incremental cache is **on by default**, so no extra flag is needed to
+get fast relinks. To turn it *off* for a CI/clean build, set
+`PEONY_INCREMENTAL=0` in the environment (build systems invoke the linker via
+`cc`/`ld`, so the env var is easier to inject than a flag). To get the sub-5 ms
+daemon tier, export `PEONY_DAEMON=1` and peony auto-spawns one on the first
+relink:
 
 ```sh
-RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no -C link-arg=--incremental" cargo build
+PEONY_DAEMON=1 cargo build   # auto-spawns a resident daemon for sub-5 ms relinks
 ```
 
 For large projects where you want to tell Cargo-facing tooling what the final
@@ -163,7 +214,7 @@ excluded from Peony's cache key so turning diagnostics on does not dirty an
 otherwise reusable link:
 
 ```sh
-RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no -C link-arg=--incremental -C link-arg=--cache-report=target/peony-cache-report.json" cargo build
+RUSTFLAGS="-C linker=/path/to/peony -C linker-flavor=ld -C link-self-contained=no -C link-arg=--cache-report=target/peony-cache-report.json" cargo build
 ```
 
 Keep that `RUSTFLAGS` value stable between retries. Cargo fingerprints the full
