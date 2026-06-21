@@ -609,16 +609,41 @@ pub fn record_link_with_sections(
     for p in inputs {
         fast_inputs.push((p.display().to_string(), FastFingerprint::of_file(p)?));
     }
-    // Content fingerprints feed red-green section coloring, which is not yet
-    // wired into the driver; recording them would re-hash every input's full
-    // bytes on every link (the cost we just removed from the reuse path). Record
-    // them only when section records are actually being produced.
+    // Content fingerprints feed red-green section coloring. REUSE the cached
+    // content fingerprint for any input whose cheap stat fingerprint is
+    // unchanged, and content-hash only the genuinely-changed inputs. Re-hashing
+    // every input's full bytes on every relink was the DOMINANT cost of an
+    // incremental relink (it made a one-file relink slower than a full link). An
+    // input with an unchanged stat fp has unchanged bytes, so the recorded
+    // content fp stays faithful — the same trust model `try_reuse` uses.
     let input_fps = if sections.is_empty() {
         Vec::new()
     } else {
+        let prior = read_manifest(&manifest_path(output)).ok().flatten();
+        let old_fast: HashMap<&str, FastFingerprint> = prior
+            .as_ref()
+            .map(|m| {
+                m.fast_inputs
+                    .iter()
+                    .map(|(p, fp)| (p.as_str(), *fp))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let old_content: HashMap<&str, Fingerprint> = prior
+            .as_ref()
+            .map(|m| m.inputs.iter().map(|(p, fp)| (p.as_str(), *fp)).collect())
+            .unwrap_or_default();
         let mut v = Vec::with_capacity(inputs.len());
-        for p in inputs {
-            v.push((p.display().to_string(), Fingerprint::of_file(p)?));
+        for (p, (path_str, new_fast)) in inputs.iter().zip(&fast_inputs) {
+            let reuse = old_fast
+                .get(path_str.as_str())
+                .zip(old_content.get(path_str.as_str()))
+                .and_then(|(of, oc)| (of == new_fast).then_some(*oc));
+            let fp = match reuse {
+                Some(fp) => fp,
+                None => Fingerprint::of_file(p)?,
+            };
+            v.push((path_str.clone(), fp));
         }
         v
     };

@@ -635,6 +635,7 @@ fn main() -> Result<()> {
     let _emit_span = peony_prof::phase("emit");
     let emit_config = EmitConfig::default();
     let incremental_plan = if args.incremental {
+        let _t = peony_prof::trace("incremental:plan");
         incremental_emit_plan(
             &args.output,
             &input_paths,
@@ -700,6 +701,7 @@ fn main() -> Result<()> {
     }
 
     if args.incremental {
+        let _t = peony_prof::trace("incremental:record");
         let sections = section_records(&args.output, &layout).unwrap_or_default();
         let cached_symbols = symbol_records(&symbols);
         peony_cache::record_link_with_sections(
