@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
-use peony_emit::{EmitConfig, emit_full, emit_partial, emit_partial_objects};
+use peony_emit::{EmitConfig, emit_full, emit_partial, emit_partial_objects, emit_relocatable};
 use peony_layout::{
     LayoutConfig,
     ScriptLayout,
@@ -142,8 +142,14 @@ fn main() -> Result<()> {
     }
     peony_prof::record_rss("start");
     reject_unsupported_flags(&args)?;
-    if maybe_handoff_relocatable(&args)? {
-        return Ok(());
+    if args.relocatable {
+        // `-r` produces an `ET_REL` object, not a loadable image — the
+        // incremental cache / daemon machinery does not apply. The native vs.
+        // GNU `ld` handoff decision is deferred until after parsing (it depends
+        // on whether the inputs carry COMDAT groups, which native -r does not
+        // regenerate yet).
+        args.incremental = false;
+        args.daemon = false;
     }
     if maybe_handoff_lto_plugin(&args)? {
         return Ok(());
@@ -278,6 +284,24 @@ fn main() -> Result<()> {
     peony_prof::record_items("name-intern", arena.interned_name_count() as u64);
     peony_prof::record_bytes("name-intern", arena.interned_name_bytes());
     peony_prof::record_rss("after-parse-resolve");
+
+    // Relocatable (`-r`) output: emit an `ET_REL` object directly from the
+    // parsed objects + merged symbols (no layout/GOT/PLT/dynamic). Hands off to
+    // GNU `ld` only when the inputs carry COMDAT groups (native -r does not
+    // regenerate `.group` sections yet).
+    if args.relocatable {
+        apply_defsym(&mut symbols, &args.defsym)?;
+        if objects.iter().any(|o| !o.comdat_groups.is_empty()) {
+            tracing::info!("relocatable -r with COMDAT groups → GNU ld handoff");
+            maybe_handoff_relocatable(&args)?;
+            return Ok(());
+        }
+        emit_relocatable(&args.output, &arena, &objects, &symbols)
+            .context("relocatable -r emission")?;
+        tracing::info!(output = %args.output.display(), "relocatable -r link complete");
+        peony_prof::report();
+        return Ok(());
+    }
 
     // Weak-undefined symbols referenced through the GOT (e.g. `__gmon_start__`)
     // need a real SymbolId so their GOT slot gets a recorded address (holding 0).

@@ -649,6 +649,7 @@ dependencies = [
  "peony-reloc",
  "peony-symbols",
  "rayon",
+ "rustc-hash",
  "thiserror",
  "tracing",
  "ws-deque",

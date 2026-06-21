@@ -26,6 +26,9 @@ by default; the daemon is one `PEONY_DAEMON=1` away.
   entry point and (for shared objects) all exported symbols
 - **COMDAT deduplication** — eliminates duplicate C++ inline/template sections
   across translation units
+- **Relocatable output** (`-r`) — native partial linking: merge inputs into one
+  `ET_REL` object with combined symbols and kept relocations (COMDAT inputs hand
+  off to GNU `ld`)
 - **Incremental linking** (on by default) — a multi-tier fast relink that is
   always **byte-identical to a full link** (the non-negotiable gate). A no-change
   relink is reused from a stat cache; a size-stable one-`.o` edit re-parses *only*
@@ -105,7 +108,7 @@ peony -o output input.o [input2.o ...] [-L dir] [-l lib] [flags]
 | `--exclude-libs LIST` | Hide archive-provided symbols from dynamic exports |
 | `--hash-style=sysv\|gnu\|both` | Select dynamic hash-table style where supported |
 | `--no-undefined` / `-z defs` | Reject unresolved symbols in shared-object links |
-| `-r` | Produce relocatable output through GNU `ld` compatibility handoff |
+| `-r` | Produce a relocatable (`ET_REL`) object — native partial linking (GNU `ld` handoff for COMDAT inputs) |
 | `--version-script FILE` | Export/localise symbols per version script |
 | `--defsym SYM=VAL` | Define an absolute symbol |
 | `--threads N` | Worker thread count (0 = auto) |
@@ -116,9 +119,13 @@ peony -o output input.o [input2.o ...] [-L dir] [-l lib] [flags]
 
 Native GCC/LLVM LTO plugin integration is not implemented; actual GCC LTO
 objects and LLVM bitcode objects are handed to GNU `ld` so the real plugin can
-materialize native code. Relocatable `-r` output uses the same GNU `ld`
-compatibility handoff while Peony's native emitter remains focused on
-executables and shared objects.
+materialize native code.
+
+Relocatable `-r` (partial linking) is emitted **natively** as an `ET_REL` object
+— input sections are merged by name, the symbol tables are combined, and
+relocations are kept (not applied) so the result re-links correctly. Inputs that
+carry COMDAT groups (typical C++ with inlines/templates) still hand off to GNU
+`ld`, which regenerates the `.group` sections native `-r` does not yet rebuild.
 
 ## Incremental relinks & the daemon
 

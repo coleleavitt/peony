@@ -26,12 +26,14 @@ mod file;
 mod headers;
 mod input_sections;
 mod input_work;
+mod relocatable;
 mod sections;
 
 use build_id::finalize_build_id;
 use eh_frame::write_eh_frame_hdr;
 use file::{chmod_executable, open_output_map};
 use headers::{write_headers, write_section_headers};
+pub use relocatable::emit_relocatable;
 use sections::{write_section_data_parallel, write_tls_got};
 
 // ── Errors ──────────────────────────────────────────────────────────────────

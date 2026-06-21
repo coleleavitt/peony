@@ -15,5 +15,6 @@ object.workspace     = true
 memmap2.workspace    = true
 ws-deque.workspace   = true
 rayon.workspace      = true
+rustc-hash.workspace = true
 thiserror.workspace  = true
 tracing.workspace    = true
