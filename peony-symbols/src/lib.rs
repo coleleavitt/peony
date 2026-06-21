@@ -96,7 +96,7 @@ pub type Result<T> = std::result::Result<T, SymbolError>;
 ///
 /// IDs are assigned in insertion order and are stable within a single link.
 /// In incremental mode they are persisted to disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SymbolId(pub u32);
 
 /// Which input object defines this symbol (or where it was first seen).
@@ -612,6 +612,15 @@ impl SymbolTable {
     /// The name bytes for a [`SymbolId`] (only valid for *defined* symbols).
     pub fn name_by_id(&self, id: SymbolId) -> Option<&[u8]> {
         self.names.get(id.0 as usize).map(Name::as_bytes)
+    }
+
+    /// Number of assigned [`SymbolId`]s (the dense id space; `id < id_count()`).
+    /// Distinct from [`len`](Self::len), which counts resolution entries
+    /// (including undefined placeholders that never minted an id). The
+    /// incremental layout-reuse gate folds the full `0..id_count()` name
+    /// sequence to prove the id→name bijection is byte-stable across a relink.
+    pub fn id_count(&self) -> usize {
+        self.names.len()
     }
 
     /// Iterate over all resolutions.

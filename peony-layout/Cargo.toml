@@ -12,5 +12,7 @@ peony-symbols     = { path = "../peony-symbols" }
 ws-deque.workspace   = true
 rayon.workspace      = true
 rustc-hash.workspace = true
+serde.workspace      = true
+bincode.workspace    = true
 thiserror.workspace  = true
 tracing.workspace    = true

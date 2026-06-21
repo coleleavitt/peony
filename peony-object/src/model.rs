@@ -63,7 +63,7 @@ impl IndexLookup {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SectionKind {
     Text,
     ReadOnly,

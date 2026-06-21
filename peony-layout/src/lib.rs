@@ -94,7 +94,7 @@ pub type Result<T> = std::result::Result<T, LayoutError>;
 // ── Output model ────────────────────────────────────────────────────────────
 
 /// A contribution from one input section to an output section.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SectionContribution {
     pub object_id: usize,
     pub section_index: usize,
@@ -105,7 +105,7 @@ pub struct SectionContribution {
 }
 
 /// How an output section's bytes are produced at emit time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SecSource {
     /// Concatenated input-section bytes (from `contributions`).
     Input,
@@ -236,7 +236,7 @@ pub struct ExportSym {
 /// `STB_LOCAL` (file-scoped), so they have no global `SymbolId`; a local TLS
 /// reference is keyed by `(object_id, input_symbol_index)`, a global one by its
 /// resolved `SymbolId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TlsRef {
     Local(usize, usize),
     Global(SymbolId),
@@ -271,7 +271,7 @@ impl TlsGotInfo {
 
 /// Pre-built byte blobs for the dynamic-linking sections (filled by layout,
 /// written verbatim by emit).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct DynBlobs {
     pub interp: Vec<u8>,
     pub hash: Vec<u8>,
@@ -298,7 +298,7 @@ pub struct DynBlobs {
 }
 
 /// A merged output section with a full section-header plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutputSection {
     pub name: String,
     pub kind: SectionKind,
@@ -320,7 +320,7 @@ pub struct OutputSection {
 }
 
 /// One ELF program header (segment).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProgramHeader {
     pub p_type: u32,
     pub p_flags: u32,
@@ -335,7 +335,7 @@ pub struct ProgramHeader {
 /// A planned `.symtab` entry. Most globals resolve `st_value`/`st_size` at emit
 /// time from the symbol table (after [`finalize_symbols`]); locals and TLS
 /// entries are precomputed here because TLS `st_value` is module-relative.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SymEntry {
     pub name: Vec<u8>,
     pub name_off: u32,
@@ -346,6 +346,7 @@ pub struct SymEntry {
 }
 
 /// The fully resolved output layout consumed by `peony-emit`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub output_sections: Vec<OutputSection>,
     /// (object_id, input_section_index) → virtual address of that placement.
@@ -415,6 +416,302 @@ impl Layout {
     /// TLS-block offset of an input TLS section's placement.
     pub fn tls_offset(&self, object_id: usize, section_index: usize) -> Option<u64> {
         self.tls_offsets.get(&(object_id, section_index)).copied()
+    }
+}
+
+/// Serialize a finished `Layout` to opaque bytes for the incremental cache.
+///
+/// The bytes are the exact output of `compute_layout`/`compute_layout_icf`
+/// (i.e. captured *before* post-layout finalization mutates the layout in
+/// place), so a no-hazard relink can substitute them for a fresh
+/// `compute_layout` and run the identical downstream pipeline.
+pub fn serialize_layout(layout: &Layout) -> Vec<u8> {
+    bincode::serde::encode_to_vec(layout, bincode::config::standard()).unwrap_or_default()
+}
+
+/// Deserialize a `Layout` previously produced by [`serialize_layout`].
+///
+/// Returns `None` on any decode failure (truncated/corrupt/format-skewed
+/// blob); the caller must fall back to a full `compute_layout` — never serve a
+/// half-decoded layout.
+pub fn deserialize_layout(bytes: &[u8]) -> Option<Layout> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .ok()
+        .map(|(layout, _)| layout)
+}
+
+// ── Layout reuse fingerprint (incremental front-end, blueprint Phase 2) ──────
+//
+// `compute_layout` is a pure function of its inputs, so two links that present
+// the same layout-determining inputs produce a byte-identical `Layout`. This
+// fingerprint folds *every* such input into a single hash; if a relink
+// reproduces it, the cached `Layout` may be substituted verbatim and the whole
+// post-layout pipeline (finalize/reloc-apply/emit) runs unchanged. The gate is
+// deliberately conservative: it folds a superset of what strictly matters, so a
+// mismatch can only cause an unnecessary full link, never a stale-byte reuse.
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn fnv_byte(h: u64, b: u8) -> u64 {
+    (h ^ b as u64).wrapping_mul(FNV_PRIME)
+}
+#[inline]
+fn fnv_bytes(mut h: u64, data: &[u8]) -> u64 {
+    for &b in data {
+        h = fnv_byte(h, b);
+    }
+    h
+}
+#[inline]
+fn fnv_u64(h: u64, v: u64) -> u64 {
+    fnv_bytes(h, &v.to_le_bytes())
+}
+
+/// A compact fingerprint of every input that fixes the byte layout.
+///
+/// `drivers_hash` folds the global drivers (config + object set + the full
+/// `SymbolId`→name bijection + GOT/PLT/TLS demand + commons + copy relocs +
+/// dynamic imports/exports). `object_digests` is kept per object so an
+/// unchanged object's digest can be reused from the cache without re-walking
+/// it — only a changed object is re-digested.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutFingerprint {
+    pub drivers_hash: u64,
+    pub object_digests: Vec<u64>,
+}
+
+/// Digest of one object's layout-relevant inputs: allocatable section geometry
+/// (name/kind/type/flags/align/size/order), COMDAT groups, and every symbol
+/// (local + global). Section *content* is folded in ONLY for the sections whose
+/// bytes are baked into the `Layout` — `.note.gnu.property` (merged into the
+/// synthetic property note) and `.eh_frame` (its FDE count fixes
+/// `.eh_frame_hdr`'s size). Ordinary sections (`.text`/`.data`/…) are
+/// emit-copied from the live object, so their content is deliberately excluded:
+/// a size-stable body edit must NOT change the digest, or the fast path would
+/// never fire.
+fn object_layout_digest(
+    arena: &InputArena,
+    obj: &InputObject,
+    obj_idx: usize,
+    live: SectionFilter<'_>,
+    fold_map: Option<&icf::FoldMap>,
+) -> u64 {
+    let mut h = FNV_OFFSET;
+    for (section_pos, sec) in obj.sections.iter().enumerate() {
+        let allocatable = is_allocatable(&sec.name, sec.kind, sec.flags);
+        // `.note.gnu.property` is NOT allocatable (it is merged synthetically),
+        // but its bytes ARE baked into the layout, so track it explicitly.
+        let is_property = sec.name == b".note.gnu.property";
+        if !allocatable && !is_property {
+            continue;
+        }
+        if allocatable {
+            if !live.emits(&(obj_idx, sec.index.0)) {
+                continue;
+            }
+            if let Some(fm) = fold_map {
+                if fm.contains_key(&(obj_idx, sec.index.0)) {
+                    continue;
+                }
+            }
+        }
+        h = fnv_u64(h, section_pos as u64);
+        h = fnv_u64(h, sec.index.0 as u64);
+        h = fnv_bytes(h, &sec.name);
+        h = fnv_u64(h, sec.kind as u64);
+        h = fnv_u64(h, u64::from(sec.sh_type));
+        h = fnv_u64(h, sec.flags);
+        h = fnv_u64(h, sec.align);
+        h = fnv_u64(h, sec.size);
+        if is_property || sec.kind == SectionKind::EhFrame {
+            h = fnv_bytes(h, arena.bytes(sec.data));
+        }
+    }
+    // COMDAT groups: their first-seen-wins resolution decides which sections are
+    // excluded; a change here can flip which copy survives.
+    for g in &obj.comdat_groups {
+        h = fnv_bytes(h, &g.signature);
+        h = fnv_byte(h, 0);
+        for &m in &g.members {
+            h = fnv_u64(h, m as u64);
+        }
+    }
+    // Symbols (locals + globals): drive `.symtab` (locals are precomputed into
+    // `Layout::symtab`), common `.bss`, global VAs, and the anchored-zero-size
+    // section rule. Fold every field that can reach the output.
+    for sym in &obj.symbols {
+        h = fnv_bytes(h, &sym.name);
+        h = fnv_u64(h, sym.binding as u64);
+        h = fnv_byte(h, sym.is_undefined as u8);
+        h = fnv_byte(h, sym.is_common as u8);
+        h = fnv_byte(h, sym.is_ifunc as u8);
+        h = fnv_u64(h, u64::from(sym.st_type));
+        h = fnv_u64(h, u64::from(sym.visibility));
+        h = fnv_u64(h, sym.section.map_or(0, |s| s.0 as u64 + 1));
+        h = fnv_u64(h, sym.value);
+        h = fnv_u64(h, sym.size);
+    }
+    h
+}
+
+#[inline]
+fn fold_symbol_name(h: u64, symbols: &SymbolTable, id: SymbolId) -> u64 {
+    match symbols.name_by_id(id) {
+        Some(n) => fnv_bytes(fnv_byte(h, 1), n),
+        None => fnv_byte(h, 0),
+    }
+}
+
+#[inline]
+fn fold_tls_ref(h: u64, symbols: &SymbolTable, r: &TlsRef, kind: u8) -> u64 {
+    let h = fnv_byte(h, kind);
+    match r {
+        TlsRef::Global(id) => fold_symbol_name(fnv_byte(h, 1), symbols, *id),
+        TlsRef::Local(o, s) => fnv_u64(fnv_u64(fnv_byte(h, 2), *o as u64), *s as u64),
+    }
+}
+
+/// Compute the [`LayoutFingerprint`] for the current front-end state.
+///
+/// `changed_object_ids` and `prior_object_digests` let the caller reuse cached
+/// digests for objects whose bytes did not change; pass an empty set + `None`
+/// to digest every object from scratch (e.g. the first link).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_layout_fingerprint(
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    got_syms: &[SymbolId],
+    plt_syms: &[SymbolId],
+    live: SectionFilter<'_>,
+    config: &LayoutConfig,
+    tls_got: &TlsGotInfo,
+    fold_map: Option<&icf::FoldMap>,
+    changed_object_ids: &FxHashSet<usize>,
+    prior_object_digests: Option<&[u64]>,
+) -> LayoutFingerprint {
+    // Per-object digests: reuse the cached digest for any object that did not
+    // change; recompute only changed objects.
+    let prior = prior_object_digests.filter(|p| p.len() == objects.len());
+    let object_digests: Vec<u64> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, obj)| match prior {
+            Some(p) if !changed_object_ids.contains(&i) => p[i],
+            _ => object_layout_digest(arena, obj, i, live, fold_map),
+        })
+        .collect();
+
+    let mut h = FNV_OFFSET;
+
+    // Config (output-shaping flags). `args_hash` already gates these upstream,
+    // but folding them keeps the layout fingerprint self-contained.
+    h = fnv_u64(h, config.base_address);
+    h = fnv_u64(h, config.page_size);
+    h = fnv_bytes(h, config.entry_symbol.as_bytes());
+    h = fnv_byte(h, config.build_id as u8);
+    h = fnv_byte(h, config.strip as u8);
+    h = fnv_byte(h, config.strip_debug as u8);
+    h = fnv_byte(h, config.pie as u8);
+    h = fnv_byte(h, config.shared as u8);
+    h = fnv_byte(h, config.emit_relocs as u8);
+    h = fnv_byte(h, config.script.is_some() as u8);
+
+    // Object set: count, paths (order), and per-object digests (order).
+    h = fnv_u64(h, objects.len() as u64);
+    for (obj, &d) in objects.iter().zip(&object_digests) {
+        h = fnv_bytes(h, obj.path.as_bytes());
+        h = fnv_byte(h, 0);
+        h = fnv_u64(h, d);
+    }
+
+    // Full `SymbolId`→name bijection. The reused layout stores OLD `SymbolId`s
+    // (in `got_slots`/`plt_slots`/`common`/…); `finalize_symbols` resolves them
+    // through the CURRENT table by `name_by_id`, so reuse is only sound when the
+    // entire id→name map is byte-identical. Folding it here proves exactly that
+    // and subsumes any symbol-set / COMDAT / archive-pull renumbering hazard.
+    let id_count = symbols.id_count();
+    h = fnv_u64(h, id_count as u64);
+    for i in 0..id_count {
+        if let Some(name) = symbols.name_by_id(SymbolId(i as u32)) {
+            h = fnv_bytes(h, name);
+        }
+        h = fnv_byte(h, 0);
+    }
+
+    // GOT / PLT slot order (by name — robust even if ids shift).
+    h = fnv_u64(h, got_syms.len() as u64);
+    for &id in got_syms {
+        h = fold_symbol_name(h, symbols, id);
+    }
+    h = fnv_u64(h, plt_syms.len() as u64);
+    for &id in plt_syms {
+        h = fold_symbol_name(h, symbols, id);
+    }
+
+    // TLS GOT demand (slot kind + ref, in order) and the module LDM pair flag.
+    for r in &tls_got.gd {
+        h = fold_tls_ref(h, symbols, r, 1);
+    }
+    for r in &tls_got.ie {
+        h = fold_tls_ref(h, symbols, r, 2);
+    }
+    for r in &tls_got.desc {
+        h = fold_tls_ref(h, symbols, r, 3);
+    }
+    h = fnv_byte(h, tls_got.ldm as u8);
+
+    // Commons (the one place `SymbolId` order is byte-load-bearing: `.bss` is
+    // packed in id order), copy relocs, and dynamic imports/exports.
+    let mut commons: Vec<(u32, &[u8], u64, u64)> = Vec::new();
+    let mut copy_relocs: Vec<&[u8]> = Vec::new();
+    let mut imports: Vec<(&[u8], &[u8], &[u8])> = Vec::new();
+    let mut exports: Vec<&[u8]> = Vec::new();
+    for (name, res) in symbols.iter() {
+        if let Some((size, align)) = res.common {
+            commons.push((res.id.0, name, size, align));
+        }
+        if res.copy_reloc {
+            copy_relocs.push(name);
+        }
+        if res.import {
+            let ver: &[u8] = res.version.as_deref().unwrap_or(&[]);
+            let son: &[u8] = match &res.soname {
+                Some(s) => s.as_bytes(),
+                None => &[],
+            };
+            imports.push((name, ver, son));
+        }
+        if res.is_export() {
+            exports.push(name);
+        }
+    }
+    commons.sort_unstable_by_key(|c| c.0);
+    for (_, name, size, align) in &commons {
+        h = fnv_bytes(h, name);
+        h = fnv_u64(h, *size);
+        h = fnv_u64(h, *align);
+    }
+    copy_relocs.sort_unstable();
+    for name in &copy_relocs {
+        h = fnv_bytes(h, name);
+    }
+    imports.sort_unstable();
+    for (name, ver, son) in &imports {
+        h = fnv_bytes(h, name);
+        h = fnv_bytes(h, ver);
+        h = fnv_bytes(h, son);
+    }
+    exports.sort_unstable();
+    for name in &exports {
+        h = fnv_bytes(h, name);
+    }
+
+    LayoutFingerprint {
+        drivers_hash: h,
+        object_digests,
     }
 }
 

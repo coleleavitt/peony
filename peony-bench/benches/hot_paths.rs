@@ -306,7 +306,7 @@ fn bench_red_green_coloring(c: &mut Criterion) {
             virtual_address: 0x401000 + (i * 16),
         })
         .collect();
-    record_link_with_sections(&output, &[], 0, &sections, &[]).expect("bench manifest");
+    record_link_with_sections(&output, &[], 0, &sections, &[], None).expect("bench manifest");
     let current: Vec<(String, Fingerprint)> = sections
         .iter()
         .map(|s| (s.name.clone(), s.fingerprint))

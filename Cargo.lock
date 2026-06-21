@@ -658,11 +658,13 @@ dependencies = [
 name = "peony-layout"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "peony-object",
  "peony-prof",
  "peony-symbols",
  "rayon",
  "rustc-hash",
+ "serde",
  "thiserror",
  "tracing",
  "ws-deque",
@@ -676,6 +678,7 @@ dependencies = [
  "object",
  "rayon",
  "rustc-hash",
+ "serde",
  "thiserror",
  "tracing",
 ]
@@ -704,6 +707,7 @@ dependencies = [
  "peony-object",
  "rayon",
  "rustc-hash",
+ "serde",
  "thiserror",
  "tracing",
 ]

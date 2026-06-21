@@ -54,7 +54,7 @@ pub enum CacheError {
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 /// Bump when the manifest format changes incompatibly.
-pub const CACHE_VERSION: u32 = 5;
+pub const CACHE_VERSION: u32 = 6;
 
 /// Sentinel for "no next entry" in the relocation reverse index.
 pub const NO_ENTRY: u32 = u32::MAX;
@@ -176,12 +176,35 @@ pub struct CachedSymbolEntry {
     pub got_address: u64,
 }
 
+/// Persisted front-end state for the layout-reuse fast path (blueprint Phase 2).
+///
+/// On a changed-input relink, if the freshly-computed layout drivers reproduce
+/// `drivers_hash` (and the object set matches `object_paths`), the cached
+/// `Layout` serialized in `layout_blob` is byte-identical to what a fresh
+/// `compute_layout` would produce, so it is substituted verbatim and the
+/// expensive layout pass is skipped. `object_digests` lets a relink reuse the
+/// per-object fingerprints of unchanged objects instead of re-walking them.
+///
+/// `layout_blob` is opaque to this crate (produced/consumed by
+/// `peony-layout::{serialize_layout, deserialize_layout}`); the cache only
+/// stores and returns the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontEndSnapshot {
+    pub drivers_hash: u64,
+    pub object_digests: Vec<u64>,
+    pub object_paths: Vec<String>,
+    pub layout_blob: Vec<u8>,
+}
+
 /// Previously recorded state that is safe to consult for a changed-input relink.
 #[derive(Debug, Clone)]
 pub struct CachedLinkState {
     pub changed_inputs: Vec<String>,
     pub sections: Vec<SectionRecord>,
     pub symbols: Vec<CachedSymbolEntry>,
+    /// Front-end snapshot for the layout-reuse fast path, if the prior link
+    /// captured one.
+    pub front_end: Option<FrontEndSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +485,9 @@ pub struct Manifest {
     pub sections: Vec<SectionRecord>,
     /// Cached symbol addresses for detecting moved symbols.
     pub symbols: Vec<CachedSymbolEntry>,
+    /// Serialized layout + drivers for the layout-reuse fast path (`None` when
+    /// the producing link did not capture it, e.g. `--gc-sections`/`--icf`).
+    pub front_end: Option<FrontEndSnapshot>,
 }
 
 /// The `<output>.incr/` directory for one output binary.
@@ -577,6 +603,7 @@ pub fn load_changed_state(
         changed_inputs,
         sections: manifest.sections,
         symbols: manifest.symbols,
+        front_end: manifest.front_end,
     }))
 }
 
@@ -584,7 +611,7 @@ pub fn load_changed_state(
 /// the output-affecting flags ([`hash_args`]); it is folded into the stored
 /// epoch key so [`try_reuse`] can reject a relink with changed flags.
 pub fn record_link(output: &Path, inputs: &[PathBuf], args_hash: u64) -> Result<()> {
-    record_link_with_sections(output, inputs, args_hash, &[], &[])
+    record_link_with_sections(output, inputs, args_hash, &[], &[], None)
 }
 
 /// Record fingerprints + section records + symbol cache after a successful link.
@@ -597,6 +624,7 @@ pub fn record_link_with_sections(
     args_hash: u64,
     sections: &[SectionRecord],
     symbols: &[CachedSymbolEntry],
+    front_end: Option<&FrontEndSnapshot>,
 ) -> Result<()> {
     let dir = cache_dir(output);
     std::fs::create_dir_all(&dir).map_err(|e| CacheError::Io {
@@ -664,6 +692,7 @@ pub fn record_link_with_sections(
         fast_output: FastFingerprint::of_file(output)?,
         sections: sections.to_vec(),
         symbols: symbols.to_vec(),
+        front_end: front_end.cloned(),
     };
 
     let bytes = bincode::serde::encode_to_vec(&manifest, bincode::config::standard())
@@ -991,6 +1020,7 @@ mod tests {
                 virtual_address: 0x401000,
             }],
             symbols: Vec::new(),
+            front_end: None,
         };
         let current = vec![PatchSectionRecord {
             name: ".text".to_string(),
@@ -1030,6 +1060,7 @@ mod tests {
                 },
             ],
             symbols: Vec::new(),
+            front_end: None,
         };
         let current = vec![
             PatchSectionRecord {
@@ -1103,7 +1134,7 @@ mod tests {
                 virtual_address: 0x2000,
             },
         ];
-        record_link_with_sections(&out, &[inp], 0, &secs, &[]).unwrap();
+        record_link_with_sections(&out, &[inp], 0, &secs, &[], None).unwrap();
 
         // Read the manifest back and confirm the records survived intact.
         let bytes = std::fs::read(manifest_path(&out)).unwrap();

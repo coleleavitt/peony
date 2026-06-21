@@ -327,7 +327,7 @@ fn red_green_all_green_when_nothing_changes() {
         },
     ];
 
-    record_link_with_sections(&fake_output, &[], 0, &sections, &[]).unwrap();
+    record_link_with_sections(&fake_output, &[], 0, &sections, &[], None).unwrap();
 
     // Same fingerprints, no moved symbols → all green.
     use peony_cache::RelocReverseIndex;
@@ -376,7 +376,7 @@ fn red_green_changed_section_is_red() {
         capacity: 0x140,
         virtual_address: 0x401000,
     }];
-    record_link_with_sections(&fake_output, &[], 0, &sections, &[]).unwrap();
+    record_link_with_sections(&fake_output, &[], 0, &sections, &[], None).unwrap();
 
     // Different fingerprint → Red.
     use peony_cache::RelocReverseIndex;

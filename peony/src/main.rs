@@ -43,6 +43,7 @@ use peony_layout::{
 };
 use peony_object::{
     Binding,
+    InputArena,
     InputObject,
     Name,
     iter_archive_members,
@@ -51,7 +52,7 @@ use peony_object::{
     parse_owned_member,
 };
 use peony_reloc::scan_relocations;
-use peony_symbols::SymbolTable;
+use peony_symbols::{SymbolId, SymbolTable};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing_subscriber::EnvFilter;
@@ -533,21 +534,73 @@ fn main() -> Result<()> {
             peony_prof::TraceField::count("dynamic", u64::from(dynamic.is_some())),
         ],
     );
-    let mut layout = peony_layout::compute_layout_icf(
+    // Incremental layout-reuse fast path (blueprint Phase 2). When the cached
+    // front-end snapshot's drivers reproduce the current front-end exactly, the
+    // cached `Layout` is byte-identical to a fresh one, so substitute it and
+    // skip `compute_layout`. Hard-gated: `--gc-sections`/`--icf`, a changed
+    // non-object input, a drivers mismatch, or a corrupt blob all fall back to a
+    // full layout, so reuse is only taken when provably pure.
+    let fe_eligible = args.incremental && !args.gc_sections && !args.icf;
+    let mut reused_snapshot: Option<peony_cache::FrontEndSnapshot> = None;
+    let mut layout_reused = false;
+    let mut layout = match try_reuse_layout(
+        &args.output,
+        &input_paths,
+        args_hash,
+        fe_eligible,
         &arena,
         &objects,
         &symbols,
         &got_syms,
         &plt_syms,
         live.as_filter(),
-        dynamic.as_ref(),
         &config,
         &tls_got,
         fold_map.as_ref(),
-    )
-    .context("layout computation failed")?;
+    ) {
+        Some((cached_layout, snapshot)) => {
+            tracing::info!("incremental: reusing cached layout (drivers match)");
+            peony_prof::count("layout_reused", 1);
+            reused_snapshot = Some(snapshot);
+            layout_reused = true;
+            cached_layout
+        }
+        None => peony_layout::compute_layout_icf(
+            &arena,
+            &objects,
+            &symbols,
+            &got_syms,
+            &plt_syms,
+            live.as_filter(),
+            dynamic.as_ref(),
+            &config,
+            &tls_got,
+            fold_map.as_ref(),
+        )
+        .context("layout computation failed")?,
+    };
     drop(layout_trace);
     drop(layout_span);
+    // Snapshot the PRE-finalize layout bytes + drivers fingerprint for the next
+    // relink's fast path. Captured HERE, before `finalize_symbols` and the
+    // dynamic-reloc assembly mutate `layout` in place, so the bytes are exactly
+    // what `compute_layout` returns and downstream substitution is transparent.
+    // Only produced when reuse is in scope (no gc/icf); otherwise `None`, so a
+    // gc/icf link records no snapshot and the next relink full-links.
+    let front_end_snapshot = build_front_end_snapshot(
+        fe_eligible,
+        &arena,
+        &objects,
+        &symbols,
+        &got_syms,
+        &plt_syms,
+        live.as_filter(),
+        &config,
+        &tls_got,
+        fold_map.as_ref(),
+        reused_snapshot,
+        &layout,
+    );
     peony_prof::count("layout_sections", layout.output_sections.len() as u64);
     peony_prof::count("layout_segments", layout.segments.len() as u64);
     peony_prof::record_items("layout", layout.output_sections.len() as u64);
@@ -643,6 +696,7 @@ fn main() -> Result<()> {
             &objects,
             &symbols,
             &layout,
+            layout_reused,
         )
         .context("incremental patch planning")?
     } else {
@@ -710,6 +764,7 @@ fn main() -> Result<()> {
             args_hash,
             &sections,
             &cached_symbols,
+            front_end_snapshot.as_ref(),
         )
         .context("incremental cache record")?;
     }
@@ -758,6 +813,154 @@ fn section_records(
     Some(records)
 }
 
+/// Attempt the incremental layout-reuse fast path (blueprint Phase 2).
+///
+/// Returns the cached `Layout` plus the freshly-computed fingerprint when the
+/// reuse is provably safe; `None` (→ full `compute_layout`) on any of: not
+/// eligible, no/version-mismatched cached snapshot, object-set drift, a changed
+/// non-object input (archive/shared-lib/script), a drivers mismatch, or a
+/// corrupt layout blob. The byte-identity gate is the freshly-recomputed
+/// `drivers_hash`: it folds every input `compute_layout` reads, so a match
+/// proves the cached layout equals a fresh one.
+#[allow(clippy::too_many_arguments)]
+fn try_reuse_layout(
+    output: &Path,
+    input_paths: &[PathBuf],
+    args_hash: u64,
+    eligible: bool,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    got_syms: &[SymbolId],
+    plt_syms: &[SymbolId],
+    live: peony_layout::SectionFilter<'_>,
+    config: &LayoutConfig,
+    tls_got: &peony_layout::TlsGotInfo,
+    fold_map: Option<&peony_layout::icf::FoldMap>,
+) -> Option<(peony_layout::Layout, peony_cache::FrontEndSnapshot)> {
+    if !eligible {
+        return None;
+    }
+    let Some(cached) = peony_cache::load_changed_state(output, input_paths, args_hash)
+        .ok()
+        .flatten()
+    else {
+        tracing::debug!("reuse-gate: no cached changed-state");
+        return None;
+    };
+    let Some(snap) = cached.front_end.as_ref() else {
+        tracing::debug!("reuse-gate: no front_end snapshot in manifest");
+        return None;
+    };
+    // Object set must match exactly (paths + order); object ids index `objects`.
+    if snap.object_paths.len() != objects.len()
+        || snap
+            .object_paths
+            .iter()
+            .zip(objects)
+            .any(|(p, o)| p != &o.path)
+    {
+        tracing::debug!(
+            cached = snap.object_paths.len(),
+            current = objects.len(),
+            "reuse-gate: object set mismatch"
+        );
+        return None;
+    }
+    // Every changed input must be a plain object already present in `objects`.
+    // A changed archive/shared-lib/script is descoped (it could pull new members
+    // or alter dynamic state) → full-link.
+    let mut changed_object_ids: FxHashSet<usize> = FxHashSet::default();
+    for changed in &cached.changed_inputs {
+        match objects.iter().position(|o| &o.path == changed) {
+            Some(idx) => {
+                changed_object_ids.insert(idx);
+            }
+            None => {
+                tracing::debug!(input = %changed, "reuse-gate: changed input is not a plain object");
+                return None;
+            }
+        }
+    }
+    let fp = peony_layout::compute_layout_fingerprint(
+        arena,
+        objects,
+        symbols,
+        got_syms,
+        plt_syms,
+        live,
+        config,
+        tls_got,
+        fold_map,
+        &changed_object_ids,
+        Some(&snap.object_digests),
+    );
+    if fp.drivers_hash != snap.drivers_hash {
+        tracing::debug!(
+            current = fp.drivers_hash,
+            cached = snap.drivers_hash,
+            "reuse-gate: drivers hash mismatch"
+        );
+        return None;
+    }
+    let Some(layout) = peony_layout::deserialize_layout(&snap.layout_blob) else {
+        tracing::debug!("reuse-gate: layout blob failed to deserialize");
+        return None;
+    };
+    // The drivers matched, so the freshly-computed fingerprint equals the cached
+    // one and the cached snapshot is still valid for the NEXT relink — hand it
+    // back so recording can persist it verbatim, skipping a 1.4MB re-serialize.
+    Some((layout, cached.front_end.unwrap()))
+}
+
+/// Build the persisted front-end snapshot for the next relink, or `None` when
+/// reuse is not in scope. Reuses the fingerprint a successful fast path already
+/// computed; otherwise digests every object from scratch.
+#[allow(clippy::too_many_arguments)]
+fn build_front_end_snapshot(
+    eligible: bool,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    got_syms: &[SymbolId],
+    plt_syms: &[SymbolId],
+    live: peony_layout::SectionFilter<'_>,
+    config: &LayoutConfig,
+    tls_got: &peony_layout::TlsGotInfo,
+    fold_map: Option<&peony_layout::icf::FoldMap>,
+    reused_snapshot: Option<peony_cache::FrontEndSnapshot>,
+    layout: &peony_layout::Layout,
+) -> Option<peony_cache::FrontEndSnapshot> {
+    if !eligible {
+        return None;
+    }
+    // Reuse path: the cached snapshot is still valid (drivers matched), so
+    // persist it verbatim — no re-fingerprint, no 1.4MB re-serialize.
+    if let Some(snapshot) = reused_snapshot {
+        return Some(snapshot);
+    }
+    // Full/first link: digest every object and serialize the fresh layout.
+    let fp = peony_layout::compute_layout_fingerprint(
+        arena,
+        objects,
+        symbols,
+        got_syms,
+        plt_syms,
+        live,
+        config,
+        tls_got,
+        fold_map,
+        &FxHashSet::default(),
+        None,
+    );
+    Some(peony_cache::FrontEndSnapshot {
+        drivers_hash: fp.drivers_hash,
+        object_digests: fp.object_digests,
+        object_paths: objects.iter().map(|o| o.path.clone()).collect(),
+        layout_blob: peony_layout::serialize_layout(layout),
+    })
+}
+
 enum IncrementalEmitPlan {
     Disabled,
     CacheUnavailable,
@@ -772,13 +975,27 @@ fn incremental_emit_plan(
     objects: &[InputObject],
     symbols: &SymbolTable,
     layout: &peony_layout::Layout,
+    layout_reused: bool,
 ) -> Result<IncrementalEmitPlan> {
     let Some(cached) = peony_cache::load_changed_state(output, input_paths, args_hash)? else {
         return Ok(IncrementalEmitPlan::CacheUnavailable);
     };
     let patch_sections = patch_section_records(layout, objects, &cached.changed_inputs);
-    let moved_symbols = moved_symbol_ids(&cached.symbols, symbols);
-    let (rev_index, reloc_sections) = relocation_reverse_index(objects, symbols, layout);
+    // When the layout was reused, the drivers fingerprint proved every address
+    // (and hence every symbol VA) is byte-identical to the cached link, so NO
+    // symbol can have moved. Skip the 32k-reloc reverse-index build entirely
+    // (~5ms) and color purely by which output sections a changed input feeds.
+    let (moved_symbols, rev_index, reloc_sections);
+    if layout_reused {
+        moved_symbols = Vec::new();
+        rev_index = peony_cache::RelocReverseIndex::new(0, 0);
+        reloc_sections = Vec::new();
+    } else {
+        moved_symbols = moved_symbol_ids(&cached.symbols, symbols);
+        let (idx, secs) = relocation_reverse_index(objects, symbols, layout);
+        rev_index = idx;
+        reloc_sections = secs;
+    }
     let reloc_section_refs: Vec<&str> = reloc_sections.iter().map(String::as_str).collect();
     Ok(
         match peony_cache::plan_partial_relink(

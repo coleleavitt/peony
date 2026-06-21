@@ -9,5 +9,6 @@ license.workspace = true
 peony-object      = { path = "../peony-object" }
 rustc-hash.workspace = true
 rayon.workspace      = true
+serde.workspace      = true
 thiserror.workspace  = true
 tracing.workspace    = true

@@ -1,8 +1,24 @@
 # Incremental Front-End — Sub-5ms One-File Relink (Executable Blueprint)
 
-Status: design locked, Phase 0 landed. Goal: a one-file-change relink in <5ms
-(10× vs mold's ~37ms-every-link), peony's whole thesis. **Every phase MUST keep
-the output byte-identical to a full link** (the non-negotiable gate).
+Status: Phase 0 + Phase 2 LANDED (layout reuse, byte-identical + thread-stable).
+Goal: a one-file-change relink in <5ms (10× vs mold's ~37ms-every-link), peony's
+whole thesis. **Every phase MUST keep the output byte-identical to a full link**
+(the non-negotiable gate).
+
+> **Phase 2 measured finding (2026-06-21): blob-serialized layout reuse is near
+> break-even, NOT the projected ~9ms win.** On the 402-object harness,
+> `compute_layout` is ~6.9ms but **deserializing the 1.4MB bincode `Layout` blob
+> costs ~5.5ms** — so skipping layout nets only ~1.5ms. This is the SAME trap the
+> blueprint already flags for parsed objects ("deserializing costs more than
+> re-parsing"): bincode deserialize ≈ recompute. The incremental relink is still
+> > a full link because the front-end (parse+resolve ~8ms) re-runs (Phases 3–4)
+> and `incremental:record` re-hashes the whole output for red/green coloring
+> (~7ms, Phase 5). **The 10× thesis needs zero-copy mmap'd persistent state
+> (Wild's actual design) or a resident daemon, not bincode blobs.** What Phase 2
+> *did* deliver and is reusable: a complete, hard-gated **hazard fingerprint**
+> (`peony_layout::compute_layout_fingerprint`) that folds every layout-determining
+> input, and the **persistence schema** (`FrontEndSnapshot`) — the foundation the
+> next phases build on regardless of the serialization format chosen.
 
 Distilled from a 6-agent design pass (peony-object/parse, peony-symbols/resolve,
 peony-layout, peony-reloc, peony-cache, and Wild/mold reference) + direct
@@ -82,10 +98,20 @@ is cheaper than deserializing + re-interning + re-binding arena file_ids.
 |---|---|---|---|
 | 0 ✅ | record reuses unchanged-input fingerprints | re-hash all inputs | 73→47ms |
 | 1 | Capacity SLACK on initial link (Wild STEP 1) so a same-or-smaller edit keeps file_offset/vaddr → `plan_partial_relink` stays green for size-*growing* edits too | — (robustness; **changes baseline output** → re-baseline) | — |
-| 2 | Reuse cached **layout** wholesale when size-stable + no-hazard: skip `compute_layout`, rebuild per-section addr map from cache, recompute only the changed object's symbol VAs | `compute_layout` ~9ms | ~47→~30ms |
+| 2 ✅ | Reuse cached **layout** when size-stable + no-hazard: hazard-fingerprint the whole front-end, and on a match deserialize the cached `Layout` and skip `compute_layout` (substituted *before* finalize, so finalize/reloc/emit run unchanged). Descopes `--gc-sections`/`--icf` + changed non-object inputs → full-link. **Net only ~1.5ms** (deserialize ~5.5ms ≈ compute ~6.9ms — see finding above). Also skips the reverse-index build on reuse (no symbol can move) and re-persists the cached blob verbatim (no re-serialize). | `compute_layout` minus deserialize | ~1.5ms saved |
 | 3 | Reuse cached **symbol table** (persist id-order + resolution; patch the changed object's defs without renumbering survivors) | `resolve-bare` ~4ms | ~26ms |
 | 4 | Re-parse ONLY the changed object; reuse other parses' downstream state | most of `parse-bare` + the front-end barrier | ~10ms |
-| 5 | `emit_partial` iterates only RED sections (today walks all 16k) | emit iteration | **<5ms** |
+| 5 | `emit_partial` iterates only RED sections (today walks all 16k) + drop the `incremental:record` full-output re-hash (~7ms) | emit iteration + record | **<5ms** |
+
+**Phase 2 implementation (landed):** serde on `Layout`+nested types (peony-layout/object/symbols);
+`compute_layout_fingerprint` (per-object geometry+symbol digests, reused for unchanged objects, +
+global drivers: full id→name bijection, GOT/PLT/TLS demand, commons, copy relocs, imports/exports,
+config); manifest v6 `FrontEndSnapshot{drivers_hash, object_digests, object_paths, layout_blob}`;
+driver `try_reuse_layout` gate before `compute_layout`. Gate proven by `peony/tests/incremental.rs`
+(byte-identical vs full link, alternating relinks) + the `/tmp/incbench` 402-object harness
+(0 mismatches across 6 thread counts + cross-thread reuse). NOTE the original `compute_a.o`/`compute_b.o`
+fixtures were compiled from differently-NAMED sources (`ca.c`/`cb.c`) → different `STT_FILE` symbol →
+`.symtab` genuinely differs → reuse CORRECTLY declines; use same-filename `compute_42.o`/`compute_77.o`.
 
 Phases 2–4 are coupled (they share the persisted id-order + contribution cache),
 so the real first big slice is "persist front-end state + reuse it when no
