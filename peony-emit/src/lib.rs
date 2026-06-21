@@ -124,9 +124,9 @@ pub struct EmitConfig {
 /// can recycle physical pages without invalidating all TLB entries, reducing
 /// per-link wall-clock time by up to 28% on I/O-bound workloads.
 ///
-/// ## Parallel section copy + relocation apply (QUAD Theorem 5.1)
+/// ## Parallel section copy + relocation apply
 ///
-/// All input sections write to disjoint file ranges (by Theorem 4.1), so they
+/// All input sections write to disjoint file ranges assigned by layout, so they
 /// can be copied and relocated in parallel with zero synchronization.
 pub fn emit_full(
     output_path: &Path,
@@ -245,7 +245,7 @@ fn emit_with_filter(
         write_headers(&mut mmap, layout);
     }
 
-    // Parallel section data copy + relocation apply (QUAD Theorem 5.1).
+    // Parallel section data copy + relocation apply.
     // Each output section writes to a disjoint file range — zero-sync parallel.
     // Uses ws-deque's Chase-Lev work-stealing deque for load-balanced dispatch.
     {

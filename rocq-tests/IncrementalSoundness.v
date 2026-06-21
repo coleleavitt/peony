@@ -1,32 +1,23 @@
-(** * IncrementalSoundness.v — NOVEL theorems for incremental relinking
+(** * IncrementalSoundness.v — model and bridge lemmas for incremental relinking
 
-    This file states and machine-checks two theorems that, per a deep-research
-    prior-art survey (CompCert separate compilation [Kang et al. POPL'16],
-    self-adjusting computation [Acar/Blume/Donham 2011], incremental λ-calculus
-    [Cai et al. 2013], Build Systems à la Carte [Mokhov et al. ICFP'18]), do NOT
-    appear in the published literature specialized to *byte-level linking*:
+    This file states and machine-checks one implementation-bridge theorem for
+    peony-cache's partial-relink planner plus model lemmas for byte-level
+    red/green reasoning:
 
     ┌─────────────────────────────────────────────────────────────────────────┐
-    │ THEOREM A (Incremental-Relink Soundness).                                │
-    │   Under a precise "capacity-stable" invariant on a content-addressed     │
-    │   section diff, the incrementally *patched* output image is BYTE-        │
-    │   IDENTICAL to a full deterministic relink of the changed inputs.        │
-    │   (Linker analogue of Acar's from-scratch consistency / Cai's            │
-    │    f(a ⊕ da) = f(a) ⊕ D⟦f⟧ a da, at the level of output bytes.)          │
+    │ THEOREM A (Incremental planner gate soundness).                          │
+    │   Metadata accepted by the Rust partial-relink planner implies the       │
+    │   model's capacity_stable invariant: same identity, file offset, VA,     │
+    │   capacity, and content length fit.                                      │
     ├─────────────────────────────────────────────────────────────────────────┤
     │ THEOREM B (Minimal Recomputation Cut).                                   │
-    │   The set of output regions the incremental algorithm recomputes (the    │
-    │   "red" set) is exactly the set that any correct incremental linker MUST  │
-    │   recompute: every red region is FORCED (a witness edit changes it) and   │
-    │   every green region is byte-stable. This is the linker analogue of      │
-    │   Mokhov's build-system *minimality* (Definition 2.1), proved at byte    │
-    │   granularity rather than file granularity.                              │
+    │   In the model, every green region is byte-stable and every red region   │
+    │   has a witness edit that changes its rendered byte.                     │
     └─────────────────────────────────────────────────────────────────────────┘
 
-    These specialize known incremental-computation meta-theory to the linker's
-    concrete (section → layout → relocation → bytes) pipeline, where the prior
-    surveys found an explicit gap. Maps to: QUAD.md §6 (Definition 6.1, Theorem
-    6.1) and §10.2 (red-green). *)
+    This is not a whole-implementation verification of peony's Rust emit path;
+    it proves one concrete bridge from planner metadata to the model invariant
+    used by the remaining lemmas. *)
 
 From Stdlib Require Import List Arith Bool Lia.
 From Stdlib Require Import FunctionalExtensionality.
@@ -44,6 +35,7 @@ Definition byte := nat.
 Record section := {
   s_id       : nat;          (* stable identity across rebuilds *)
   s_offset   : addr;         (* file offset of this section *)
+  s_vaddr    : addr;         (* virtual address used to compute relocated bytes *)
   s_capacity : nat;          (* reserved bytes (>= |content|) *)
   s_content  : list byte     (* the section's bytes (already relocated) *)
 }.
@@ -71,6 +63,7 @@ Definition render (secs : list section) (m0 : addr -> byte) : addr -> byte :=
 Definition layout_compatible (s s' : section) : Prop :=
   s_id s = s_id s' /\
   s_offset s = s_offset s' /\
+  s_vaddr s = s_vaddr s' /\
   s_capacity s = s_capacity s' /\
   length (s_content s)  <= s_capacity s /\
   length (s_content s') <= s_capacity s'.
@@ -93,6 +86,111 @@ Proof.
   - rewrite Hoff, IH. reflexivity.
 Qed.
 
+Lemma capacity_stable_same_vaddrs :
+  forall l l', capacity_stable l l' -> map s_vaddr l = map s_vaddr l'.
+Proof.
+  induction 1 as [|s s' xs xs' [Hid [Hoff [Hvaddr _]]] Hcs IH]; simpl.
+  - reflexivity.
+  - rewrite Hvaddr, IH. reflexivity.
+Qed.
+
+(* ================================================================== *)
+(** * 2a.  Bridge for peony-cache's runtime patch planner             *)
+(* ================================================================== *)
+
+(** The Rust patch planner consumes one persisted [SectionRecord] from the
+    previous manifest and one current [PatchSectionRecord] from the fresh
+    layout. This model mirrors only the fields used by
+    [peony_cache::plan_partial_relink]'s acceptance gate. *)
+Record persisted_section := {
+  ps_name        : nat;
+  ps_file_offset : addr;
+  ps_size        : nat;
+  ps_capacity    : nat;
+  ps_vaddr       : addr
+}.
+
+Record current_section := {
+  cs_name        : nat;
+  cs_file_offset : addr;
+  cs_size        : nat;
+  cs_vaddr       : addr;
+  cs_changed     : bool
+}.
+
+Definition accepted_patch_metadata (prev : persisted_section) (cur : current_section) : Prop :=
+  ps_name prev = cs_name cur /\
+  ps_file_offset prev = cs_file_offset cur /\
+  ps_vaddr prev = cs_vaddr cur /\
+  cs_size cur <= ps_capacity prev /\
+  cs_size cur = ps_size prev.
+
+Definition previous_model_section
+    (id : nat) (prev : persisted_section) (content : list byte) : section :=
+  {| s_id := id;
+     s_offset := ps_file_offset prev;
+     s_vaddr := ps_vaddr prev;
+     s_capacity := ps_capacity prev;
+     s_content := content |}.
+
+Definition current_model_section
+    (id : nat) (prev : persisted_section) (cur : current_section)
+    (content : list byte) : section :=
+  {| s_id := id;
+     s_offset := cs_file_offset cur;
+     s_vaddr := cs_vaddr cur;
+     s_capacity := ps_capacity prev;
+     s_content := content |}.
+
+Theorem accepted_patch_metadata_implies_layout_compatible :
+  forall id prev cur old_content new_content,
+    accepted_patch_metadata prev cur ->
+    length old_content = ps_size prev ->
+    length new_content = cs_size cur ->
+    layout_compatible
+      (previous_model_section id prev old_content)
+      (current_model_section id prev cur new_content).
+Proof.
+  intros id prev cur old_content new_content Hgate Hold Hnew.
+  destruct Hgate as [_ [Hoff [Hvaddr [Hfits Hsize]]]].
+  unfold previous_model_section, current_model_section, layout_compatible.
+  simpl. repeat split; try assumption; lia.
+Qed.
+
+Record patch_pair := {
+  pp_id          : nat;
+  pp_prev        : persisted_section;
+  pp_cur         : current_section;
+  pp_old_content : list byte;
+  pp_new_content : list byte
+}.
+
+Definition accepted_patch_pair (p : patch_pair) : Prop :=
+  accepted_patch_metadata (pp_prev p) (pp_cur p) /\
+  length (pp_old_content p) = ps_size (pp_prev p) /\
+  length (pp_new_content p) = cs_size (pp_cur p).
+
+Definition previous_pair_section (p : patch_pair) : section :=
+  previous_model_section (pp_id p) (pp_prev p) (pp_old_content p).
+
+Definition current_pair_section (p : patch_pair) : section :=
+  current_model_section (pp_id p) (pp_prev p) (pp_cur p) (pp_new_content p).
+
+Theorem accepted_patch_plan_implies_capacity_stable :
+  forall pairs,
+    Forall accepted_patch_pair pairs ->
+    capacity_stable (map previous_pair_section pairs) (map current_pair_section pairs).
+Proof.
+  induction pairs as [|p ps IH]; intros Hall; simpl.
+  - constructor.
+  - inversion Hall as [|? ? Hp Hps]; subst.
+    destruct Hp as [Hgate [Hold Hnew]].
+    constructor.
+    + unfold previous_pair_section, current_pair_section.
+      apply accepted_patch_metadata_implies_layout_compatible; assumption.
+    + apply IH. exact Hps.
+Qed.
+
 (* ================================================================== *)
 (** * 3.  Disjoint placement                                           *)
 (* ================================================================== *)
@@ -113,7 +211,7 @@ Inductive well_placed : list section -> Prop :=
     well_placed (s :: xs).
 
 (* ================================================================== *)
-(** * 4.  THEOREM A — Incremental-relink soundness (byte-identical)    *)
+(** * 4.  THEOREM A — Incremental planner gate soundness               *)
 (* ================================================================== *)
 
 (** Region of a section: the addresses its content occupies. *)
@@ -121,8 +219,9 @@ Definition in_section (s : section) (a : addr) : Prop :=
   s_offset s <= a /\ a < s_offset s + length (s_content s).
 
 (** A *green* section is one whose content is unchanged; its rendered bytes are
-    therefore identical. A *red* section changed. The incremental patch only
-    rewrites red sections; THEOREM A says the result equals a full render. *)
+    therefore identical. A *red* section changed. The implementation bridge
+    above proves the planner gate establishes the capacity-stability precondition
+    used by the model lemmas below. *)
 
 (** Rendering one section is determined solely by its offset and content. *)
 Lemma render_section_ext :
@@ -144,27 +243,27 @@ Lemma green_noop :
     render_section s' m = render_section s m.
 Proof. intros; symmetry; apply render_section_ext; auto. Qed.
 
-(** THEOREM A (Incremental-Relink Soundness).
+(** THEOREM A (Incremental-Relink gate soundness).
 
-    If the new section list is a capacity-stable update of the old one, then
-    rendering the NEW sections from any base memory (the "full relink") equals
-    rendering them — i.e. the in-place patch, which reuses offsets/capacities
-    and only overwrites changed content windows, yields a byte-identical image.
-
-    Formally: capacity-stability guarantees the new render is a function only of
-    the new contents at the (shared) offsets, with no cross-section interference
-    — so "patch the old image" and "render from scratch" coincide. *)
+    The Rust planner only permits a partial relink after matching the current
+    section metadata against the persisted manifest. The theorem below is the
+    machine-checked bridge from that accepted runtime metadata shape to the
+    model's load-bearing [capacity_stable] invariant. It does not claim that all
+    of peony's Rust emit logic is verified; it proves the exact precondition
+    that later byte-stability lemmas rely on. *)
 Theorem incremental_relink_sound :
-  forall old new m0,
-    capacity_stable old new ->
-    render new m0 = render new m0.
-Proof. reflexivity. Qed.
+  forall pairs,
+    Forall accepted_patch_pair pairs ->
+    capacity_stable (map previous_pair_section pairs) (map current_pair_section pairs).
+Proof.
+  intros pairs Hpairs.
+  apply accepted_patch_plan_implies_capacity_stable.
+  exact Hpairs.
+Qed.
 
-(** The substantive content of Theorem A is that the *patched* image equals the
-    *full* render. We make "patch" explicit: patching applies only the new
-    contents of changed sections on top of the old image; because offsets and
-    capacities are shared (capacity-stable) and windows are disjoint
-    (well_placed), this equals rendering all new sections from the old base. *)
+(** The remaining lemmas stay at model level: once a caller has established
+    capacity-stability and disjoint placement, unchanged regions are stable and
+    changed regions have explicit witnesses. *)
 
 Lemma render_app : forall a b m,
   render (a ++ b) m = render b (render a m).

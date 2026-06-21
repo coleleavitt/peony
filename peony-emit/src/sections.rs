@@ -49,9 +49,9 @@ pub(crate) fn write_tls_got(buf: &mut [u8], layout: &Layout) {
 
 /// Write all section data and apply relocations in parallel.
 ///
-/// By QUAD Theorem 5.1, each output section writes to a disjoint file range,
-/// so we can split the mutable buffer into non-overlapping slices and hand each
-/// to a worker thread without any synchronization.
+/// Layout assigns each output section a disjoint file range, so we can split
+/// the mutable buffer into non-overlapping slices and hand each to a worker
+/// thread without any synchronization.
 pub(crate) fn write_section_data_parallel(
     buf: &mut [u8],
     arena: &InputArena,

@@ -9,7 +9,7 @@
 //! current epoch key and cheap file fingerprints match the cached manifest, the
 //! output is byte-identical to the previous link and we skip all work.
 //!
-//! ### Red-green section coloring (QUAD Definition 6.1, Theorem 6.1)
+//! ### Red-green section coloring (QUAD Definition 6.1)
 //!
 //! When inputs *do* change, the cache exposes section-level diff machinery:
 //! - **Green** sections: byte-identical to the previous link → skip re-emit.
@@ -131,7 +131,7 @@ impl FastFingerprint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SectionColor {
-    /// Byte-identical to the previous link → skip re-emit (Theorem 6.1).
+    /// Safe to preserve under the accepted partial-relink metadata gate.
     Green,
     /// Changed or has moved relocation targets → must re-emit.
     Red,
@@ -852,7 +852,7 @@ fn read_manifest(path: &Path) -> Result<Option<Manifest>> {
 
 /// Compute the red-green coloring for each output section.
 ///
-/// Implements QUAD Definition 6.1 and Theorem 6.1:
+/// Implements the QUAD Definition 6.1 red-green classification:
 /// - **Green**: section fingerprint unchanged AND no relocation target moved.
 /// - **Red**: fingerprint changed OR a relocation target in this section moved.
 ///
