@@ -155,15 +155,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let script_controls = parse_linker_script_controls(&args.linker_scripts)?;
-    if !args.entry_explicit {
-        if let Some(entry) = &script_controls.entry {
-            args.entry = entry.clone();
-        }
+    if !args.entry_explicit
+        && let Some(entry) = &script_controls.entry
+    {
+        args.entry = entry.clone();
     }
-    if !args.base_address_explicit {
-        if let Some(base) = &script_controls.base_address {
-            args.base_address = base.clone();
-        }
+    if !args.base_address_explicit
+        && let Some(base) = &script_controls.base_address
+    {
+        args.base_address = base.clone();
     }
     // `-shared` wins over `-pie`: a shared object is ET_DYN but is not a PIE
     // (no DF_1_PIE, no PT_INTERP, no entry). Some drivers pass both.
@@ -226,12 +226,12 @@ fn main() -> Result<()> {
     // sub-5ms path is automatic in a dev shell.
     if args.incremental {
         daemon::ensure_autospawn(&args.output);
-        if let Some(handled) = daemon::try_delegate(&args.output, args_hash) {
-            if handled {
-                tracing::info!(output = %args.output.display(), "link complete (daemon relink)");
-                cache_report.record(&args.output, CacheOutcome::ReusedUnchanged)?;
-                return Ok(());
-            }
+        if let Some(handled) = daemon::try_delegate(&args.output, args_hash)
+            && handled
+        {
+            tracing::info!(output = %args.output.display(), "link complete (daemon relink)");
+            cache_report.record(&args.output, CacheOutcome::ReusedUnchanged)?;
+            return Ok(());
         }
     }
 
@@ -1110,13 +1110,12 @@ fn emit_parse_only_changed(
                 if !reloc_apply_simple(r.r_type) {
                     return Ok(None);
                 }
-                if let Some(s) = obj.symbol_by_index(r.symbol.0) {
-                    if s.binding != Binding::Local
-                        && !s.name.is_empty()
-                        && symbols.lookup(&s.name).is_none()
-                    {
-                        return Ok(None);
-                    }
+                if let Some(s) = obj.symbol_by_index(r.symbol.0)
+                    && s.binding != Binding::Local
+                    && !s.name.is_empty()
+                    && symbols.lookup(&s.name).is_none()
+                {
+                    return Ok(None);
                 }
             }
         }
@@ -1493,12 +1492,11 @@ fn relocation_reverse_index(
             for reloc in &input_sec.relocs {
                 let reloc_id = reloc_sections.len() as u32;
                 reloc_sections.push(sec.name.clone());
-                if let Some(sym) = obj.symbol_by_index(reloc.symbol.0) {
-                    if sym.binding != Binding::Local {
-                        if let Some(res) = symbols.lookup(&sym.name) {
-                            index.insert(res.id.0, reloc_id);
-                        }
-                    }
+                if let Some(sym) = obj.symbol_by_index(reloc.symbol.0)
+                    && sym.binding != Binding::Local
+                    && let Some(res) = symbols.lookup(&sym.name)
+                {
+                    index.insert(res.id.0, reloc_id);
                 }
             }
         }

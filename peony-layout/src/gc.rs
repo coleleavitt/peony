@@ -1,12 +1,14 @@
 use peony_object::{InputObject, InputSection};
 use peony_symbols::SymbolTable;
 use rustc_hash::FxHashSet;
+mod graph;
 mod live;
 mod parallel;
 mod targets;
 #[cfg(test)]
 mod tests;
 
+pub use graph::{GcEdge, GcEdgeReason, GcGraph, GcRoot, GcRootReason};
 pub use live::LiveSections;
 use parallel::{ParallelLevel, collect_parallel_level};
 use targets::{GcTargetMaps, GcTargetStats};
@@ -123,19 +125,10 @@ impl<'a> GcTraversal<'a> {
     }
 
     fn insert_key(&mut self, key: (usize, usize)) {
-        if self.live.insert(key) {
-            if let Some(item) = self.context().item_for_key(key) {
-                self.frontier.push(item);
-            }
-        }
-    }
-
-    fn insert_root(&mut self, key: (usize, usize)) {
-        if self.live.insert(key) {
-            if let Some(item) = self.context().item_for_key(key) {
-                self.frontier.push(item);
-                self.stats.roots += 1;
-            }
+        if self.live.insert(key)
+            && let Some(item) = self.context().item_for_key(key)
+        {
+            self.frontier.push(item);
         }
     }
 
@@ -147,40 +140,9 @@ impl<'a> GcTraversal<'a> {
     }
 
     fn seed_roots(&mut self, entry_symbol: &str, export_roots: bool) {
-        if let Some(res) = self.targets.symbols().lookup(entry_symbol.as_bytes()) {
-            if let (Some(def), Some(si)) = (res.defined_in, res.section_index) {
-                self.insert_root((def.0 as usize, si));
-            }
-        }
-        if export_roots {
-            let mut roots = Vec::new();
-            for (_, res) in self.targets.symbols().iter() {
-                if !res.is_export() {
-                    continue;
-                }
-                if let (Some(def), Some(si)) = (res.defined_in, res.section_index) {
-                    roots.push((def.0 as usize, si));
-                }
-            }
-            for key in roots {
-                self.insert_root(key);
-            }
-        }
-        for (object_id, obj) in self.objects.iter().enumerate() {
-            for (section_pos, sec) in obj.sections.iter().enumerate() {
-                let keep = sec.name.starts_with(b".init")
-                    || sec.name.starts_with(b".fini")
-                    || sec.name.starts_with(b".preinit_array")
-                    || sec.name.starts_with(b".eh_frame")
-                    || sec.name.starts_with(b".gcc_except_table")
-                    || (sec.flags & peony_object::elf::SHF_GNU_RETAIN) != 0;
-                if keep && sec.flags & peony_object::elf::SHF_ALLOC != 0 {
-                    self.insert_known_root(GcWorkItem {
-                        object_id,
-                        section_index: sec.index.0,
-                        section_pos,
-                    });
-                }
+        for root in graph::collect_roots(self, entry_symbol, export_roots) {
+            if let Some(item) = self.context().item_for_key(root.section) {
+                self.insert_known_root(item);
             }
         }
     }
@@ -268,4 +230,17 @@ pub fn gc_sections_rooted_with_stats(
     let mut traversal = GcTraversal::new(objects, symbols);
     traversal.seed_roots(entry_symbol, export_roots);
     traversal.run()
+}
+
+pub fn gc_graph_rooted(
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    entry_symbol: &str,
+    export_roots: bool,
+) -> GcGraph {
+    graph::extract_graph(
+        &GcTraversal::new(objects, symbols),
+        entry_symbol,
+        export_roots,
+    )
 }

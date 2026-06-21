@@ -75,21 +75,21 @@ fn c_identifier_suffix(s: &str) -> bool {
 
 fn start_stop_symbol(name: &[u8]) -> Option<ProvidedSymbol> {
     let name = std::str::from_utf8(name).ok()?;
-    if let Some(section) = name.strip_prefix("__start_") {
-        if c_identifier_suffix(section) {
-            return Some(ProvidedSymbol::SectionStart {
-                name: name.to_string(),
-                section: section.to_string(),
-            });
-        }
+    if let Some(section) = name.strip_prefix("__start_")
+        && c_identifier_suffix(section)
+    {
+        return Some(ProvidedSymbol::SectionStart {
+            name: name.to_string(),
+            section: section.to_string(),
+        });
     }
-    if let Some(section) = name.strip_prefix("__stop_") {
-        if c_identifier_suffix(section) {
-            return Some(ProvidedSymbol::SectionStop {
-                name: name.to_string(),
-                section: section.to_string(),
-            });
-        }
+    if let Some(section) = name.strip_prefix("__stop_")
+        && c_identifier_suffix(section)
+    {
+        return Some(ProvidedSymbol::SectionStop {
+            name: name.to_string(),
+            section: section.to_string(),
+        });
     }
     None
 }
@@ -100,11 +100,11 @@ fn start_stop_symbol(name: &[u8]) -> Option<ProvidedSymbol> {
 pub(crate) fn predefine_linker_symbols(symbols: &mut SymbolTable) -> Vec<ProvidedSymbol> {
     let mut provided = Vec::new();
     for &name in LINKER_SYMS {
-        if let Some(r) = symbols.lookup(name.as_bytes()) {
-            if r.defined_in.is_none() {
-                symbols.define_absolute(name.as_bytes(), 0);
-                provided.push(ProvidedSymbol::Fixed(name));
-            }
+        if let Some(r) = symbols.lookup(name.as_bytes())
+            && r.defined_in.is_none()
+        {
+            symbols.define_absolute(name.as_bytes(), 0);
+            provided.push(ProvidedSymbol::Fixed(name));
         }
     }
     let dynamic: Vec<ProvidedSymbol> = symbols

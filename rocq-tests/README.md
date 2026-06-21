@@ -27,10 +27,10 @@ axioms).
 | File | QUAD.md § | Headline results |
 |---|---|---|
 | `SymbolLattice.v` | §2 | `sjoin_assoc`, `sjoin_comm`, idempotence (non-strong); `resolve_perm_invariant` / `parallel_resolution_deterministic` (order-independent merge); `pick_assoc` + `pick_is_input` (argmax resolution under provenance tie-break) |
-| `RelocDisjoint.v` | §5 | `apply_comm` (disjoint relocations commute — the frame property); `apply_all_perm_invariant` / `parallel_reloc_deterministic` (parallel apply = sequential) |
+| `RelocDisjoint.v` | §5 | `apply_comm` (disjoint relocations commute — the frame property); `apply_all_perm_invariant` / `parallel_reloc_deterministic` (parallel apply = sequential); `accepted_emit_ranges_batch_precondition` / `accepted_emit_ranges_parallel_batches_deterministic` (checked section output ranges imply cross-batch disjointness for the current emitter) |
 | `RelocMonoid.v` | §5 (new framing) | Model algebra: relocation patches form a *partial commutative monoid*; `act_oplus` (action is a homomorphism), `act_comm`, `reloc_pcm_summary` |
 | `SectionGC.v` | §3 | `gc_sound` (every GC-live section is reachable), `gc_contains_roots`, `bfs_superset_*` (level-synchronous BFS = reachability) |
-| `Layout.v` | §4 | `layout_all_aligned` (page alignment), `layout_page_congruent` (vaddr ≡ fileoff mod page), `layout_addr_lower_bound` + `layout_no_overlap` (disjoint windows) |
+| `Layout.v` | §4 | `layout_all_aligned` (page alignment), `layout_page_congruent` (vaddr ≡ fileoff mod page), `layout_addr_lower_bound`, `layout_no_overlap`, and `layout_pairwise_no_overlap` (disjoint windows) |
 | `IncrementalSoundness.v` | §6, §10.2 | `accepted_patch_metadata_implies_layout_compatible`, `accepted_patch_plan_implies_capacity_stable`, and `incremental_relink_sound`: a checked bridge from `peony-cache::plan_partial_relink`'s accepted metadata shape to the model's `capacity_stable` invariant, plus model lemmas `green_is_byte_stable`, `red_is_forced`, and `minimal_cut_characterization` |
 | `IncrementalCostBound.v` | §6 (new) | Model-level cost results: `incremental_beats_fromscratch`, `single_edit_cost_is_one`, `fromscratch_grows_unboundedly`, and `capacity_stable_cost_bounded`. These are abstract work-count results, not wall-clock performance proofs. |
 | `ParallelSchedule.v` | §7 (new) | Model-level work-span (Brent) bounds for an ideal disjoint-footprint section-copy antichain: `span_lower_bound`, `work_lower_bound`, `greedy_within_2x_opt`, `linear_speedup_regime` |
@@ -55,7 +55,19 @@ explicitly leaving the byte-level link step in the trusted base.
    `peony-cache/tests/partial_relink.rs` and exercise every planner fallback
    reason plus relocation-dependent red coloring.
 
-2. **Minimal Recomputation Cut** (`IncrementalSoundness.v`, Theorem B =
+2. **Parallel emit range bridge** (`RelocDisjoint.v`).
+   `accepted_emit_ranges_batch_precondition` proves that accepted half-open
+   section output ranges imply cross-batch relocation disjointness when every
+   relocation footprint in a worker batch fits inside that worker's range. This
+   matches the Rust shape: one work item per input-section contribution, with
+   relocations inside that item applied sequentially by one worker. The Rust
+   precondition is enforced by
+   `peony-emit::input_work::validate_work_item_ranges` before
+   `copy_input_sections` dispatches serial or parallel workers; unit tests cover
+   adjacent ranges, overlap, overflow, out-of-bounds ranges, and zero-length
+   ranges.
+
+3. **Minimal Recomputation Cut** (`IncrementalSoundness.v`, Theorem B =
    `minimal_cut_characterization`). In this model, the red/green partition by
    content-change is the *unique minimal correct cut*: every green region is byte-stable
    (`green_is_byte_stable`, so it is sound to skip) and every red region is
@@ -98,21 +110,59 @@ arXiv:2105.06712, Brent/Graham work–span, Hopcroft partition refinement):
 
 ## Relationship to the Implementation
 
-Only the incremental planner gate currently has a checked implementation bridge:
-`IncrementalSoundness.incremental_relink_sound` models the fields accepted by
-`peony-cache::plan_partial_relink` and proves that accepted records imply
-`capacity_stable`. The Rust integration tests in
-`peony-cache/tests/partial_relink.rs` lock the concrete planner behavior against
-that model shape.
+The public claim boundary lives in
+[`../docs/VERIFICATION_CLAIMS.md`](../docs/VERIFICATION_CLAIMS.md), with the
+machine-readable table in
+[`../docs/VERIFICATION_CLAIMS.json`](../docs/VERIFICATION_CLAIMS.json). That
+boundary separates model-only results, bridge-tested correspondences, theorem
+bridges, and narrow implementation-verified surfaces.
 
-The remaining items below are correspondences, not verified refinement proofs:
+The theorem-to-Rust bridge map is
+[`../docs/THEOREM_TO_RUST_BRIDGES.md`](../docs/THEOREM_TO_RUST_BRIDGES.md).
+Every theorem used by a theorem-backed public claim has a raw
+`Print Assumptions` artifact under
+[`../docs/verification-assumptions/`](../docs/verification-assumptions/).
 
-- `SymbolLattice.sjoin` ↔ `peony-symbols::merge_symbol` (`⊕` resolution)
+The current Rust bridge tests check these concrete correspondences:
+
+- `peony-reloc` unit tests lock representative `patch_buf` byte formulas for
+  `R_X86_64_64`, `PC32`, `PLT32`, `GOTPCREL`, and `SIZE32`, plus the checked
+  overflow path.
+- `peony-layout/tests/layout_gc_bridge.rs` exercises `compute_layout`
+  page-congruence/non-overlap plus `gc_sections` reachability and
+  `SHF_GNU_RETAIN` roots.
+- `peony-layout/tests/icf_bridge.rs` exercises ICF's positive `.llvm_addrsig`
+  fold plus negative coverage for `.llvm_addrsig`-listed symbols, named and
+  section-relative address taint, exported/default-visible symbols, weak
+  definitions, ABI-unique `_ZT*` names, missing addrsig metadata, and unresolved
+  fold-key relocation targets.
+- `peony-symbols/tests/symbol_bridge.rs` exercises the global symbol table's
+  undefined-to-strong, weak-to-strong, and duplicate-strong rules.
+- `peony-cache/tests/partial_relink.rs` and `peony-emit::input_work` tests cover
+  planner metadata and accepted input-work ranges.
+- `peony/tests/incremental.rs` checks the scoped partial-emit byte identity path
+  used by the N1 claim.
+
+The remaining items below are still model-only results or scoped
+correspondences unless the claim table states a narrower theorem-backed status.
+The executable task ledger for the verification work is
+[`../docs/IMPLEMENTATION_VERIFICATION_TASKS.md`](../docs/IMPLEMENTATION_VERIFICATION_TASKS.md).
+
+- `SymbolLattice.sjoin` ↔ the full `peony-symbols` resolution pipeline
+  (`⊕` resolution plus archive/version/COMDAT interactions)
 - `RelocDisjoint.apply1` / `footprint` ↔ `peony-reloc::apply_reloc` writing
-  `width` bytes at `offset`; `pairwise_disjoint` ↔ the disjoint section file
-  ranges that make `peony-emit::write_section_data_parallel` sound
-- `SectionGC.bfs` ↔ `peony-layout::gc_sections` (S3-GC level-synchronous BFS)
-- `Layout.layout_assign` ↔ `peony-layout::compute_layout` address assignment
+  `width` bytes at `offset`; cross-batch disjointness is now bridged from the
+  checked `peony-emit` section work ranges, while end-to-end byte-level
+  `apply_reloc` refinement, including symbol/layout address resolution, is still
+  a correspondence
+- `SectionGC.bfs` ↔ the full `peony-layout::gc_sections` graph construction and
+  traversal
+- `Layout.layout_assign` ↔ the full `peony-layout::compute_layout` segment and
+  section-header assignment
+- `ICFSoundness.address_safe` ↔ the current Rust ICF pass's checked
+  address-safety witness for folds emitted by `compute_fold_map`; object parser
+  correctness and unsupported dynamic address-significance sources remain
+  outside this bridge
 - `IncrementalSoundness.capacity_stable` ↔ the accepted `peony-cache`
   partial-relink planner metadata; `render` ↔ the emit of section contents into
   the mmap

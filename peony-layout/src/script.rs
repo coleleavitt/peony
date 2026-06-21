@@ -46,18 +46,18 @@ fn script_pattern_matches(pattern: &str, name: &str) -> bool {
     let anchored_start = !pattern.starts_with('*');
     let anchored_end = !pattern.ends_with('*');
 
-    if let Some(first) = parts.next() {
-        if !first.is_empty() {
-            if anchored_start {
-                let Some(stripped) = rest.strip_prefix(first) else {
-                    return false;
-                };
-                rest = stripped;
-            } else if let Some(pos) = rest.find(first) {
-                rest = &rest[pos + first.len()..];
-            } else {
+    if let Some(first) = parts.next()
+        && !first.is_empty()
+    {
+        if anchored_start {
+            let Some(stripped) = rest.strip_prefix(first) else {
                 return false;
-            }
+            };
+            rest = stripped;
+        } else if let Some(pos) = rest.find(first) {
+            rest = &rest[pos + first.len()..];
+        } else {
+            return false;
         }
     }
 

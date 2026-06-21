@@ -363,10 +363,11 @@ fn directive_body_with_pos<'a>(
                 if let Some(close) = matching_paren(text, open) {
                     return Some((kw, &text[open + 1..close], close + 1));
                 }
-            } else if open < text.len() && text.as_bytes()[open] == b'{' {
-                if let Some(close) = matching_brace(text, open) {
-                    return Some((kw, &text[open + 1..close], close + 1));
-                }
+            } else if open < text.len()
+                && text.as_bytes()[open] == b'{'
+                && let Some(close) = matching_brace(text, open)
+            {
+                return Some((kw, &text[open + 1..close], close + 1));
             }
         }
         search = after;
@@ -719,7 +720,7 @@ mod tests {
         std::fs::write(&archive, b"!<arch>\n").unwrap();
 
         assert_eq!(
-            resolve_library("compat", LibraryMode::Dynamic, &[dir.clone()]).unwrap(),
+            resolve_library("compat", LibraryMode::Dynamic, std::slice::from_ref(&dir)).unwrap(),
             archive
         );
 

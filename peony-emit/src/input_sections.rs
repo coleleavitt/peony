@@ -8,7 +8,15 @@ use peony_prof::TraceField;
 use peony_reloc::{ApplyCtx, RelocError};
 use peony_symbols::SymbolTable;
 
-use crate::input_work::{WorkItem, WorkSummary, collect_input_work_items, usize_to_u64};
+use crate::input_work::{
+    AcceptedWorkItemRange,
+    AcceptedWorkRanges,
+    WorkItem,
+    WorkSummary,
+    collect_input_work_items,
+    usize_to_u64,
+    validate_work_item_ranges,
+};
 use crate::{EmitError, Result, SectionWriteFilter};
 
 #[derive(Clone, Copy)]
@@ -75,6 +83,7 @@ pub(crate) fn copy_input_sections(
         sym_index: Some(&sym_index),
     };
     let work_items = collect_input_work_items(layout, objects, filter);
+    let accepted_ranges = validate_work_item_ranges(&work_items, buf_len)?;
     peony_prof::record_items("emit", work_items.len() as u64);
     let _t = WorkSummary::from_items(&work_items).map_or_else(
         || peony_prof::trace("emit:section-copy-dispatch"),
@@ -89,12 +98,16 @@ pub(crate) fn copy_input_sections(
         reloc: &reloc_ctx,
         output_path,
     };
-    let totals = dispatch_parallel(&work_items, &dispatch)?;
+    let totals = dispatch_parallel(&work_items, &accepted_ranges, &dispatch)?;
     record_emit_totals(&totals);
     Ok(())
 }
 
-fn dispatch_parallel(work_items: &[WorkItem<'_>], ctx: &DispatchCtx<'_>) -> Result<EmitTotals> {
+fn dispatch_parallel(
+    work_items: &[WorkItem<'_>],
+    accepted_ranges: &AcceptedWorkRanges,
+    ctx: &DispatchCtx<'_>,
+) -> Result<EmitTotals> {
     if work_items.is_empty() {
         return Ok(EmitTotals::default());
     }
@@ -109,8 +122,12 @@ fn dispatch_parallel(work_items: &[WorkItem<'_>], ctx: &DispatchCtx<'_>) -> Resu
             ],
         );
         let mut totals = EmitTotals::default();
-        for &item in work_items {
-            process_item(item, ctx, &mut totals).map_err(|e| reloc_error(ctx.output_path, e))?;
+        for (item_index, &item) in work_items.iter().enumerate() {
+            let Some(accepted_range) = accepted_ranges.range_for_item(item_index) else {
+                continue;
+            };
+            process_item(item, accepted_range, ctx, &mut totals)
+                .map_err(|e| reloc_error(ctx.output_path, e))?;
         }
         return Ok(totals);
     }
@@ -148,8 +165,12 @@ fn dispatch_parallel(work_items: &[WorkItem<'_>], ctx: &DispatchCtx<'_>) -> Resu
 
     ws_deque::scheduler::run(num_threads, batches, |(start, end), _spawner| {
         let mut batch_totals = EmitTotals::default();
-        for &item in &work_items[start..end] {
-            if let Err(error) = process_item(item, ctx, &mut batch_totals) {
+        for (batch_offset, &item) in work_items[start..end].iter().enumerate() {
+            let item_index = start + batch_offset;
+            let Some(accepted_range) = accepted_ranges.range_for_item(item_index) else {
+                continue;
+            };
+            if let Err(error) = process_item(item, accepted_range, ctx, &mut batch_totals) {
                 record_error(&error_slot, error);
                 break;
             }
@@ -190,6 +211,7 @@ fn record_error(slot: &Mutex<Option<RelocError>>, error: RelocError) {
 
 fn process_item(
     item: WorkItem<'_>,
+    accepted_range: AcceptedWorkItemRange,
     ctx: &DispatchCtx<'_>,
     totals: &mut EmitTotals,
 ) -> std::result::Result<(), RelocError> {
@@ -201,7 +223,7 @@ fn process_item(
         || item
             .file_off
             .checked_add(data_len)
-            .is_none_or(|end| end > ctx.output.len)
+            .is_none_or(|end| end > ctx.output.len || !accepted_range.contains(item.file_off, end))
     {
         return Ok(());
     }

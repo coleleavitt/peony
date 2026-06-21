@@ -26,10 +26,7 @@ pub fn parse_shared_object(path: &Path) -> Result<SharedObject> {
     // in from the map. `data` borrows `mapped`, which outlives every name copy.
     let mapped = MappedInput::open(path).ok_or_else(|| ObjectError::Io {
         path: path.display().to_string(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "could not memory-map shared object",
-        ),
+        source: std::io::Error::other("could not memory-map shared object"),
     })?;
     let data = mapped.bytes();
     let elf: ElfFile64<Endianness> = ElfFile64::parse(data).map_err(|e| ObjectError::Parse {
@@ -100,10 +97,10 @@ fn elf_soname(elf: &ElfFile64<Endianness>, data: &[u8]) -> Option<String> {
         .strings(endian, data, dyn_index)
         .ok()?;
     for d in dynamic {
-        if d.tag32(endian) == Some(elf::DT_SONAME as u32) {
-            if let Ok(name) = d.string(endian, strings) {
-                return Some(String::from_utf8_lossy(name).into_owned());
-            }
+        if d.tag32(endian) == Some(elf::DT_SONAME as u32)
+            && let Ok(name) = d.string(endian, strings)
+        {
+            return Some(String::from_utf8_lossy(name).into_owned());
         }
     }
     None

@@ -246,10 +246,10 @@ pub fn emit_relocatable(
         if let Some(&i) = local_map[obj_id].get(&raw) {
             return i;
         }
-        if let Some(s) = objects[obj_id].symbol_by_index(raw as usize) {
-            if let Some(&i) = global_index.get(s.name.as_bytes()) {
-                return i;
-            }
+        if let Some(s) = objects[obj_id].symbol_by_index(raw as usize)
+            && let Some(&i) = global_index.get(s.name.as_bytes())
+        {
+            return i;
         }
         0
     };

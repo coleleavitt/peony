@@ -13,3 +13,6 @@ rayon.workspace      = true
 rustc-hash.workspace = true
 thiserror.workspace  = true
 tracing.workspace    = true
+
+[dev-dependencies]
+peony-verification = { path = "../peony-verification" }

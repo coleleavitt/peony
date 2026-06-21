@@ -1,6 +1,6 @@
 # Peony Rust Code Style
 
-- Keep Rust on edition 2021 and follow surrounding style.
+- Keep Rust on edition 2024 and follow surrounding style.
 - Respect crate boundaries: parse in `peony-object`, symbols in
   `peony-symbols`, layout in `peony-layout`, relocation logic in `peony-reloc`,
   serialization in `peony-emit`, orchestration in `peony`.

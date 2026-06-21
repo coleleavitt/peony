@@ -71,6 +71,10 @@ impl LiveSections {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn into_hash_set(self) -> FxHashSet<(usize, usize)> {
         let mut out = FxHashSet::default();
         out.reserve(self.len);

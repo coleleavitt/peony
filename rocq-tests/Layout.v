@@ -162,3 +162,27 @@ Corollary layout_no_overlap :
     In q (layout_assign (align_up cursor + sc_cap s) rest) ->
     p_addr q >= align_up cursor + sc_cap s.
 Proof. intros; eapply layout_head_disjoint; eauto. Qed.
+
+Definition placed_disjoint (p q : placed) : Prop :=
+  p_addr p + p_cap p <= p_addr q \/
+  p_addr q + p_cap q <= p_addr p.
+
+Inductive pairwise_placed_disjoint : list placed -> Prop :=
+| ppd_nil : pairwise_placed_disjoint []
+| ppd_cons : forall p ps,
+    Forall (placed_disjoint p) ps ->
+    pairwise_placed_disjoint ps ->
+    pairwise_placed_disjoint (p :: ps).
+
+Theorem layout_pairwise_no_overlap :
+  forall secs cursor,
+    pairwise_placed_disjoint (layout_assign cursor secs).
+Proof.
+  induction secs as [|s rest IH]; intro cursor; simpl.
+  - constructor.
+  - constructor.
+    + apply Forall_forall. intros q Hin.
+      unfold placed_disjoint. left. simpl.
+      eapply layout_head_disjoint; eauto.
+    + apply IH.
+Qed.

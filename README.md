@@ -20,70 +20,50 @@ A relink does work proportional to what *changed*, not to the size of the progra
 | one file | re-parse only that `.o`, reuse the cached layout + symbol table, patch its bytes in place | **~19 ms** |
 | + daemon | keep the layout + symbols resident in RAM | **~3–4 ms** |
 
-The fast path is taken only when peony can *prove* the output is identical, same
-sizes, same symbols, same GOT/PLT/TLS demand, no `--gc-sections`/`--icf`, no
-archive change. Anything else falls back to a full link. **peony never serves
-stale bytes**; that is the one rule everything else bends to.
+The fast path is taken only when peony's cache gates establish the output should
+be identical: same sizes, same symbols, same GOT/PLT/TLS demand, no
+`--gc-sections`/`--icf`, no archive change. Anything else falls back to a full
+link. **peony never serves stale bytes**; that is the one rule everything else
+bends to.
 
 Incremental is on by default. For the daemon, `export PEONY_DAEMON=1` and peony
 spawns and reuses one automatically.
 
-## Proofs
-`rocq-tests/` holds machine-checked Rocq/Coq proofs (`make` is the oracle; zero axioms beyond
-functional extensionality). A few of the load-bearing ones:
+## Correctness Story
 
-**Byte-identity.** A "green" (unchanged) section renders byte-for-byte the same,
-which is what licenses skipping it:
+The real correctness gate is differential testing against the system linker:
+peony links real objects and checks byte identity against a full link across the
+incremental, daemon, and thread-count paths.
 
-```coq
-Theorem green_is_byte_stable :
-  forall s s' m,
-    s_offset s = s_offset s' ->          (* same place *)
-    s_content s = s_content s' ->        (* same bytes  *)
-    forall a, render_section s' m a = render_section s m a.
-```
+`rocq-tests/` holds machine-checked Rocq/Coq model proofs. They are useful
+specifications for linker invariants, but they are not whole-program
+verification of the Rust implementation. Public verification wording is scoped
+by [`docs/VERIFICATION_CLAIMS.md`](docs/VERIFICATION_CLAIMS.md), with the
+machine-readable source in
+[`docs/VERIFICATION_CLAIMS.json`](docs/VERIFICATION_CLAIMS.json). That table
+separates model-only results, bridge-tested correspondences, theorem bridges,
+and narrow implementation-verified surfaces.
 
-**Cost is O(affected), not O(program).** A relink's cost equals the number of
-changed sections — and a from-scratch link's cost grows without bound while a
-one-edit relink stays at 1:
+- Rocq theorem bridges and assumption audits:
+  [`docs/THEOREM_TO_RUST_BRIDGES.md`](docs/THEOREM_TO_RUST_BRIDGES.md) maps
+  theorem families to Rust surfaces, tests, trusted boundaries, and claim
+  scopes. `docs/verification-assumptions/` stores the `Print Assumptions`
+  outputs for theorem-backed public claims.
+- Rust bridge and differential tests:
+  `peony-cache/tests/partial_relink.rs`,
+  `peony-emit::input_work` unit tests,
+  `peony-reloc` byte-formula tests,
+  `peony-layout/tests/layout_gc_bridge.rs`,
+  `peony-layout/tests/icf_bridge.rs`, and
+  `peony-symbols/tests/symbol_bridge.rs` exercise the matching concrete planner,
+  emit-range, relocation-byte, layout/GC/ICF, and symbol-resolution surfaces.
+  `peony/tests/incremental.rs` checks the scoped partial-emit byte identity path.
 
-```coq
-Theorem incremental_cost_eq_num_changed :
-  forall old new, incremental_cost old new = num_changed old new.
-
-Theorem incremental_beats_fromscratch :
-  forall n, exists old new,
-    length new = S n  /\  incremental_cost old new = 1  /\  fromscratch_cost new = S n.
-```
-
-**Parallel emit is deterministic.** Relocations that touch disjoint bytes may be
-applied in any order, on any number of threads, and produce identical memory:
-
-```coq
-Corollary parallel_reloc_deterministic :
-  forall sched1 sched2 m,
-    Permutation sched1 sched2 ->
-    pairwise_disjoint sched1 ->
-    apply_all sched1 m = apply_all sched2 m.
-```
-
-**ICF is sound.** Folding identical functions to one copy preserves every call's
-result, and only moves addresses where they can't be observed:
-
-```coq
-Theorem icf_observationally_equivalent :
-  forall P (F : fold_map P),
-    address_safe P F ->
-      (forall f, call_result P (rep F f) = call_result P f) /\
-      (forall f g, observably_compared P f g ->
-         addr_eq_after P F f g = addr_eq_before f g).
-```
-
-The rest cover parallel-schedule work–span optimality (within 2× of the Brent
-bound), GC reachability, layout page-congruence, and the symbol-resolution
-semilattice. And the byte-identity guarantee is enforced in CI too: a
-`cmp`-against-a-full-link test on every relink path, across thread counts, plus
-an adversarial relocation sweep.
+The current narrow claims do not cover parser correctness, dynamic-loader
+behavior, unsupported ELF features, all relocation encodings, every mmap write
+in every mode, or whole-linker correctness. The full task breakdown for the
+verification work is tracked in
+[`docs/IMPLEMENTATION_VERIFICATION_TASKS.md`](docs/IMPLEMENTATION_VERIFICATION_TASKS.md).
 
 ## Use it
 

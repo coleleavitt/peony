@@ -250,8 +250,10 @@ fn parse_expanded_args(argv: Vec<String>) -> Result<Args> {
         }
     }
 
-    let mut a = Args::default();
-    a.raw_args = argv.clone();
+    let mut a = Args {
+        raw_args: argv.clone(),
+        ..Args::default()
+    };
     let mut whole_archive = false;
     let mut as_needed = false;
     let mut library_mode = LibraryMode::Any;
@@ -611,6 +613,12 @@ pub(crate) fn cache_key_args(raw_args: &[String]) -> Vec<String> {
     out
 }
 
+pub(crate) fn print_help() {
+    println!(
+        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table and cache diagnostics\n  --trace             Print phase timing and call-flow trace\n  --trace-detail      Include capped byte/address detail records\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Incremental cache (ON by default)\n  --no-incremental    Disable incremental (also PEONY_INCREMENTAL=0)\n  --daemon            Run a resident daemon serving sub-5ms relinks\n                      (or set PEONY_DAEMON=1 to auto-spawn one)\n  --cache-report FILE Write JSON cache reuse/fallback report\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  --no-crt            Do not auto-inject C runtime startup objects\n  -shared             Produce a shared object\n  --help              Print this help"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,10 +666,4 @@ mod tests {
         let no_startfiles = parse_expanded_args(strings(&["-nostartfiles", "main.o"])).unwrap();
         assert!(no_startfiles.no_crt);
     }
-}
-
-pub(crate) fn print_help() {
-    println!(
-        "peony [OPTIONS] <inputs>...\n\n  -o FILE             Output file (default: a.out)\n  -L DIR              Add library search directory\n  -l NAME             Link libNAME.so or libNAME.a\n  -e, --entry SYM     Entry symbol (default: _start)\n  --threads N         Worker thread count (0 = auto)\n  --stats             Print phase timing table and cache diagnostics\n  --trace             Print phase timing and call-flow trace\n  --trace-detail      Include capped byte/address detail records\n  --trace-stack       Print trace frames with Rust backtraces\n  --incremental       Incremental cache (ON by default)\n  --no-incremental    Disable incremental (also PEONY_INCREMENTAL=0)\n  --daemon            Run a resident daemon serving sub-5ms relinks\n                      (or set PEONY_DAEMON=1 to auto-spawn one)\n  --cache-report FILE Write JSON cache reuse/fallback report\n  --gc-sections       Drop unreachable sections\n  --build-id          Emit .note.gnu.build-id\n  --no-crt            Do not auto-inject C runtime startup objects\n  -shared             Produce a shared object\n  --help              Print this help"
-    );
 }

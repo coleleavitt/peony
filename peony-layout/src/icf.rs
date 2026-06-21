@@ -105,7 +105,7 @@ fn read_uleb128(data: &[u8], pos: &mut usize) -> Option<u64> {
     loop {
         let byte = *data.get(*pos)?;
         *pos += 1;
-        result |= ((byte & 0x7f) as u64) << shift;
+        result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(result);
         }
@@ -133,24 +133,30 @@ fn address_taint(arena: &InputArena, objects: &[InputObject]) -> AddrTaint {
     t
 }
 
-/// Parse this object's `.llvm_addrsig` section (if present): record that the
-/// object HAS the table, and which of its symbols are address-significant. The
-/// table is a sequence of ULEB128 ELF symbol-table indices.
+/// Parse this object's `.llvm_addrsig` section (if present): record only a fully
+/// decoded table, and which of its symbols are address-significant. The table is
+/// a sequence of ULEB128 ELF symbol-table indices.
 fn parse_addrsig(arena: &InputArena, t: &mut AddrTaint, obj: &InputObject, obj_id: usize) {
     let Some(sec) = obj.sections.iter().find(|s| s.sh_type == SHT_LLVM_ADDRSIG) else {
         return;
     };
-    t.objects_with_addrsig.insert(obj_id);
     let data = arena.bytes(sec.data);
     let mut pos = 0usize;
+    let mut addrsig_syms = Vec::new();
     while pos < data.len() {
         let Some(sym_idx) = read_uleb128(data, &mut pos) else {
-            break;
+            return;
         };
-        if let Some(sym_pos) = obj.symbol_pos(sym_idx as usize) {
-            t.addrsig_syms.insert((obj_id, sym_pos));
-        }
+        let Ok(raw_index) = usize::try_from(sym_idx) else {
+            return;
+        };
+        let Some(sym_pos) = obj.symbol_pos(raw_index) else {
+            return;
+        };
+        addrsig_syms.push((obj_id, sym_pos));
     }
+    t.objects_with_addrsig.insert(obj_id);
+    t.addrsig_syms.extend(addrsig_syms);
 }
 
 /// Record the address-taint contribution of a single relocation.

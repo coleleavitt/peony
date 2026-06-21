@@ -73,7 +73,7 @@ pub fn iter_archive_members_matching(
 fn read_archive(path: &Path) -> Result<MappedInput> {
     MappedInput::open(path).ok_or_else(|| ObjectError::Io {
         path: path.display().to_string(),
-        source: std::io::Error::new(std::io::ErrorKind::Other, "could not memory-map archive"),
+        source: std::io::Error::other("could not memory-map archive"),
     })
 }
 

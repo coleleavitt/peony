@@ -1,0 +1,414 @@
+{
+  "schema_version": 1,
+  "status_definitions": {
+    "model-only": "A Rocq theorem or model result with no Rust implementation claim.",
+    "bridge-tested": "Rust witnesses or tests check a concrete correspondence, but the claim is not a theorem-backed implementation refinement.",
+    "theorem-bridged": "A Rocq theorem is connected to a named Rust surface and its preconditions are checked for that surface, but the scope is still a bridge claim.",
+    "implementation-verified": "A narrow implementation surface has completed dependencies, checked Rust witnesses, theorem assumptions audited here, and an explicit trusted boundary. This status never means whole-linker correctness."
+  },
+  "claim_boundary": {
+    "whole_linker_claim": "No current claim covers whole-linker correctness, whole-program semantic preservation, object parser correctness, dynamic loader behavior, or every emitted byte in every linker mode.",
+    "public_docs": [
+      "README.md",
+      "rocq-tests/README.md",
+      "docs/THEOREM_TO_RUST_BRIDGES.md",
+      "docs/VERIFICATION_CLAIMS.md"
+    ]
+  },
+  "claims": [
+    {
+      "id": "v0-v1-bridge-harness-and-witness-schema",
+      "status": "bridge-tested",
+      "claim": "The repo-local bridge harness checks proof placeholders, selected Rust bridge tests, proof build, coqchk, and the theorem-to-Rust bridge map; V1 witness schemas exist for later bridge rows.",
+      "scope": "Harness and witness infrastructure only.",
+      "depends_on_todos": [
+        "V0",
+        "V1"
+      ],
+      "theorems": [],
+      "rust_surfaces": [
+        "scripts/check-verification-bridges.sh",
+        "peony-verification"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/v0/full-gate.txt",
+        ".omo/evidence/peony-implementation-verification/v1/full-gate.txt"
+      ],
+      "assumption_artifacts": [],
+      "trusted_base": [
+        "Rocq/Coq toolchain",
+        "Rust compiler and test harness"
+      ],
+      "not_claimed": [
+        "No Rust behavior is certified by V0 or V1 alone."
+      ]
+    },
+    {
+      "id": "s1-symbol-resolution-witnesses",
+      "status": "bridge-tested",
+      "claim": "Synthetic symbol-resolution witnesses exercise defined, undefined, weak, common, absolute, imported, and duplicate-strong paths against the current Rust table behavior.",
+      "scope": "The S1 synthetic witness subset of the global symbol table.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "S1"
+      ],
+      "theorems": [
+        "SymbolLattice.sjoin"
+      ],
+      "rust_surfaces": [
+        "peony-symbols::SymbolTable",
+        "peony-symbols/tests/symbol_bridge.rs",
+        "peony_verification::SymbolWitness"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/s1/symbol-tests.txt",
+        ".omo/evidence/peony-implementation-verification/s1/witness-tests.txt"
+      ],
+      "assumption_artifacts": [],
+      "trusted_base": [
+        "Rust compiler",
+        "object crate input decoding outside synthetic fixtures"
+      ],
+      "not_claimed": [
+        "Archive extraction, COMDAT discard, full version semantics, and real-object symbol resolution are not implementation-verified."
+      ]
+    },
+    {
+      "id": "e1-parallel-input-work-range-disjointness",
+      "status": "implementation-verified",
+      "claim": "Accepted input-section work ranges establish the cross-worker disjointness precondition used by the Rocq parallel relocation/emit-range theorem.",
+      "scope": "Input-section worker ranges accepted by peony-emit before serial or parallel dispatch.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "E1"
+      ],
+      "theorems": [
+        "RelocDisjoint.accepted_emit_ranges_parallel_batches_deterministic"
+      ],
+      "rust_surfaces": [
+        "peony-emit::input_work::validate_work_item_ranges",
+        "peony-emit::input_work::AcceptedWorkRanges",
+        "peony_verification::EmitWorkRangeWitness"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/e1/emit-tests.txt",
+        ".omo/evidence/peony-implementation-verification/e1/witness-tests.txt"
+      ],
+      "assumption_artifacts": [
+        "docs/verification-assumptions/RelocDisjoint.accepted_emit_ranges_parallel_batches_deterministic.txt"
+      ],
+      "trusted_base": [
+        "Rust compiler",
+        "usize arithmetic",
+        "host memory model",
+        "mmap raw-pointer slice creation after validation"
+      ],
+      "not_claimed": [
+        "Synthetic-section frame separation and whole-emitter byte correctness remain outside this claim."
+      ]
+    },
+    {
+      "id": "r1b-relocation-byte-and-address-witnesses",
+      "status": "bridge-tested",
+      "claim": "Representative apply_reloc address inputs for local, global, weak-undefined GOT, PLT/GOTPCREL, and static TLS cases are checked against the R1a byte model.",
+      "scope": "R1b address-witness cases that feed patch_buf through the current test hook.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "E1",
+        "R1a",
+        "L1",
+        "S1",
+        "R1b"
+      ],
+      "theorems": [
+        "RelocDisjoint.apply1 / footprint"
+      ],
+      "rust_surfaces": [
+        "peony-reloc::apply_reloc",
+        "peony-reloc::patch_buf",
+        "peony_verification::ApplyRelocAddressWitness"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/r1a/reloc-tests.txt",
+        ".omo/evidence/peony-implementation-verification/r1b/reloc-tests.txt",
+        ".omo/evidence/peony-implementation-verification/r1b/real-object-full-link.txt"
+      ],
+      "assumption_artifacts": [],
+      "trusted_base": [
+        "Rust compiler",
+        "x86-64 relocation constants mirrored in the Rust byte model",
+        "object crate decoding",
+        "symbol-table construction",
+        "layout finalization"
+      ],
+      "not_claimed": [
+        "This is not exhaustive real-object relocation coverage, dynamic-loader verification, final output-image composition, or whole relocation correctness."
+      ]
+    },
+    {
+      "id": "l1-layout-window-predicates",
+      "status": "implementation-verified",
+      "claim": "Extracted layout witnesses satisfy the model predicates for alignment, PT_LOAD page congruence, window bounds, non-overlap, load containment, and contribution ownership/order.",
+      "scope": "Layout witness predicates emitted for supported output-section and load-segment windows.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "L1"
+      ],
+      "theorems": [
+        "Layout.layout_all_aligned",
+        "Layout.layout_page_congruent",
+        "Layout.layout_pairwise_no_overlap"
+      ],
+      "rust_surfaces": [
+        "peony-layout::compute_layout",
+        "peony_verification::LayoutWitness",
+        "peony-layout/tests/layout_bridge.rs",
+        "peony-layout/tests/layout_gc_bridge.rs"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/l1/layout-tests.txt",
+        ".omo/evidence/peony-implementation-verification/l1/witness-tests.txt"
+      ],
+      "assumption_artifacts": [
+        "docs/verification-assumptions/Layout.layout_all_aligned.txt",
+        "docs/verification-assumptions/Layout.layout_page_congruent.txt",
+        "docs/verification-assumptions/Layout.layout_pairwise_no_overlap.txt"
+      ],
+      "trusted_base": [
+        "Rust compiler",
+        "synthetic object fixtures",
+        "ELF semantic classes beyond modeled window, alignment, and bounds facts"
+      ],
+      "not_claimed": [
+        "GC, symbol resolution, relocation address selection, dynamic-section contents, emit bytes, and whole layout semantics are outside this claim."
+      ]
+    },
+    {
+      "id": "g1-gc-reachability-witnesses",
+      "status": "implementation-verified",
+      "claim": "The extracted GC graph and Rust live set match the SectionGC reachability model for supported root and edge classes.",
+      "scope": "Current GC roots and relocation edges exposed through gc_graph_rooted and gc_sections_rooted.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "L1",
+        "G1"
+      ],
+      "theorems": [
+        "SectionGC.gc_sound"
+      ],
+      "rust_surfaces": [
+        "peony-layout::gc_graph_rooted",
+        "peony-layout::gc_sections_rooted",
+        "peony_verification::GcReachabilityWitness"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/g1/layout-gc-tests.txt",
+        ".omo/evidence/peony-implementation-verification/g1/witness-tests.txt"
+      ],
+      "assumption_artifacts": [
+        "docs/verification-assumptions/SectionGC.gc_sound.txt"
+      ],
+      "trusted_base": [
+        "Rust compiler",
+        "SymbolTable resolution outside synthetic fixtures",
+        "InputObject decoding outside synthetic fixtures"
+      ],
+      "not_claimed": [
+        "Section-group edges, EH-frame FDE-to-code dependency edges, unsupported root classes, and whole-GC semantics are not covered."
+      ]
+    },
+    {
+      "id": "i1-icf-address-safety-for-emitted-folds",
+      "status": "implementation-verified",
+      "claim": "The Rust ICF witness recomputes the current eligibility and address-taint predicates before using the Rocq address_safe premise for folds emitted by compute_fold_map.",
+      "scope": "Folds actually emitted by compute_fold_map under supported current inputs.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "L1",
+        "S1",
+        "G1",
+        "I1"
+      ],
+      "theorems": [
+        "ICFSoundness.icf_observationally_equivalent"
+      ],
+      "rust_surfaces": [
+        "peony-layout::icf::compute_fold_map",
+        "peony_verification::IcfFoldWitness",
+        "peony_verification::check_icf_fold_witnesses",
+        "peony-layout/tests/icf_bridge.rs"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/i1/icf-bridge-tests.txt",
+        ".omo/evidence/peony-implementation-verification/i1/witness-tests.txt"
+      ],
+      "assumption_artifacts": [
+        "docs/verification-assumptions/ICFSoundness.icf_observationally_equivalent.txt"
+      ],
+      "trusted_base": [
+        "Rust compiler",
+        "x86-64 relocation address-taking classification mirrored in the I1 checker",
+        "InputObject section bytes, relocations, binding, and visibility facts",
+        "dynamic address-significance sources not represented in InputObject"
+      ],
+      "not_claimed": [
+        "ICF maximality, parser correctness, dynamic-loader behavior, layout correctness, relocation correctness, emit correctness, and whole-linker correctness are outside this claim."
+      ]
+    },
+    {
+      "id": "n1-partial-emit-byte-preservation-scoped-fixture",
+      "status": "implementation-verified",
+      "claim": "For the changed-object partial emit fixture, the emitted write report is connected to the model red set: green bytes are untouched and equal to previous bytes, while red bytes equal the full-link bytes.",
+      "scope": "N1 changed-object fixture using peony-cache color decisions and peony-emit write reports.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "E1",
+        "R1a",
+        "L1",
+        "S1",
+        "G1",
+        "R1b",
+        "N1"
+      ],
+      "theorems": [
+        "IncrementalSoundness.incremental_relink_sound",
+        "IncrementalSoundness.green_is_byte_stable",
+        "IncrementalSoundness.red_is_forced"
+      ],
+      "rust_surfaces": [
+        "peony-cache::plan_partial_relink",
+        "peony-emit::emit_partial_objects_with_report",
+        "peony-emit::EmitWriteReport",
+        "peony_verification::PartialEmitPreservationWitness"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/n1/incremental-tests.txt",
+        ".omo/evidence/peony-implementation-verification/n1/partial-relink-tests.txt",
+        ".omo/evidence/peony-implementation-verification/n1/witness-tests.txt"
+      ],
+      "assumption_artifacts": [
+        "docs/verification-assumptions/IncrementalSoundness.incremental_relink_sound.txt",
+        "docs/verification-assumptions/IncrementalSoundness.green_is_byte_stable.txt",
+        "docs/verification-assumptions/IncrementalSoundness.red_is_forced.txt"
+      ],
+      "trusted_base": [
+        "Rust compiler",
+        "cache metadata serialization",
+        "the scoped previous, partial, and full-link byte fixture",
+        "EmitWriteReport coverage for the reported changed-object path"
+      ],
+      "not_claimed": [
+        "Every mmap write in every linker mode, all synthetic-section rewrites outside the report, and whole incremental linker correctness are outside this claim."
+      ]
+    },
+    {
+      "id": "incremental-planner-capacity-stability",
+      "status": "theorem-bridged",
+      "claim": "Accepted partial-relink planner metadata implies the model capacity_stable invariant.",
+      "scope": "Metadata fields accepted by peony-cache::plan_partial_relink.",
+      "depends_on_todos": [
+        "V0",
+        "V1",
+        "N1"
+      ],
+      "theorems": [
+        "IncrementalSoundness.incremental_relink_sound"
+      ],
+      "rust_surfaces": [
+        "peony-cache::plan_partial_relink",
+        "peony-cache/tests/partial_relink.rs"
+      ],
+      "evidence": [
+        ".omo/evidence/peony-implementation-verification/n1/partial-relink-tests.txt"
+      ],
+      "assumption_artifacts": [
+        "docs/verification-assumptions/IncrementalSoundness.incremental_relink_sound.txt"
+      ],
+      "trusted_base": [
+        "Rust compiler",
+        "cache metadata serialization"
+      ],
+      "not_claimed": [
+        "This theorem bridge alone does not verify Rust emit bytes."
+      ]
+    },
+    {
+      "id": "relocation-write-composition-model",
+      "status": "model-only",
+      "claim": "RelocMonoid models composition of disjoint relocation writes as a partial commutative monoid.",
+      "scope": "Rocq memory model only.",
+      "depends_on_todos": [
+        "V0"
+      ],
+      "theorems": [
+        "RelocMonoid.oplus / act"
+      ],
+      "rust_surfaces": [],
+      "evidence": [
+        "make -C rocq-tests -B"
+      ],
+      "assumption_artifacts": [],
+      "trusted_base": [
+        "Rocq kernel and standard library"
+      ],
+      "not_claimed": [
+        "No Rust output-image write-composition implementation claim is made."
+      ]
+    },
+    {
+      "id": "abstract-incremental-cost-model",
+      "status": "model-only",
+      "claim": "IncrementalCostBound proves abstract work-count relationships for the model.",
+      "scope": "Rocq cost model only.",
+      "depends_on_todos": [
+        "V0"
+      ],
+      "theorems": [
+        "IncrementalCostBound.incremental_beats_fromscratch"
+      ],
+      "rust_surfaces": [],
+      "evidence": [
+        "make -C rocq-tests -B"
+      ],
+      "assumption_artifacts": [],
+      "trusted_base": [
+        "Rocq kernel and standard library",
+        "abstract work-count model"
+      ],
+      "not_claimed": [
+        "No wall-clock performance proof or scheduler implementation claim is made."
+      ]
+    },
+    {
+      "id": "abstract-parallel-scheduler-model",
+      "status": "model-only",
+      "claim": "ParallelSchedule proves abstract work-span bounds for an ideal disjoint-footprint antichain scheduler model.",
+      "scope": "Rocq scheduler model only.",
+      "depends_on_todos": [
+        "V0"
+      ],
+      "theorems": [
+        "ParallelSchedule.greedy_within_2x_opt"
+      ],
+      "rust_surfaces": [],
+      "evidence": [
+        "make -C rocq-tests -B"
+      ],
+      "assumption_artifacts": [],
+      "trusted_base": [
+        "Rocq kernel and standard library",
+        "abstract ws-deque scheduler model"
+      ],
+      "not_claimed": [
+        "No hardware runtime-speed or Rust scheduler implementation claim is made."
+      ]
+    }
+  ]
+}

@@ -186,4 +186,5 @@ fn marks_relocation_dependents_red_when_symbol_moved() {
 
     assert_eq!(plan.color(".text"), Some(SectionColor::Green));
     assert_eq!(plan.color(".data"), Some(SectionColor::Red));
+    assert!(!plan.is_green(".data"));
 }

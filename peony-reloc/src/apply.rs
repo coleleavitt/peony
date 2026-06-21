@@ -67,6 +67,7 @@ impl<'a> SymIndex<'a> {
 }
 
 /// Addresses used when computing a relocation value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RelocAddrs {
     pub(crate) s: u64, // symbol VA
     pub(crate) a: i64, // addend
@@ -86,6 +87,21 @@ pub(crate) struct RelocAddrs {
     pub(crate) tls_imported: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelocAction {
+    Skip(RelocSkipReason),
+    Patch(RelocAddrs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelocSkipReason {
+    NoneRelocation,
+    MissingSymbolPosition,
+    MissingSymbolRecord,
+    RelaxedTlsGetAddrCall,
+    MissingLocalSectionAddress,
+}
+
 /// Apply a single relocation, patching `buf` (the relocated section's bytes).
 ///
 /// `obj_id` is the object's index (used to resolve local-symbol addresses).
@@ -98,14 +114,27 @@ pub fn apply_reloc(
     section_va: u64,
     buf: &mut [u8],
 ) -> Result<()> {
+    match resolve_reloc_action(ctx, obj, obj_id, reloc, section_va)? {
+        RelocAction::Skip(_) => Ok(()),
+        RelocAction::Patch(addrs) => patch_buf(buf, reloc.r_type, &addrs, &obj.path),
+    }
+}
+
+fn resolve_reloc_action(
+    ctx: &ApplyCtx<'_>,
+    obj: &InputObject,
+    obj_id: usize,
+    reloc: &InputReloc,
+    section_va: u64,
+) -> Result<RelocAction> {
     if reloc.r_type == r_x86_64::NONE {
-        return Ok(());
+        return Ok(RelocAction::Skip(RelocSkipReason::NoneRelocation));
     }
     let Some(sym_pos) = obj.symbol_pos(reloc.symbol.0) else {
-        return Ok(());
+        return Ok(RelocAction::Skip(RelocSkipReason::MissingSymbolPosition));
     };
     let Some(sym) = obj.symbols.get(sym_pos) else {
-        return Ok(());
+        return Ok(RelocAction::Skip(RelocSkipReason::MissingSymbolRecord));
     };
 
     // In an EXECUTABLE the `call __tls_get_addr@PLT` after a GD/LD `lea` is
@@ -117,7 +146,7 @@ pub fn apply_reloc(
         && matches!(reloc.r_type, r_x86_64::PLT32 | r_x86_64::PC32)
         && sym.name == b"__tls_get_addr"
     {
-        return Ok(());
+        return Ok(RelocAction::Skip(RelocSkipReason::RelaxedTlsGetAddrCall));
     }
 
     // Resolve the global symbol's record ONCE (a name-keyed hash lookup) and
@@ -164,7 +193,9 @@ pub fn apply_reloc(
                         "reloc skipped: target section has no address (GC'd, \
                          discarded, or unplaced) — field left unrelocated"
                     );
-                    return Ok(());
+                    return Ok(RelocAction::Skip(
+                        RelocSkipReason::MissingLocalSectionAddress,
+                    ));
                 }
             },
             None => sym.value, // absolute local
@@ -253,7 +284,18 @@ pub fn apply_reloc(
         tls_imported,
     };
 
-    patch_buf(buf, reloc.r_type, &addrs, &obj.path)
+    Ok(RelocAction::Patch(addrs))
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_reloc_action_for_test(
+    ctx: &ApplyCtx<'_>,
+    obj: &InputObject,
+    obj_id: usize,
+    reloc: &InputReloc,
+    section_va: u64,
+) -> Result<RelocAction> {
+    resolve_reloc_action(ctx, obj, obj_id, reloc, section_va)
 }
 
 pub(crate) fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &str) -> Result<()> {
@@ -434,11 +476,12 @@ pub(crate) fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &st
                         "TLSGD: unexpected prologue, skipping IE relaxation"
                     );
                 } else {
+                    let disp_bytes = checked_i32_bytes(disp, r_type, object, off as u64)?;
                     buf[start..start + 16].copy_from_slice(&[
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x03, 0x05, 0,
                         0, 0, 0,
                     ]);
-                    buf[start + 12..start + 16].copy_from_slice(&(disp as i32).to_le_bytes());
+                    buf[start + 12..start + 16].copy_from_slice(&disp_bytes);
                 }
             } else {
                 tracing::warn!(
@@ -465,7 +508,7 @@ pub(crate) fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &st
                 let le_off = (a.tls as i64)
                     .wrapping_add(a.a)
                     .wrapping_sub(a.tls_size as i64)
-                    .wrapping_add(4) as i32;
+                    .wrapping_add(4);
                 tracing::trace!(
                     off,
                     start,
@@ -484,12 +527,13 @@ pub(crate) fn patch_buf(buf: &mut [u8], r_type: u32, a: &RelocAddrs, object: &st
                         "TLSGD: unexpected prologue, skipping relaxation"
                     );
                 } else {
+                    let le_bytes = checked_i32_bytes(le_off, r_type, object, off as u64)?;
                     buf[start..start + 16].copy_from_slice(&[
                         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00,
                         0x00, // mov %fs:0,%rax
                         0x48, 0x8d, 0x80, 0, 0, 0, 0, // lea off(%rax),%rax
                     ]);
-                    buf[start + 12..start + 16].copy_from_slice(&le_off.to_le_bytes());
+                    buf[start + 12..start + 16].copy_from_slice(&le_bytes);
                 }
             } else {
                 tracing::warn!(
@@ -703,12 +747,16 @@ fn write_i32(
     object: &str,
     reloc_off: u64,
 ) -> Result<()> {
-    let v = val as i32;
-    if v as i64 != val {
-        return Err(overflow(object, reloc_off, val, r_type));
-    }
-    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let bytes = checked_i32_bytes(val, r_type, object, reloc_off)?;
+    buf[off..off + 4].copy_from_slice(&bytes);
     Ok(())
+}
+
+fn checked_i32_bytes(val: i64, r_type: u32, object: &str, reloc_off: u64) -> Result<[u8; 4]> {
+    let Ok(v) = i32::try_from(val) else {
+        return Err(overflow(object, reloc_off, val, r_type));
+    };
+    Ok(v.to_le_bytes())
 }
 
 fn write_u32(

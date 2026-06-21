@@ -30,7 +30,7 @@ reuse, compile-time isolation, or public versioning justifies it.
 
 ## Working Rules
 
-- Follow Rust edition 2021 and the surrounding module/file style.
+- Follow Rust edition 2024 and the surrounding module/file style.
 - Prefer existing patterns and small targeted changes.
 - Add or update focused regression tests for parser, symbol, layout,
   relocation, emit, TLS, dynamic-linking, or incremental-cache changes.

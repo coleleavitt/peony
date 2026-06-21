@@ -1,6 +1,6 @@
 # Peony Rust Code Style
 
-- Keep Rust code on edition 2021 and follow the surrounding file style.
+- Keep Rust code on edition 2024 and follow the surrounding file style.
 - Prefer domain modules under the owning crate over root-level helper files.
 - Use explicit enums, newtypes, typed IDs, and phase-specific types for linker
   invariants when raw primitives or booleans would be ambiguous.

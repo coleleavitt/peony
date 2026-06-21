@@ -1,0 +1,15 @@
+[package]
+name = "peony-verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+peony-cache = { path = "../peony-cache" }
+peony-emit = { path = "../peony-emit" }
+peony-layout = { path = "../peony-layout" }
+peony-object = { path = "../peony-object" }
+peony-symbols = { path = "../peony-symbols" }
+serde.workspace = true
+thiserror.workspace = true

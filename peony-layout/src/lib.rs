@@ -29,9 +29,15 @@ pub mod icf;
 mod script;
 
 pub use gc::{
+    GcEdge,
+    GcEdgeReason,
+    GcGraph,
     GcOutput,
+    GcRoot,
+    GcRootReason,
     GcStats,
     LiveSections,
+    gc_graph_rooted,
     gc_sections,
     gc_sections_rooted,
     gc_sections_rooted_with_stats,
@@ -522,10 +528,10 @@ fn object_layout_digest(
             if !live.emits(&(obj_idx, sec.index.0)) {
                 continue;
             }
-            if let Some(fm) = fold_map {
-                if fm.contains_key(&(obj_idx, sec.index.0)) {
-                    continue;
-                }
+            if let Some(fm) = fold_map
+                && fm.contains_key(&(obj_idx, sec.index.0))
+            {
+                continue;
             }
         }
         h = fnv_u64(h, section_pos as u64);
@@ -1456,10 +1462,10 @@ pub fn compute_layout_icf(
             }
             // --icf: a folded duplicate contributes no bytes; its references are
             // redirected to the canonical section after addresses are assigned.
-            if let Some(fm) = fold_map {
-                if fm.contains_key(&(obj_idx, sec.index.0)) {
-                    continue;
-                }
+            if let Some(fm) = fold_map
+                && fm.contains_key(&(obj_idx, sec.index.0))
+            {
+                continue;
             }
             let align = if sec.align == 0 { 1 } else { sec.align };
             if !align.is_power_of_two() {
@@ -2894,38 +2900,36 @@ pub fn compute_layout_icf(
         });
     }
     // PT_NOTE for the build-id (after PT_PHDR, before the loads).
-    if config.build_id {
-        if let Some(s) = sections.iter().find(|s| s.source == SecSource::NoteBuildId) {
-            segments.insert(
-                1,
-                ProgramHeader {
-                    p_type: elf::PT_NOTE,
-                    p_flags: elf::PF_R,
-                    p_offset: s.sh_offset,
-                    p_vaddr: s.sh_addr,
-                    p_paddr: s.sh_addr,
-                    p_filesz: s.sh_size,
-                    p_memsz: s.sh_size,
-                    p_align: 4,
-                },
-            );
-        }
-    }
-    // PT_GNU_PROPERTY points at `.note.gnu.property` so the loader sees x86
-    // feature notes (IBT/SHSTK/etc.).
-    if has_gnu_property {
-        if let Some(s) = sections.iter().find(|s| s.name == ".note.gnu.property") {
-            segments.push(ProgramHeader {
-                p_type: elf::PT_GNU_PROPERTY,
+    if config.build_id
+        && let Some(s) = sections.iter().find(|s| s.source == SecSource::NoteBuildId)
+    {
+        segments.insert(
+            1,
+            ProgramHeader {
+                p_type: elf::PT_NOTE,
                 p_flags: elf::PF_R,
                 p_offset: s.sh_offset,
                 p_vaddr: s.sh_addr,
                 p_paddr: s.sh_addr,
                 p_filesz: s.sh_size,
                 p_memsz: s.sh_size,
-                p_align: s.sh_addralign.max(1),
-            });
-        }
+                p_align: 4,
+            },
+        );
+    }
+    // PT_GNU_PROPERTY points at `.note.gnu.property` so the loader sees x86
+    // feature notes (IBT/SHSTK/etc.).
+    if has_gnu_property && let Some(s) = sections.iter().find(|s| s.name == ".note.gnu.property") {
+        segments.push(ProgramHeader {
+            p_type: elf::PT_GNU_PROPERTY,
+            p_flags: elf::PF_R,
+            p_offset: s.sh_offset,
+            p_vaddr: s.sh_addr,
+            p_paddr: s.sh_addr,
+            p_filesz: s.sh_size,
+            p_memsz: s.sh_size,
+            p_align: s.sh_addralign.max(1),
+        });
     }
     // PT_INTERP (early) and PT_DYNAMIC for a dynamic executable.
     if dynamic.is_some() {

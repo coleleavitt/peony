@@ -277,10 +277,10 @@ impl SymbolTable {
             if sym.name.is_empty() {
                 continue;
             }
-            if let Some(si) = sym.section {
-                if excluded.contains(&si.0) {
-                    continue; // symbol lives in a discarded COMDAT section
-                }
+            if let Some(si) = sym.section
+                && excluded.contains(&si.0)
+            {
+                continue; // symbol lives in a discarded COMDAT section
             }
             self.merge_symbol(obj_id, sym)?;
         }
@@ -613,10 +613,10 @@ impl SymbolTable {
 
     /// Mark an import as requiring an executable copy relocation.
     pub fn mark_copy_reloc(&mut self, name: &[u8]) {
-        if let Some(r) = self.resolutions.get_mut(name) {
-            if r.import {
-                r.copy_reloc = true;
-            }
+        if let Some(r) = self.resolutions.get_mut(name)
+            && r.import
+        {
+            r.copy_reloc = true;
         }
     }
 

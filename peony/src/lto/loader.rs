@@ -28,7 +28,7 @@ impl DlHandle {
     }
 
     pub(super) fn onload(&self) -> Result<OnloadFn> {
-        let name = CStr::from_bytes_with_nul(b"onload\0").context("building onload symbol name")?;
+        let name = c"onload";
         // SAFETY: Category 8 - FFI boundary. `self.handle` came from a
         // successful dlopen and `name` is a valid C string for the dlsym call.
         let symbol = unsafe { dlsym(self.handle.as_ptr(), name.as_ptr()) };

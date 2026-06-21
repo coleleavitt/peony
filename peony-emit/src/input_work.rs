@@ -4,6 +4,18 @@ use peony_prof::TraceField;
 
 use crate::SectionWriteFilter;
 
+mod errors;
+mod footprints;
+mod ranges;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) use errors::WorkRangeError;
+pub(crate) use ranges::{AcceptedWorkItemRange, AcceptedWorkRanges, validate_work_item_ranges};
+#[cfg(test)]
+pub(crate) use ranges::{WorkRange, validate_work_ranges};
+
 #[derive(Clone, Copy)]
 pub(crate) struct WorkItem<'a> {
     pub(crate) file_off: usize,

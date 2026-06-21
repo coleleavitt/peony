@@ -28,6 +28,7 @@ mod input_sections;
 mod input_work;
 mod relocatable;
 mod sections;
+mod write_report;
 
 use build_id::finalize_build_id;
 use eh_frame::write_eh_frame_hdr;
@@ -35,6 +36,7 @@ use file::{chmod_executable, open_output_map};
 use headers::{write_headers, write_section_headers};
 pub use relocatable::emit_relocatable;
 use sections::{write_section_data_parallel, write_tls_got};
+pub use write_report::{EmitWriteRange, EmitWriteReport};
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +52,43 @@ pub enum EmitError {
     Reloc(#[from] peony_reloc::RelocError),
     #[error("output file size {size} exceeds platform limits")]
     TooLarge { size: u64 },
+    #[error("input write range {item_index} overflows: start {file_off:#x}, length {file_len:#x}")]
+    InputWriteRangeOverflow {
+        item_index: usize,
+        file_off: usize,
+        file_len: usize,
+    },
+    #[error(
+        "input write range {item_index} exceeds output size {buf_len:#x}: start {file_off:#x}, length {file_len:#x}"
+    )]
+    InputWriteRangeOutOfBounds {
+        item_index: usize,
+        file_off: usize,
+        file_len: usize,
+        buf_len: usize,
+    },
+    #[error(
+        "input write ranges overlap: {first_index} [{first_start:#x}, {first_end:#x}) and {second_index} [{second_start:#x}, {second_end:#x})"
+    )]
+    InputWriteRangeOverlap {
+        first_index: usize,
+        first_start: usize,
+        first_end: usize,
+        second_index: usize,
+        second_start: usize,
+        second_end: usize,
+    },
+    #[error("emit write range `{label}` overflows: start {start:#x}, length {len:#x}")]
+    WriteRangeOverflow { label: String, start: u64, len: u64 },
+    #[error(
+        "emit write range `{label}` exceeds output size {buf_len:#x}: start {start:#x}, length {len:#x}"
+    )]
+    WriteRangeOutOfBounds {
+        label: String,
+        start: u64,
+        len: u64,
+        buf_len: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, EmitError>;
@@ -170,6 +209,26 @@ pub fn emit_partial(
     )
 }
 
+pub fn emit_partial_with_report(
+    output_path: &Path,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    config: &EmitConfig,
+    red_sections: &HashSet<String>,
+) -> Result<Option<EmitWriteReport>> {
+    emit_with_report(
+        output_path,
+        arena,
+        objects,
+        symbols,
+        layout,
+        config,
+        SectionWriteFilter::RedOnly(red_sections),
+    )
+}
+
 /// Patch only the contributions of `changed_objects` into an existing output,
 /// for the layout-reuse fast path. The cached layout was reused, so every
 /// address, synthetic section, header, and unchanged object's bytes are
@@ -196,6 +255,63 @@ pub fn emit_partial_objects(
         SectionWriteFilter::ChangedObjects(changed_objects),
         true,
     )
+}
+
+pub fn emit_partial_objects_with_report(
+    output_path: &Path,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    config: &EmitConfig,
+    changed_objects: &HashSet<usize>,
+) -> Result<Option<EmitWriteReport>> {
+    emit_with_report(
+        output_path,
+        arena,
+        objects,
+        symbols,
+        layout,
+        config,
+        SectionWriteFilter::ChangedObjects(changed_objects),
+    )
+}
+
+fn emit_with_report(
+    output_path: &Path,
+    arena: &InputArena,
+    objects: &[InputObject],
+    symbols: &SymbolTable,
+    layout: &Layout,
+    config: &EmitConfig,
+    filter: SectionWriteFilter<'_>,
+) -> Result<Option<EmitWriteReport>> {
+    let Some(file_size) = usize::try_from(layout.file_size).ok() else {
+        return Err(EmitError::TooLarge {
+            size: layout.file_size,
+        });
+    };
+    let existing_size = std::fs::metadata(output_path).ok().map(|m| m.len());
+    if existing_size != Some(layout.file_size) {
+        return Ok(None);
+    }
+    let report = write_report::report_for_filter(write_report::EmitReportInput {
+        layout,
+        objects,
+        filter,
+        buf_len: file_size,
+    })?;
+    let emitted = emit_with_filter(
+        output_path,
+        arena,
+        objects,
+        symbols,
+        layout,
+        config,
+        filter,
+        true,
+    )?;
+    Ok(emitted.then_some(report))
 }
 
 fn emit_with_filter(

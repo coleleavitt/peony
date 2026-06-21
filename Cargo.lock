@@ -695,6 +695,7 @@ dependencies = [
  "peony-layout",
  "peony-object",
  "peony-symbols",
+ "peony-verification",
  "rayon",
  "rustc-hash",
  "thiserror",
@@ -711,6 +712,19 @@ dependencies = [
  "serde",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "peony-verification"
+version = "0.1.0"
+dependencies = [
+ "peony-cache",
+ "peony-emit",
+ "peony-layout",
+ "peony-object",
+ "peony-symbols",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

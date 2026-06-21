@@ -129,12 +129,11 @@ pub fn collect_tls_got(
 
 /// `.dynsym` index for an imported TLS symbol (0 if not an import / unknown).
 pub(crate) fn tls_ref_dynidx(tref: TlsRef, symbols: &SymbolTable) -> u32 {
-    if let TlsRef::Global(id) = tref {
-        if let Some(name) = symbols.name_by_id(id) {
-            if let Some(r) = symbols.lookup(name) {
-                return r.dynsym_index;
-            }
-        }
+    if let TlsRef::Global(id) = tref
+        && let Some(name) = symbols.name_by_id(id)
+        && let Some(r) = symbols.lookup(name)
+    {
+        return r.dynsym_index;
     }
     0
 }

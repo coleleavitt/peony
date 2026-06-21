@@ -29,7 +29,7 @@ under `peony/tests/lld/`.
   relocation, emit, TLS, dynamic-linking, or incremental-cache changes, add or
   update focused regression tests that link real object files when practical.
 - Prefer existing workspace patterns over new abstractions or dependencies.
-- Keep Rust code on edition 2021 and format with standard `rustfmt`.
+- Keep Rust code on edition 2024 and format with standard `rustfmt`.
 - Avoid broad rewrites, generated churn, or fixture normalization in
   `peony/tests/lld/`, `bench/baselines/`, or captured corpora unless the task is
   specifically about those assets.
@@ -65,4 +65,3 @@ For the formal proof suite:
 cd rocq-tests
 make
 ```
-
